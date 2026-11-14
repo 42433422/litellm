@@ -1,17 +1,18 @@
 """Per-capacity admission for router attempts once a provider reports overload.
 
 A healthy capacity admits every attempt without a queue entry. A matching provider failure congests it: attempts then
-wait in priority order (lower first, FIFO within a priority), one leased probe at a time is admitted after a backoff,
-and enough consecutive probe successes of the current generation recover it, admitting every waiter at once ahead of
-any later arrival. ``LocalQueueBackend`` serves one process; ``RedisQueueBackend`` in ``dynamic_queue_redis`` serves
-many workers with the same contract.
+wait in priority order (lower first, FIFO within a priority) and one leased probe at a time is admitted after a
+backoff. Enough consecutive probe successes of the current generation recover it into a finite snapshot of the waiters
+it held, which claim admission strictly in that order while every later arrival waits; once the snapshot is claimed or
+gone the capacity is healthy again. Another matching failure folds unclaimed waiters back into the priority queue.
+``LocalQueueBackend`` serves one process; ``RedisQueueBackend`` in ``dynamic_queue_redis`` serves many workers.
 """
 
 import asyncio
 import bisect
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from types import MappingProxyType, TracebackType
 from typing import Final, Protocol, TypeAlias, TypeVar
 
@@ -24,6 +25,7 @@ class QueueSettings:
     lease_ms: int = 10_000
     liveness_ms: int = 5_000
     recheck_ms: int = 250
+    claim_step_ms: int = 10
     max_waiting: int = 1_000
     state_ttl_ms: int = 600_000
     sweep_limit: int = 64
@@ -43,7 +45,6 @@ class Probe:
 @dataclass(frozen=True, slots=True)
 class Released:
     generation: int
-    order: int
 
 
 Grant: TypeAlias = PassThrough | Probe | Released
@@ -51,7 +52,7 @@ Grant: TypeAlias = PassThrough | Probe | Released
 
 @dataclass(frozen=True, slots=True)
 class Waiting:
-    pass
+    ahead: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +76,7 @@ class CoordinationUnavailable:
 
 
 Rejection: TypeAlias = QueueTimeout | QueueFull | CoordinationUnavailable
-AdmitReply: TypeAlias = Grant | Waiting | QueueFull | CoordinationUnavailable
+AdmitReply: TypeAlias = Grant | Waiting | Gone | QueueFull | CoordinationUnavailable
 PollReply: TypeAlias = Grant | Waiting | Gone | CoordinationUnavailable
 
 
@@ -141,6 +142,19 @@ class MonotonicTimer:
         await asyncio.sleep(seconds)
 
 
+async def _await_owned(*work: "asyncio.Task[object]", interrupted: bool = False) -> None:
+    """Waits for cleanup the caller owns to finish however often the caller is cancelled meanwhile, then raises the
+    cancellation, so the cleanup is never cut short and the cancellation is never swallowed."""
+    if not work:
+        return
+    try:
+        _ = await asyncio.wait(work)
+    except asyncio.CancelledError:
+        return await _await_owned(*work, interrupted=True)
+    if interrupted:
+        raise asyncio.CancelledError
+
+
 class Attempt:
     """Holds a probe's lease while its provider call runs, and reports the call's outcome once. Leaving without a
     report releases the lease without counting anything, so an abandoned probe is never replayed or credited."""
@@ -161,20 +175,24 @@ class Attempt:
     async def __aexit__(
         self, error_type: type[BaseException] | None, error: BaseException | None, traceback: TracebackType | None
     ) -> None:
-        await self._stop_renewal()
+        renewal: Final = self._stop_renewal()
         if self._settled or not isinstance(self._grant, Probe):
+            await _await_owned(*renewal)
             return
         self._settled = True
-        _ = await asyncio.shield(self._backend.abandon(self._request.capacity, self._request.waiter_id))
+        release: Final = asyncio.create_task(self._backend.abandon(self._request.capacity, self._request.waiter_id))
+        await _await_owned(release, *renewal)
 
     async def report(self, outcome: Outcome) -> None | CoordinationUnavailable:
         if self._settled:
             return None
         self._settled = True
-        await self._stop_renewal()
-        return await asyncio.shield(
+        renewal: Final = self._stop_renewal()
+        sent: Final = asyncio.create_task(
             self._backend.report(self._request.capacity, self._request.waiter_id, self._grant, outcome)
         )
+        await _await_owned(sent, *renewal)
+        return sent.result()
 
     async def _renew(self, token: int) -> None:
         interval: Final = self._backend.settings.lease_ms / 3000
@@ -184,13 +202,13 @@ class Attempt:
             if renewed is False:
                 return
 
-    async def _stop_renewal(self) -> None:
+    def _stop_renewal(self) -> "tuple[asyncio.Task[None], ...]":
         renewal: Final = self._renewal
         if renewal is None:
-            return
+            return ()
         self._renewal = None
         _ = renewal.cancel()
-        _ = await asyncio.gather(renewal, return_exceptions=True)
+        return (renewal,)
 
 
 class DynamicQueue:
@@ -216,25 +234,37 @@ class DynamicQueue:
     def attempt(self, request: WaitRequest, admitted: Admitted) -> Attempt:
         return Attempt(self._backend, self._timer, request, admitted.grant)
 
+    def _delay(self, waiting: Waiting) -> float:
+        settings: Final = self._backend.settings
+        if waiting.ahead is None:
+            return settings.recheck_ms / 1000
+        return min(settings.recheck_ms, settings.claim_step_ms * (waiting.ahead + 1)) / 1000
+
     async def _settle(self, request: WaitRequest, deadline: float) -> Grant | Rejection:
-        recheck: Final = self._backend.settings.recheck_ms / 1000
         budget_ms: Final = max(int((deadline - self._timer.now()) * 1000), 0)
         first: Final = await self._backend.admit(request, budget_ms)
+        if isinstance(first, Gone):
+            return QueueTimeout()
         if not isinstance(first, Waiting):
             return first
+        return await self._wait(request, deadline, first)
+
+    async def _wait(self, request: WaitRequest, deadline: float, waiting: Waiting) -> Grant | Rejection:
+        delay: float = self._delay(waiting)  # rebind-ok: each poll's reply sets how soon to recheck
         while True:
             remaining: Final = deadline - self._timer.now()
             if remaining <= 0:
                 return QueueTimeout()
-            await self._timer.sleep(min(recheck, remaining))
+            await self._timer.sleep(min(delay, remaining))
             polled: Final = await self._backend.poll(request.capacity, request.waiter_id)
             if isinstance(polled, Gone):
                 return QueueTimeout()
             if not isinstance(polled, Waiting):
                 return polled
+            delay = self._delay(polled)
 
     async def _abandon(self, request: WaitRequest) -> None:
-        _ = await asyncio.shield(self._backend.abandon(request.capacity, request.waiter_id))
+        await _await_owned(asyncio.create_task(self._backend.abandon(request.capacity, request.waiter_id)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,19 +277,10 @@ class _Waiter:
 
 @dataclass(frozen=True, slots=True)
 class _Lease:
-    waiter_id: str
+    waiter: _Waiter
     token: int
     until_ms: int
-
-
-@dataclass(frozen=True, slots=True)
-class _Pending:
-    grant: Grant
-    deadline_ms: int
-
-
-def _no_pending() -> Mapping[str, _Pending]:
-    return MappingProxyType({})
+    claimed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,7 +294,11 @@ class _Capacity:
     tokens: int = 0
     lease: _Lease | None = None
     queue: tuple[_Waiter, ...] = ()
-    pending: Mapping[str, _Pending] = field(default_factory=_no_pending)
+    snapshot: tuple[_Waiter, ...] = ()
+
+    @property
+    def healthy(self) -> bool:
+        return not self.congested and not self.snapshot
 
 
 _R = TypeVar("_R")
@@ -283,43 +308,53 @@ def _order(waiter: _Waiter) -> tuple[int, int]:
     return (waiter.priority, waiter.seq)
 
 
-def _without_pending(pending: Mapping[str, _Pending], dropped: frozenset[str]) -> Mapping[str, _Pending]:
-    return MappingProxyType({waiter_id: entry for waiter_id, entry in pending.items() if waiter_id not in dropped})
+def _queued(queue: tuple[_Waiter, ...], waiter: _Waiter) -> tuple[_Waiter, ...]:
+    at: Final = bisect.bisect_right(queue, _order(waiter), key=_order)
+    return (*queue[:at], waiter, *queue[at:])
+
+
+def _live(waiters: tuple[_Waiter, ...], now: int) -> tuple[_Waiter, ...]:
+    return tuple(waiter for waiter in waiters if waiter.deadline_ms > now)
+
+
+def _without(waiters: tuple[_Waiter, ...], waiter_id: str) -> tuple[_Waiter, ...]:
+    return tuple(waiter for waiter in waiters if waiter.waiter_id != waiter_id)
+
+
+def _unclaimed_back(capacity: _Capacity, now: int) -> tuple[_Waiter, ...]:
+    """The queue with an unclaimed probe's waiter back in its place, keeping its priority, sequence and deadline."""
+    lease: Final = capacity.lease
+    if lease is None or lease.claimed or lease.waiter.deadline_ms <= now:
+        return capacity.queue
+    return _queued(capacity.queue, lease.waiter)
 
 
 def _sweep(capacity: _Capacity, now: int) -> _Capacity:
-    expired: Final = frozenset(waiter_id for waiter_id, entry in capacity.pending.items() if entry.deadline_ms <= now)
     lease: Final = capacity.lease
-    lease_alive: Final = lease is not None and lease.until_ms > now and lease.waiter_id not in expired
-    return replace(
-        capacity,
-        lease=lease if lease_alive else None,
-        queue=tuple(waiter for waiter in capacity.queue if waiter.deadline_ms > now),
-        pending=_without_pending(capacity.pending, expired),
-    )
+    expired_lease: Final = lease is not None and lease.until_ms <= now
+    dead_owner: Final = lease is not None and not lease.claimed and lease.waiter.deadline_ms <= now
+    if expired_lease or dead_owner:
+        return _sweep(replace(capacity, queue=_unclaimed_back(capacity, now), lease=None), now)
+    return replace(capacity, queue=_live(capacity.queue, now), snapshot=_live(capacity.snapshot, now))
 
 
 def _grant_probe(capacity: _Capacity, now: int, settings: QueueSettings) -> _Capacity:
     if not capacity.congested or capacity.lease is not None or now < capacity.next_probe_ms or not capacity.queue:
         return capacity
-    head: Final = capacity.queue[0]
     token: Final = capacity.tokens + 1
     return replace(
         capacity,
         tokens=token,
-        lease=_Lease(waiter_id=head.waiter_id, token=token, until_ms=now + settings.lease_ms),
+        lease=_Lease(waiter=capacity.queue[0], token=token, until_ms=now + settings.lease_ms, claimed=False),
         queue=capacity.queue[1:],
-        pending=MappingProxyType(
-            {**capacity.pending, head.waiter_id: _Pending(Probe(capacity.generation, token), head.deadline_ms)}
-        ),
     )
 
 
-def _take(capacity: _Capacity, waiter_id: str) -> tuple[_Capacity, Grant | Waiting]:
-    entry: Final = capacity.pending.get(waiter_id)
-    if entry is None:
-        return capacity, Waiting()
-    return replace(capacity, pending=_without_pending(capacity.pending, frozenset((waiter_id,)))), entry.grant
+def _claim_probe(capacity: _Capacity, waiter_id: str) -> tuple[_Capacity, Probe] | None:
+    lease: Final = capacity.lease
+    if lease is None or lease.claimed or lease.waiter.waiter_id != waiter_id:
+        return None
+    return replace(capacity, lease=replace(lease, claimed=True)), Probe(capacity.generation, lease.token)
 
 
 def _congest(
@@ -332,6 +367,7 @@ def _congest(
         if failed_probe
         else capacity.backoff_ms
     )
+    requeued: Final = _unclaimed_back(capacity, now)
     return replace(
         capacity,
         congested=True,
@@ -339,26 +375,23 @@ def _congest(
         successes=0,
         backoff_ms=backoff,
         lease=None,
+        queue=tuple(sorted((*requeued, *capacity.snapshot), key=_order)),
+        snapshot=(),
         next_probe_ms=max(capacity.next_probe_ms, now + max(backoff, retry_after_ms)),
     )
 
 
 def _recover(capacity: _Capacity) -> _Capacity:
-    generation: Final = capacity.generation + 1
-    released: Final = {
-        waiter.waiter_id: _Pending(Released(generation, order), waiter.deadline_ms)
-        for order, waiter in enumerate(capacity.queue, start=1)
-    }
     return replace(
         capacity,
         congested=False,
-        generation=generation,
+        generation=capacity.generation + 1,
         successes=0,
         backoff_ms=0,
         next_probe_ms=0,
         lease=None,
         queue=(),
-        pending=MappingProxyType({**capacity.pending, **released}),
+        snapshot=capacity.queue,
     )
 
 
@@ -366,21 +399,41 @@ def _admit(
     capacity: _Capacity, now: int, settings: QueueSettings, request: WaitRequest, budget_ms: int
 ) -> tuple[_Capacity, AdmitReply]:
     swept: Final = _sweep(capacity, now)
-    if not swept.congested:
+    if swept.healthy:
         return swept, PassThrough(swept.generation)
-    if len(swept.queue) >= settings.max_waiting:
+    if budget_ms <= 0:
+        return swept, Gone()
+    if len(swept.queue) + len(swept.snapshot) >= settings.max_waiting:
         return swept, QueueFull()
     waiter: Final = _Waiter(request.waiter_id, request.priority, swept.seq + 1, now + budget_ms)
-    at: Final = bisect.bisect_right(swept.queue, _order(waiter), key=_order)
-    queued: Final = replace(swept, seq=waiter.seq, queue=(*swept.queue[:at], waiter, *swept.queue[at:]))
-    return _take(_grant_probe(queued, now, settings), request.waiter_id)
+    queued: Final = replace(swept, seq=waiter.seq, queue=_queued(swept.queue, waiter))
+    if not queued.congested:
+        return queued, Waiting(ahead=len(queued.snapshot))
+    return _settle_congested(_grant_probe(queued, now, settings), request.waiter_id)
+
+
+def _settle_congested(capacity: _Capacity, waiter_id: str) -> tuple[_Capacity, Probe | Waiting]:
+    claimed: Final = _claim_probe(capacity, waiter_id)
+    return (capacity, Waiting()) if claimed is None else claimed
 
 
 def _poll(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str) -> tuple[_Capacity, PollReply]:
     swept: Final = _sweep(capacity, now)
-    if waiter_id not in swept.pending and all(waiter.waiter_id != waiter_id for waiter in swept.queue):
+    claimed: Final = _claim_probe(swept, waiter_id)
+    if claimed is not None:
+        return claimed
+    position: Final = next((at for at, waiter in enumerate(swept.snapshot) if waiter.waiter_id == waiter_id), None)
+    if position == 0:
+        return replace(swept, snapshot=swept.snapshot[1:]), Released(swept.generation)
+    if position is not None:
+        return swept, Waiting(ahead=position)
+    if all(waiter.waiter_id != waiter_id for waiter in swept.queue):
         return swept, Gone()
-    return _take(_grant_probe(swept, now, settings), waiter_id)
+    if swept.healthy:
+        return replace(swept, queue=_without(swept.queue, waiter_id)), PassThrough(swept.generation)
+    if not swept.congested:
+        return swept, Waiting(ahead=len(swept.snapshot))
+    return _settle_congested(_grant_probe(swept, now, settings), waiter_id)
 
 
 def _renew(
@@ -388,7 +441,7 @@ def _renew(
 ) -> tuple[_Capacity, bool]:
     swept: Final = _sweep(capacity, now)
     lease: Final = swept.lease
-    if lease is None or lease.waiter_id != waiter_id or lease.token != token:
+    if lease is None or not lease.claimed or lease.waiter.waiter_id != waiter_id or lease.token != token:
         return swept, False
     return replace(swept, lease=replace(lease, until_ms=now + settings.lease_ms)), True
 
@@ -401,7 +454,8 @@ def _report(
     active_probe: Final = (
         isinstance(grant, Probe)
         and lease is not None
-        and lease.waiter_id == waiter_id
+        and lease.claimed
+        and lease.waiter.waiter_id == waiter_id
         and lease.token == grant.token
         and swept.generation == grant.generation
     )
@@ -422,9 +476,9 @@ def _abandon(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: 
     lease: Final = swept.lease
     remaining: Final = replace(
         swept,
-        lease=None if lease is not None and lease.waiter_id == waiter_id else lease,
-        queue=tuple(waiter for waiter in swept.queue if waiter.waiter_id != waiter_id),
-        pending=_without_pending(swept.pending, frozenset((waiter_id,))),
+        lease=None if lease is not None and lease.waiter.waiter_id == waiter_id else lease,
+        queue=_without(swept.queue, waiter_id),
+        snapshot=_without(swept.snapshot, waiter_id),
     )
     return _grant_probe(remaining, now, settings)
 

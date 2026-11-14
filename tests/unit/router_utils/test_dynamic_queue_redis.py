@@ -6,7 +6,7 @@ from redis.crc import key_slot
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from litellm.router_utils.dynamic_queue import CoordinationUnavailable, DynamicQueue, WaitRequest
-from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, _keys, rank_key
+from litellm.router_utils.dynamic_queue_redis import REDIS_UNAVAILABLE, RedisQueueBackend, _keys, rank_key
 
 
 def test_rank_keys_sort_byte_wise_in_numeric_order_for_any_integer() -> None:
@@ -25,15 +25,16 @@ def test_every_key_of_a_capacity_lands_on_one_cluster_slot(capacity: str) -> Non
 class UnreachableRedis:
     def async_register_script(self, script: str) -> Callable[..., Awaitable[object]]:
         async def run(keys: Sequence[str], args: Sequence[str | int]) -> object:
-            raise RedisConnectionError("connection refused")
+            raise RedisConnectionError("Error connecting to redis://queue-user:hunter2@cache.internal:6379")
 
         return run
 
 
-async def test_an_unreachable_redis_rejects_the_wait_instead_of_admitting_locally() -> None:
+async def test_an_unreachable_redis_rejects_the_wait_with_a_stable_reason_instead_of_admitting_locally() -> None:
     queue: Final = DynamicQueue(RedisQueueBackend(UnreachableRedis()))
 
     result: Final = await queue.admit(WaitRequest(capacity="deployment-1", waiter_id="a", priority=0), 30.0)
 
     assert isinstance(result, CoordinationUnavailable)
-    assert "connection refused" in result.reason
+    assert result.reason == REDIS_UNAVAILABLE
+    assert "hunter2" not in repr(result)

@@ -2,15 +2,18 @@
 
 Each operation is one Lua script call over five keys sharing a hash tag, so it is atomic and lands on one Redis
 Cluster slot. Time is Redis ``TIME``, the one clock every worker agrees on. Waiters sort by member text, so the order
-is exact for any integer priority and FIFO by an atomic sequence within one, with no floating-point score.
+is exact for any integer priority and FIFO by an atomic sequence within one, with no floating-point score. A waiter's
+own expiry is checked before it is granted, claimed or kept alive, so the bounded sweep only reclaims space.
 """
 
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Final, Protocol
 
 from pydantic import TypeAdapter, ValidationError
 
-from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
+from litellm._logging import verbose_logger
+from litellm.caching.redis_cache import RedisCircuitBreakerOpenError, log_redis_failure
 from litellm.router_utils.dynamic_queue import (
     AdmitReply,
     CoordinationUnavailable,
@@ -29,11 +32,12 @@ from litellm.router_utils.dynamic_queue import (
     WaitRequest,
 )
 
+REDIS_UNAVAILABLE: Final = "redis_unavailable"
+UNEXPECTED_REPLY: Final = "unexpected_reply"
 _RANK_WIDTH: Final = 6
-_SEQ_WIDTH: Final = 20
 
 _SCRIPT: Final = """
-local state, queue, members, expiry, grants = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+local state, queue, drain, members, expiry = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
 local op, waiter = ARGV[1], ARGV[3]
 local now
 if ARGV[2] == '' then
@@ -54,59 +58,103 @@ local function waiter_of(member)
   return string.sub(member, string.find(member, '|', 1, true) + 22)
 end
 
-local function clear_lease()
-  redis.call('HDEL', state, 'lease_waiter', 'lease_token', 'lease_until')
-end
-
-local function drop(w)
+local function member_of(w)
   local entry = redis.call('HGET', members, w)
-  if entry then
-    redis.call('ZREM', queue, string.sub(entry, string.find(entry, '|', 1, true) + 1))
-    redis.call('HDEL', members, w)
+  if not entry then
+    return nil
   end
-  redis.call('ZREM', expiry, w)
-  redis.call('HDEL', grants, w)
-  if redis.call('HGET', state, 'lease_waiter') == w then
-    clear_lease()
-  end
+  return string.sub(entry, string.find(entry, '|', 1, true) + 1)
 end
 
-local function sweep()
-  if redis.call('HEXISTS', state, 'lease_until') == 1 and num('lease_until') <= now then
-    clear_lease()
-  end
-  for _, w in ipairs(redis.call('ZRANGEBYSCORE', expiry, '-inf', now, 'LIMIT', 0, sweep_limit)) do
-    drop(w)
-  end
+local function expired(w)
+  local score = redis.call('ZSCORE', expiry, w)
+  return score and tonumber(score) <= now
 end
 
 local function congested()
   return redis.call('HGET', state, 'mode') == 'congested'
 end
 
+local function healthy()
+  return not congested() and redis.call('ZCARD', drain) == 0
+end
+
+local function clear_lease()
+  redis.call('HDEL', state, 'lease_waiter', 'lease_token', 'lease_until', 'lease_claimed')
+end
+
+local function drop(w)
+  local member = member_of(w)
+  if member then
+    redis.call('ZREM', queue, member)
+    redis.call('ZREM', drain, member)
+    redis.call('HDEL', members, w)
+  end
+  redis.call('ZREM', expiry, w)
+  if redis.call('HGET', state, 'lease_waiter') == w then
+    clear_lease()
+  end
+end
+
+local function release_lease()
+  local w = redis.call('HGET', state, 'lease_waiter')
+  if w and redis.call('HGET', state, 'lease_claimed') == '0' then
+    local member = member_of(w)
+    if member and not expired(w) then
+      redis.call('ZADD', queue, 0, member)
+    else
+      drop(w)
+    end
+  end
+  clear_lease()
+end
+
+local function sweep()
+  local w = redis.call('HGET', state, 'lease_waiter')
+  if w and (num('lease_until') <= now or (redis.call('HGET', state, 'lease_claimed') == '0' and expired(w))) then
+    release_lease()
+  end
+  for _, e in ipairs(redis.call('ZRANGEBYSCORE', expiry, '-inf', now, 'LIMIT', 0, sweep_limit)) do
+    drop(e)
+  end
+end
+
+local function head_of(set)
+  for _ = 0, sweep_limit do
+    local head = redis.call('ZRANGE', set, 0, 0)[1]
+    if not head then
+      return nil
+    end
+    local w = waiter_of(head)
+    if not expired(w) then
+      return head, w
+    end
+    drop(w)
+  end
+  return nil
+end
+
 local function grant_probe()
   if not congested() or redis.call('HEXISTS', state, 'lease_waiter') == 1 or now < num('next_probe') then
     return
   end
-  local head = redis.call('ZRANGE', queue, 0, 0)[1]
+  local head, w = head_of(queue)
   if not head then
     return
   end
-  local w = waiter_of(head)
   local token = redis.call('HINCRBY', state, 'tokens', 1)
-  redis.call('HSET', state, 'lease_waiter', w, 'lease_token', token, 'lease_until', now + lease_ms)
+  redis.call('HSET', state, 'lease_waiter', w, 'lease_token', token, 'lease_until', now + lease_ms, 'lease_claimed', 0)
   redis.call('ZREM', queue, head)
-  redis.call('HDEL', members, w)
-  redis.call('HSET', grants, w, 'probe|' .. num('generation') .. '|' .. token)
 end
 
-local function take_grant(w)
-  local grant = redis.call('HGET', grants, w)
-  if grant then
-    redis.call('HDEL', grants, w)
-    redis.call('ZREM', expiry, w)
+local function claim_probe(w)
+  if redis.call('HGET', state, 'lease_waiter') ~= w or redis.call('HGET', state, 'lease_claimed') ~= '0' then
+    return nil
   end
-  return grant
+  redis.call('HSET', state, 'lease_claimed', 1)
+  redis.call('HDEL', members, w)
+  redis.call('ZREM', expiry, w)
+  return {'grant', 'probe|' .. num('generation') .. '|' .. num('lease_token')}
 end
 
 local function congest(retry_after, failed_probe)
@@ -117,22 +165,21 @@ local function congest(retry_after, failed_probe)
       backoff = math.min(backoff * 2, max_backoff)
     end
   end
+  release_lease()
+  redis.call('ZUNIONSTORE', queue, 2, queue, drain)
+  redis.call('DEL', drain)
   redis.call('HINCRBY', state, 'generation', 1)
-  clear_lease()
   local next_probe = math.max(num('next_probe'), now + math.max(backoff, retry_after))
   redis.call('HSET', state, 'mode', 'congested', 'successes', 0, 'backoff', backoff, 'next_probe', next_probe)
 end
 
 local function recover()
-  local generation = redis.call('HINCRBY', state, 'generation', 1)
+  redis.call('HINCRBY', state, 'generation', 1)
   redis.call('HDEL', state, 'mode', 'successes', 'backoff', 'next_probe')
   clear_lease()
-  for order, member in ipairs(redis.call('ZRANGE', queue, 0, -1)) do
-    local w = waiter_of(member)
-    redis.call('HSET', grants, w, 'released|' .. generation .. '|' .. order)
-    redis.call('HDEL', members, w)
+  if redis.call('ZCARD', queue) > 0 then
+    redis.call('RENAME', queue, drain)
   end
-  redis.call('DEL', queue)
 end
 
 local function touch()
@@ -141,50 +188,91 @@ local function touch()
   end
 end
 
-local function settle(w)
+local function settle_congested(w)
   grant_probe()
-  local grant = take_grant(w)
+  local claimed = claim_probe(w)
   touch()
-  if grant then
-    return {'grant', grant}
-  end
-  return {'wait'}
+  return claimed or {'wait'}
+end
+
+local function admitted(w, member)
+  redis.call('ZREM', queue, member)
+  redis.call('ZREM', drain, member)
+  redis.call('HDEL', members, w)
+  redis.call('ZREM', expiry, w)
+  touch()
 end
 
 sweep()
 
 if op == 'admit' then
-  if not congested() then
+  if healthy() then
     touch()
     return {'pass', num('generation')}
   end
-  if redis.call('ZCARD', queue) >= max_waiting then
+  local budget = tonumber(ARGV[13])
+  if budget <= 0 then
+    return {'gone'}
+  end
+  if redis.call('ZCARD', queue) + redis.call('ZCARD', drain) >= max_waiting then
     touch()
     return {'full'}
   end
   local seq = redis.call('HINCRBY', state, 'seq', 1)
   local member = ARGV[12] .. '|' .. string.format('%020d', seq) .. '|' .. waiter
-  local deadline = now + tonumber(ARGV[13])
+  local deadline = now + budget
   redis.call('ZADD', queue, 0, member)
   redis.call('HSET', members, waiter, deadline .. '|' .. member)
   redis.call('ZADD', expiry, math.min(deadline, now + liveness_ms), waiter)
-  return settle(waiter)
+  if congested() then
+    return settle_congested(waiter)
+  end
+  touch()
+  return {'wait', redis.call('ZCARD', drain)}
 end
 
 if op == 'poll' then
-  if redis.call('HEXISTS', grants, waiter) == 0 then
-    local entry = redis.call('HGET', members, waiter)
-    if not entry then
-      return {'gone'}
-    end
-    local deadline = tonumber(string.sub(entry, 1, string.find(entry, '|', 1, true) - 1))
-    redis.call('ZADD', expiry, math.min(deadline, now + liveness_ms), waiter)
+  if expired(waiter) then
+    drop(waiter)
+    grant_probe()
+    touch()
+    return {'gone'}
   end
-  return settle(waiter)
+  local claimed = claim_probe(waiter)
+  if claimed then
+    touch()
+    return claimed
+  end
+  local entry = redis.call('HGET', members, waiter)
+  if not entry then
+    return {'gone'}
+  end
+  local split = string.find(entry, '|', 1, true)
+  local member = string.sub(entry, split + 1)
+  redis.call('ZADD', expiry, math.min(tonumber(string.sub(entry, 1, split - 1)), now + liveness_ms), waiter)
+  if redis.call('ZSCORE', drain, member) then
+    local _, head_waiter = head_of(drain)
+    if head_waiter == waiter then
+      admitted(waiter, member)
+      return {'grant', 'released|' .. num('generation')}
+    end
+    touch()
+    return {'wait', redis.call('ZRANK', drain, member)}
+  end
+  if healthy() then
+    admitted(waiter, member)
+    return {'pass', num('generation')}
+  end
+  if not congested() then
+    touch()
+    return {'wait', redis.call('ZCARD', drain)}
+  end
+  return settle_congested(waiter)
 end
 
 if op == 'renew' then
-  if redis.call('HGET', state, 'lease_waiter') == waiter and num('lease_token') == tonumber(ARGV[12]) then
+  if redis.call('HGET', state, 'lease_waiter') == waiter and redis.call('HGET', state, 'lease_claimed') == '1'
+    and num('lease_token') == tonumber(ARGV[12]) then
     redis.call('HSET', state, 'lease_until', now + lease_ms)
     touch()
     return {'renewed'}
@@ -195,6 +283,7 @@ end
 if op == 'report' then
   local active_probe = ARGV[12] == 'probe'
     and redis.call('HGET', state, 'lease_waiter') == waiter
+    and redis.call('HGET', state, 'lease_claimed') == '1'
     and num('lease_token') == tonumber(ARGV[14])
     and num('generation') == tonumber(ARGV[13])
   if ARGV[15] == 'matching' then
@@ -242,21 +331,16 @@ def rank_key(priority: int) -> str:
 
 def _keys(capacity: str) -> tuple[str, ...]:
     tag: Final = f"litellm:dynamic_queue:{{dq:{capacity}}}"
-    return tuple(f"{tag}:{part}" for part in ("state", "queue", "members", "expiry", "grants"))
+    return tuple(f"{tag}:{part}" for part in ("state", "queue", "drain", "members", "expiry"))
 
 
 def _text(item: str | bytes | int) -> str:
     return item.decode() if isinstance(item, bytes) else str(item)
 
 
-def _grant(encoded: str) -> Grant | CoordinationUnavailable:
-    match tuple(encoded.split("|")):
-        case ("probe", generation, token):
-            return Probe(generation=int(generation), token=int(token))
-        case ("released", generation, order):
-            return Released(generation=int(generation), order=int(order))
-        case _:
-            return CoordinationUnavailable(reason=f"unexpected grant {encoded!r}")
+def _unexpected(reply: tuple[str, ...]) -> CoordinationUnavailable:
+    verbose_logger.error("dynamic queue: unexpected Redis script reply %r", reply)
+    return CoordinationUnavailable(reason=UNEXPECTED_REPLY)
 
 
 def _settled(reply: tuple[str, ...]) -> Grant | Waiting | QueueFull | Gone | CoordinationUnavailable:
@@ -264,15 +348,27 @@ def _settled(reply: tuple[str, ...]) -> Grant | Waiting | QueueFull | Gone | Coo
         case ("pass", generation):
             return PassThrough(generation=int(generation))
         case ("grant", encoded):
-            return _grant(encoded)
+            return _grant(reply, encoded)
         case ("wait",):
             return Waiting()
+        case ("wait", ahead):
+            return Waiting(ahead=int(ahead))
         case ("full",):
             return QueueFull()
         case ("gone",):
             return Gone()
         case _:
-            return CoordinationUnavailable(reason=f"unexpected reply {reply!r}")
+            return _unexpected(reply)
+
+
+def _grant(reply: tuple[str, ...], encoded: str) -> Grant | CoordinationUnavailable:
+    match tuple(encoded.split("|")):
+        case ("probe", generation, token):
+            return Probe(generation=int(generation), token=int(token))
+        case ("released", generation):
+            return Released(generation=int(generation))
+        case _:
+            return _unexpected(reply)
 
 
 def _outcome_args(outcome: Outcome) -> tuple[str, int]:
@@ -331,29 +427,26 @@ class RedisQueueBackend:
         )
         try:
             raw: Final = await self._run(keys=_keys(capacity), args=args)
+        except (RedisError, RedisCircuitBreakerOpenError, OSError) as error:
+            log_redis_failure(verbose_logger, logging.ERROR, f"dynamic queue {op} could not reach Redis", error)
+            return CoordinationUnavailable(reason=REDIS_UNAVAILABLE)
+        try:
             return tuple(_text(item) for item in _REPLY.validate_python(raw))
-        except (RedisError, RedisCircuitBreakerOpenError, OSError, ValidationError) as error:
-            return CoordinationUnavailable(reason=f"{type(error).__name__}: {error}")
+        except ValidationError:
+            return _unexpected((type(raw).__name__,))
 
     async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
         reply: Final = await self._call(
             "admit", request.capacity, request.waiter_id, (rank_key(request.priority), budget_ms)
         )
-        if isinstance(reply, CoordinationUnavailable):
-            return reply
-        settled: Final = _settled(reply)
-        if isinstance(settled, Gone):
-            return CoordinationUnavailable(reason=f"unexpected admit reply {reply!r}")
-        return settled
+        return reply if isinstance(reply, CoordinationUnavailable) else _settled(reply)
 
     async def poll(self, capacity: str, waiter_id: str) -> PollReply:
         reply: Final = await self._call("poll", capacity, waiter_id, ())
         if isinstance(reply, CoordinationUnavailable):
             return reply
         settled: Final = _settled(reply)
-        if isinstance(settled, QueueFull):
-            return CoordinationUnavailable(reason=f"unexpected poll reply {reply!r}")
-        return settled
+        return _unexpected(reply) if isinstance(settled, QueueFull) else settled
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
         reply: Final = await self._call("renew", capacity, waiter_id, (token,))

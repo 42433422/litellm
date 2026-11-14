@@ -126,7 +126,7 @@ async def test_probe_backoff_doubles_to_its_cap_and_honors_a_longer_retry_after(
 
 
 @pytest.mark.asyncio
-async def test_consecutive_successes_recover_and_release_the_snapshot_ahead_of_later_arrivals(capacity: str) -> None:
+async def test_consecutive_successes_recover_into_a_snapshot_claimed_in_order_ahead_of_arrivals(capacity: str) -> None:
     clock: Final = SharedClock()
     first, second = _pair(clock, required_successes=2)
     await _congest(first, capacity)
@@ -147,10 +147,17 @@ async def test_consecutive_successes_recover_and_release_the_snapshot_ahead_of_l
         assert waiter_id == expected
         assert await remaining.pop(waiter_id).report(capacity, waiter_id, probe, outcome) is None
     arrival: Final = await first.admit(WaitRequest(capacity, "after-recovery", -100), FAR)
-    released: Final = await _polls(remaining, capacity)
+    f_early: Final = await second.poll(capacity, "f")
+    e: Final = await first.poll(capacity, "e")
+    arrival_mid: Final = await first.poll(capacity, "after-recovery")
+    f: Final = await second.poll(capacity, "f")
+    arrival_after: Final = await first.poll(capacity, "after-recovery")
 
-    assert isinstance(arrival, PassThrough)
-    assert released == {"e": Released(arrival.generation, 1), "f": Released(arrival.generation, 2)}
+    assert arrival == Waiting(ahead=2)
+    assert f_early == Waiting(ahead=1)
+    assert isinstance(arrival_after, PassThrough)
+    assert e == f == Released(arrival_after.generation)
+    assert arrival_mid == Waiting(ahead=1)
 
 
 @pytest.mark.asyncio
@@ -249,3 +256,72 @@ async def test_redis_time_drives_the_queue_when_no_clock_is_injected(capacity: s
     assert isinstance(await second.poll(capacity, "queued"), Waiting)
     assert await second.abandon(capacity, "queued") is None
     assert isinstance(await first.poll(capacity, "queued"), Gone)
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_its_place(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("owner", 0, first), ("later", 0, second)])
+    clock.ms = 1_000
+    assert await second.poll(capacity, "later") == Waiting()
+
+    await _congest(second, capacity)
+
+    assert await first.poll(capacity, "owner") == Waiting()
+    clock.ms = 2_000
+    assert await second.poll(capacity, "later") == Waiting()
+    regranted: Final = await first.poll(capacity, "owner")
+    assert isinstance(regranted, Probe) and regranted.generation == 2
+
+
+@pytest.mark.asyncio
+async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priority_and_deadline(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, required_successes=1, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("prober", -1, first), ("urgent", 1, second)])
+    await _enqueue(capacity, [("short-budget", 3, first)], budget_ms=3_000)
+    clock.ms = 1_000
+    probe: Final = await first.poll(capacity, "prober")
+    assert isinstance(probe, Probe)
+    assert await first.report(capacity, "prober", probe, Succeeded()) is None
+
+    await _congest(second, capacity)
+
+    assert await first.poll(capacity, "short-budget") == Waiting()
+    clock.ms = 2_000
+    assert await first.poll(capacity, "short-budget") == Waiting()
+    assert isinstance(await second.poll(capacity, "urgent"), Probe)
+    clock.ms = 3_000
+    assert isinstance(await first.poll(capacity, "short-budget"), Gone)
+
+
+@pytest.mark.asyncio
+async def test_a_congested_admit_with_no_budget_is_refused_even_when_a_probe_is_due(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock)
+    await _congest(first, capacity)
+    clock.ms = 1_000
+
+    assert isinstance(await first.admit(WaitRequest(capacity, "spent", 0), 0), Gone)
+    assert isinstance(await second.admit(WaitRequest(capacity, "next", 0), FAR), Probe)
+
+
+@pytest.mark.asyncio
+async def test_expired_waiters_beyond_the_sweep_limit_are_never_granted_or_revived(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, sweep_limit=2, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [(f"stale-{index}", -10, first) for index in range(6)], budget_ms=500)
+    await _enqueue(capacity, [("live", 0, second)])
+    clock.ms = 1_000
+
+    unswept: Final = await first.poll(capacity, "stale-5")
+    granted: Final = await second.poll(capacity, "live")
+    stale_after: Final = [await first.poll(capacity, f"stale-{index}") for index in range(6)]
+
+    assert isinstance(unswept, Gone)
+    assert isinstance(granted, Probe)
+    assert all(isinstance(reply, Gone) for reply in stale_after)

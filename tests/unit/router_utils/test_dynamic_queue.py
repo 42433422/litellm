@@ -9,6 +9,7 @@ from litellm.router_utils.dynamic_queue import (
     Admitted,
     CoordinationUnavailable,
     DynamicQueue,
+    Gone,
     Grant,
     LocalQueueBackend,
     MatchingFailure,
@@ -49,12 +50,12 @@ class ManualTimer:
             self._changed.notify_all()
         await wake
 
-    def _pending(self) -> int:
+    def pending(self) -> int:
         return sum(1 for _, wake in self._sleepers if not wake.done())
 
     async def _sleeping(self, count: int) -> None:
         async with self._changed:
-            await self._changed.wait_for(lambda: self._pending() >= count)
+            await self._changed.wait_for(lambda: self.pending() >= count)
 
     async def parked(self, task: "asyncio.Task[Admitted | Rejection] | None" = None, count: int = 1) -> None:
         sleeping: Final = asyncio.create_task(self._sleeping(count))
@@ -188,13 +189,13 @@ async def test_probe_backoff_doubles_on_each_failed_probe_up_to_the_cap_and_hono
         await backend.report(CAPACITY, waiter_id, probe, MatchingFailure(retry_after_ms))
 
 
-async def test_recovery_needs_consecutive_probe_successes_then_admits_every_waiter_ahead_of_later_arrivals() -> None:
+async def test_recovery_needs_consecutive_probe_successes() -> None:
     timer: Final = ManualTimer()
     backend: Final = _backend(timer, required_successes=2)
     await _congest(backend)
-    await _enqueue(backend, ("a", 0), ("b", 1), ("c", 2), ("d", 3), ("e", 4), ("f", 4))
+    await _enqueue(backend, ("a", 0), ("b", 1), ("c", 2), ("d", 3), ("behind", 4))
     timer.advance(1.0)
-    waiters: Final = ["a", "b", "c", "d", "e", "f"]
+    waiters: Final = ["a", "b", "c", "d", "behind"]
 
     for waiter_id, outcome in (("a", Succeeded()), ("b", OtherFailure()), ("c", Succeeded())):
         probed, probe = await _probed(backend, waiters)
@@ -204,13 +205,128 @@ async def test_recovery_needs_consecutive_probe_successes_then_admits_every_wait
     probed, probe = await _probed(backend, waiters)
     assert probed == "d"
     await backend.report(CAPACITY, "d", probe, Succeeded())
-    arrival: Final = await backend.admit(_request("after-recovery", priority=-100), FAR)
 
-    released: Final = await _polls(backend, ["e", "f"])
-    assert isinstance(arrival, PassThrough)
-    assert isinstance(released["e"], Released) and isinstance(released["f"], Released)
-    assert (released["e"].order, released["f"].order) == (1, 2)
-    assert released["e"].generation == released["f"].generation == arrival.generation
+    assert isinstance(await backend.poll(CAPACITY, "behind"), Released)
+
+
+async def _recovered(timer: ManualTimer, backend: LocalQueueBackend, *snapshot: tuple[str, int]) -> None:
+    """Congests, queues a prober ahead of ``snapshot`` and recovers on its single success."""
+    await _congest(backend)
+    await _enqueue(backend, ("prober", -(10**9)), *snapshot)
+    timer.advance(1.0)
+    probe: Final = await backend.poll(CAPACITY, "prober")
+    assert isinstance(probe, Probe)
+    await backend.report(CAPACITY, "prober", probe, Succeeded())
+
+
+async def test_a_recovery_snapshot_claims_in_priority_order_while_every_later_arrival_waits() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _recovered(timer, backend, ("low", 9), ("high", 1), ("high-second", 1))
+
+    early_arrival: Final = await backend.admit(_request("arrival", priority=-100), FAR)
+    low_first: Final = await backend.poll(CAPACITY, "low")
+    second_first: Final = await backend.poll(CAPACITY, "high-second")
+    high: Final = await backend.poll(CAPACITY, "high")
+    arrival_mid: Final = await backend.poll(CAPACITY, "arrival")
+    second: Final = await backend.poll(CAPACITY, "high-second")
+    low: Final = await backend.poll(CAPACITY, "low")
+    arrival_after: Final = await backend.poll(CAPACITY, "arrival")
+    fresh: Final = await backend.admit(_request("fresh"), FAR)
+
+    assert early_arrival == Waiting(ahead=3)
+    assert low_first == Waiting(ahead=2)
+    assert second_first == Waiting(ahead=1)
+    assert isinstance(high, Released)
+    assert arrival_mid == Waiting(ahead=2)
+    assert isinstance(second, Released) and isinstance(low, Released)
+    assert isinstance(arrival_after, PassThrough) and isinstance(fresh, PassThrough)
+
+
+@pytest.mark.parametrize("leaves", ["abandon", "deadline"])
+async def test_a_snapshot_member_that_leaves_stops_holding_back_the_rest(leaves: str) -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _congest(backend)
+    _ = await backend.admit(_request("prober", priority=-1), FAR)
+    _ = await backend.admit(_request("head"), 1_500)
+    _ = await backend.admit(_request("next", priority=1), FAR)
+    timer.advance(1.0)
+    probe: Final = await backend.poll(CAPACITY, "prober")
+    assert isinstance(probe, Probe)
+    await backend.report(CAPACITY, "prober", probe, Succeeded())
+    assert await backend.poll(CAPACITY, "next") == Waiting(ahead=1)
+
+    if leaves == "abandon":
+        await backend.abandon(CAPACITY, "head")
+    else:
+        timer.at = 1.5
+
+    assert isinstance(await backend.poll(CAPACITY, "next"), Released)
+    assert isinstance(await backend.poll(CAPACITY, "head"), Gone)
+
+
+async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_its_place() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0), ("later", 0))
+    timer.advance(1.0)
+    assert await backend.poll(CAPACITY, "later") == Waiting()
+
+    await _congest(backend)
+
+    assert await backend.poll(CAPACITY, "owner") == Waiting()
+    timer.advance(1.0)
+    regranted: Final = await backend.poll(CAPACITY, "owner")
+    assert isinstance(regranted, Probe) and regranted.generation == 2
+    assert await backend.poll(CAPACITY, "later") == Waiting()
+
+
+async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priority_and_deadline() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _congest(backend)
+    _ = await backend.admit(_request("prober", priority=-1), FAR)
+    _ = await backend.admit(_request("short-budget", priority=3), 3_000)
+    _ = await backend.admit(_request("urgent", priority=1), FAR)
+    timer.advance(1.0)
+    probe: Final = await backend.poll(CAPACITY, "prober")
+    assert isinstance(probe, Probe)
+    await backend.report(CAPACITY, "prober", probe, Succeeded())
+
+    await _congest(backend)
+
+    assert await backend.poll(CAPACITY, "short-budget") == Waiting()
+    timer.at = 2.0
+    assert await backend.poll(CAPACITY, "short-budget") == Waiting()
+    assert isinstance(await backend.poll(CAPACITY, "urgent"), Probe)
+    timer.at = 3.0
+    assert isinstance(await backend.poll(CAPACITY, "short-budget"), Gone)
+
+
+async def test_a_congested_wait_with_no_budget_times_out_without_taking_a_due_probe() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.advance(1.0)
+
+    result: Final = await DynamicQueue(backend, timer).admit(_request("spent"), 0.0)
+
+    assert isinstance(result, QueueTimeout)
+    assert isinstance(await backend.admit(_request("next"), FAR), Probe)
+
+
+async def test_a_waiter_reaching_its_deadline_as_the_probe_comes_due_is_not_granted() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    _ = await backend.admit(_request("due-now"), 1_000)
+    _ = await backend.admit(_request("next"), FAR)
+    timer.at = 1.0
+
+    assert isinstance(await backend.poll(CAPACITY, "due-now"), Gone)
+    assert isinstance(await backend.poll(CAPACITY, "next"), Probe)
 
 
 async def test_a_probe_success_from_a_superseded_generation_does_not_recover() -> None:
@@ -393,3 +509,69 @@ async def test_a_reported_probe_success_recovers_the_capacity_for_the_waiters_be
         assert await attempt.report(Succeeded()) is None
 
     assert isinstance(await backend.poll(CAPACITY, "behind"), Released)
+
+
+class HoldsReleases(StallsAfterEnqueue):
+    """Lets admission through, then holds every report and abandon until the test releases them."""
+
+    def __init__(self, inner: LocalQueueBackend) -> None:
+        super().__init__(inner)
+        self.held = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms)
+
+    async def report(
+        self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
+    ) -> None | CoordinationUnavailable:
+        self.held.set()
+        await self.release.wait()
+        return await self.inner.report(capacity, waiter_id, grant, outcome)
+
+    async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
+        self.held.set()
+        await self.release.wait()
+        return await self.inner.abandon(capacity, waiter_id)
+
+
+async def _held_probe(timer: ManualTimer) -> tuple[LocalQueueBackend, HoldsReleases, Admitted]:
+    inner: Final = _backend(timer, required_successes=1)
+    await _congest(inner)
+    holding: Final = HoldsReleases(inner)
+    waiting: Final = asyncio.create_task(DynamicQueue(holding, timer).admit(_request("p"), 9.0))
+    admitted: Final = await _run(timer, waiting, 1.0)
+    assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
+    await _enqueue(inner, ("behind", 0))
+    return inner, holding, admitted
+
+
+@pytest.mark.parametrize("reports", [True, False])
+async def test_cancelling_a_probe_while_its_release_is_in_flight_finishes_the_release_then_cancels(
+    reports: bool,
+) -> None:
+    timer: Final = ManualTimer()
+    inner, holding, admitted = await _held_probe(timer)
+    attempt: Final = DynamicQueue(holding, timer).attempt(_request("p"), admitted)
+
+    async def probe() -> None:
+        async with attempt:
+            if not reports:
+                await asyncio.Event().wait()
+            await timer.parked()
+            _ = await attempt.report(Succeeded())
+
+    running: Final = asyncio.create_task(probe())
+    if not reports:
+        await timer.parked()
+        running.cancel()
+    await holding.held.wait()
+    running.cancel()
+    running.cancel()
+    holding.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    after: Final = await inner.poll(CAPACITY, "behind")
+    assert isinstance(after, Released if reports else Probe)
+    assert timer.pending() == 0

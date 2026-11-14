@@ -48,9 +48,6 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RateLimitResponse,
     RateLimitUnverifiableError,
     RequestRateLimiterStash,
-    _fail_closed_rate_limit_enforcement_from_general_settings,  # pyright: ignore[reportPrivateUsage]  # the inner limiter's default policy, read live per call
-    _force_redis_hash_tag_grouping_from_litellm_settings,  # pyright: ignore[reportPrivateUsage]  # the inner limiter's default policy, read live per call
-    _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage]  # the registered limiter whose store capacity shares
     borrowing_team_model_limits,
     callback_kwargs_mapping,
     claim_request_stash_for_data,
@@ -58,6 +55,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     get_request_stash,
     request_stash_for_callback,
 )
+from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy as limiter_policy
 from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.proxy.request_auth_context import REQUEST_AUTH
@@ -296,8 +294,7 @@ class CapacityDelegate:
             "saturation_check_cache_ttl": settings.saturation_check_cache_ttl,
             "window_size": self.v3_limiter.window_size,
             "rate_limit_type": self.v3_limiter.get_rate_limit_type(),
-            "fail_closed": _fail_closed_rate_limit_enforcement_from_general_settings(),
-            "force_grouping": _force_redis_hash_tag_grouping_from_litellm_settings(),
+            "policy": limiter_policy(self.v3_limiter),
         }
 
     @_seam
@@ -467,7 +464,7 @@ def shared_rate_limit_store(internal_usage_cache: DualCache) -> RateLimitStore:
         (
             callback.rate_limits
             for callback in litellm.callbacks
-            if isinstance(callback, _PROXY_MaxParallelRequestsHandler_v3)
+            if isinstance(callback, PROXY_MaxParallelRequestsHandler_v3)
             and callback.internal_usage_cache.dual_cache is internal_usage_cache
         ),
         None,
@@ -574,7 +571,7 @@ class NativeDynamicRateLimiter(RustLogger):
         *,
         rate_limits: RateLimitStore | None = None,
     ) -> "NativeDynamicRateLimiter":
-        from litellm.rust_bridge._native import NativeModelCapacity
+        from litellm.rust_bridge._native import NativeModelCapacity, NativeRateLimits
 
         register_abort_error(RATE_LIMIT_KIND, _rate_limit_error)
         register_abort_error(RERAISE_KIND, _reraise)
@@ -584,10 +581,13 @@ class NativeDynamicRateLimiter(RustLogger):
             time_provider=time_provider,
             rate_limit_store=store,
         )
+        handle: Final = store.handle
+        if not isinstance(handle, NativeRateLimits):
+            raise TypeError(f"model capacity counts on the native rate limit store, not {type(handle).__name__}")
         delegate: Final = CapacityDelegate(internal_usage_cache, v3_limiter)
         capacity: Final = NativeModelCapacity(
             delegate,
-            store._handle,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the engine shares the native store and its memory tier
+            handle,
             v3_limiter.window_size,
             v3_limiter.tpm_reservation_enabled,
             None if time_provider is None else (lambda: time_provider().timestamp()),

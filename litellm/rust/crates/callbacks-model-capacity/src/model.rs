@@ -1,5 +1,5 @@
 use litellm_callbacks::{KeyIdentity, LoggedModelGroup, Scalar, Usage, UsageRecord};
-use litellm_callbacks_parallel_request_limiter::Policy;
+use litellm_callbacks_parallel_request_limiter::{Policy, PolicyFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
@@ -152,17 +152,12 @@ pub struct Settings {
     #[serde(default)]
     pub licensed: bool,
     #[serde(default)]
-    pub fail_closed: bool,
-    #[serde(default)]
-    pub force_grouping: bool,
+    pub policy: PolicyFacts,
 }
 
 impl Settings {
     pub fn policy(&self) -> Policy {
-        Policy {
-            fail_closed: self.fail_closed,
-            force_grouping: self.force_grouping,
-        }
+        self.policy.into()
     }
 
     pub fn reserves<'a>(

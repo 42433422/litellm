@@ -3,7 +3,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde_json::{Number, Value, json};
 
-use litellm_callbacks_parallel_request_limiter::Ctx;
+use litellm_callbacks_parallel_request_limiter::{Ctx, PolicyFacts};
 
 use super::*;
 use crate::{
@@ -187,8 +187,7 @@ fn settings(ttl: Value) -> Settings {
         window_size: 60,
         rate_limit_type: TokenRateLimitType::default(),
         licensed: true,
-        fail_closed: false,
-        force_grouping: false,
+        policy: PolicyFacts::default(),
     }
 }
 

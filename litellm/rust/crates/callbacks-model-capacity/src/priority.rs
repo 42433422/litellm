@@ -220,6 +220,7 @@ pub fn team_share(
 
 #[cfg(test)]
 mod tests {
+    use litellm_callbacks_parallel_request_limiter::PolicyFacts;
     use rstest::rstest;
     use serde_json::json;
 
@@ -241,8 +242,7 @@ mod tests {
             window_size: 60,
             rate_limit_type: TokenRateLimitType::Total,
             licensed: true,
-            fail_closed: false,
-            force_grouping: false,
+            policy: PolicyFacts::default(),
         }
     }
 

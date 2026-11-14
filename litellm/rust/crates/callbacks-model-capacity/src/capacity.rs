@@ -1236,7 +1236,245 @@ pub fn scope(key: &str, value: &str) -> Scope {
 mod tests {
     use rstest::rstest;
 
+    use parking_lot::Mutex;
+    use serde_json::{Number, Value, json};
+
+    use litellm_callbacks_parallel_request_limiter::{Ctx, PolicyFacts};
+
+    use crate::{
+        model::{Status, TokenRateLimitType},
+        seam::{SeamFuture, ShareGauge},
+        state::Stash,
+    };
+
     use super::*;
+
+    struct FakeLimiter {
+        redis: Result<Option<Value>, String>,
+        local: Option<Value>,
+        atomic: LimiterResponse,
+        ttls: Mutex<Vec<(Counter, Value)>>,
+    }
+
+    impl FakeLimiter {
+        fn new(
+            redis: Result<Option<Value>, String>,
+            local: Option<Value>,
+            atomic: LimiterResponse,
+        ) -> Self {
+            Self {
+                redis,
+                local,
+                atomic,
+                ttls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl V3Limiter for FakeLimiter {
+        fn read_counter<'a>(
+            &'a self,
+            counter: &'a Counter,
+            backfill_ttl: &'a Value,
+        ) -> SeamFuture<'a, Option<Value>> {
+            self.ttls
+                .lock()
+                .push((counter.clone(), backfill_ttl.clone()));
+            let reply = self.redis.clone().map_err(CapacityError::Store);
+            Box::pin(async move { reply })
+        }
+
+        fn read_local_counter(&self, _counter: &Counter) -> Result<Option<Value>, CapacityError> {
+            Ok(self.local.clone())
+        }
+
+        fn check_and_increment<'a>(
+            &'a self,
+            _descriptors: &'a [Descriptor],
+            _increments: &'a [Increment],
+            _ctx: Ctx<'a>,
+        ) -> SeamFuture<'a, LimiterResponse> {
+            let reply = self.atomic.clone();
+            Box::pin(async move { Ok(reply) })
+        }
+
+        fn should_rate_limit<'a>(
+            &'a self,
+            _descriptors: &'a [Descriptor],
+            _read_only: bool,
+            _skip_parallel_check: bool,
+            _ctx: Ctx<'a>,
+        ) -> SeamFuture<'a, LimiterResponse> {
+            Box::pin(async move { Ok(answer("OK", Vec::new())) })
+        }
+
+        fn apply<'a>(&'a self, _operations: &'a [ReservationOp]) -> SeamFuture<'a, ()> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeHost {
+        group: Option<GroupInfo>,
+        logged: Mutex<Vec<(String, String)>>,
+    }
+
+    fn done<'a, T: Send + 'a>(value: T) -> SeamFuture<'a, T> {
+        Box::pin(async move { Ok(value) })
+    }
+
+    impl CapacityHost for FakeHost {
+        fn settings(&self) -> SeamFuture<'_, Settings> {
+            done(settings(json!(null)))
+        }
+
+        fn group<'a>(&'a self, _model: &'a str) -> SeamFuture<'a, Option<GroupInfo>> {
+            done(self.group.clone())
+        }
+
+        fn touch<'a>(
+            &'a self,
+            _model: &'a str,
+            _member: &'a str,
+            _priority_class: &'a Value,
+            _window: i64,
+        ) -> SeamFuture<'a, Vec<(String, Value)>> {
+            done(Vec::new())
+        }
+
+        fn metrics_enabled(&self) -> SeamFuture<'_, bool> {
+            done(false)
+        }
+
+        fn throttled<'a>(&'a self, _event: &'a Throttle) -> SeamFuture<'a, ()> {
+            done(())
+        }
+
+        fn set_share<'a>(&'a self, _gauge: &'a ShareGauge) -> SeamFuture<'a, ()> {
+            done(())
+        }
+
+        fn unlicensed_priority(&self) -> SeamFuture<'_, ()> {
+            done(())
+        }
+
+        fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()> {
+            self.logged
+                .lock()
+                .push((level.to_owned(), message.to_owned()));
+            done(())
+        }
+
+        fn borrowing_limits<'a>(
+            &'a self,
+            _model: &'a str,
+        ) -> SeamFuture<'a, Option<BorrowingLimits>> {
+            done(None)
+        }
+
+        fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String> {
+            done(model.to_owned())
+        }
+
+        fn estimate_tokens<'a>(
+            &'a self,
+            _tpm_share: i64,
+            _model: &'a str,
+            _call_type: Option<&'a str>,
+        ) -> SeamFuture<'a, Estimate> {
+            done(Estimate::NoBody)
+        }
+
+        fn cap_output<'a>(
+            &'a self,
+            _tpm_share: i64,
+            _call_type: Option<&'a str>,
+        ) -> SeamFuture<'a, ()> {
+            done(())
+        }
+
+        fn publish<'a>(&'a self, _published: &'a Published) -> SeamFuture<'a, ()> {
+            done(())
+        }
+
+        fn stash_call_type(&self) -> SeamFuture<'_, Option<String>> {
+            done(None)
+        }
+
+        fn post_call_success<'a>(&'a self, _headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {
+            done(())
+        }
+    }
+
+    fn settings(ttl: Value) -> Settings {
+        Settings {
+            priority_reservation: Some(vec![
+                (json!("high"), json!(0.9)),
+                (json!("low"), json!(0.1)),
+            ]),
+            default_priority: 0.5,
+            saturation_threshold: 0.5,
+            class_split: false,
+            saturation_check_cache_ttl: ttl,
+            window_size: 60,
+            rate_limit_type: TokenRateLimitType::default(),
+            licensed: true,
+            policy: PolicyFacts::default(),
+        }
+    }
+
+    fn group(tpm: Option<i64>, rpm: Option<i64>) -> GroupInfo {
+        GroupInfo {
+            tpm,
+            rpm,
+            input_cost_per_token: None,
+            output_cost_per_token: None,
+        }
+    }
+
+    fn answer(code: &str, statuses: Vec<Status>) -> LimiterResponse {
+        LimiterResponse {
+            overall_code: code.into(),
+            statuses,
+            reservation_windows: Vec::new(),
+        }
+    }
+
+    fn engine(limiter: &Arc<FakeLimiter>, host: &Arc<FakeHost>) -> Engine {
+        Engine {
+            limiter: Arc::clone(limiter) as Arc<dyn V3Limiter>,
+            host: Arc::clone(host) as Arc<dyn CapacityHost>,
+        }
+    }
+
+    async fn pre_call(
+        engine: &Engine,
+        settings: &Settings,
+        model: &str,
+        group: &GroupInfo,
+    ) -> PreCall {
+        let key = KeyFacts {
+            priority: Some(Priority {
+                value: json!("high"),
+                hash_error: None,
+            }),
+            ..KeyFacts::default()
+        };
+        let stash: SharedStash = Arc::new(Mutex::new(Stash::default()));
+        let request = Request {
+            key: &key,
+            call_type: None,
+            settings,
+            stash: &stash,
+            fallback: SaturationFallback {
+                enabled: false,
+                invalid: None,
+                armed: false,
+            },
+            redis: None,
+        };
+        engine.pre_call(&request, model, group).await
+    }
 
     fn tokens(key: &str, tpm: Option<i64>) -> Descriptor {
         Descriptor {
@@ -1275,8 +1513,122 @@ mod tests {
             expected
         );
     }
-}
 
-#[cfg(test)]
-#[path = "capacity_seam_tests.rs"]
-mod seam_tests;
+    #[tokio::test]
+    async fn saturation_check_cache_ttl_configuration_backfills_each_read_for_its_ttl_like_python()
+    {
+        let limiter = Arc::new(FakeLimiter::new(Ok(None), None, answer("OK", Vec::new())));
+        let host = Arc::new(FakeHost::default());
+        let engine = engine(&limiter, &host);
+        let model_group = group(Some(1000), Some(100));
+        engine
+            .saturation(&settings(json!(5)), "test-saturation-ttl", &model_group)
+            .await;
+        engine
+            .saturation(&settings(json!(30)), "test-saturation-ttl", &model_group)
+            .await;
+        let requests =
+            scope(MODEL_SATURATION_CHECK, "test-saturation-ttl").with_kind(CounterKind::Requests);
+        let tokens =
+            scope(MODEL_SATURATION_CHECK, "test-saturation-ttl").with_kind(CounterKind::Tokens);
+        assert_eq!(
+            *limiter.ttls.lock(),
+            vec![
+                (requests.clone(), json!(5)),
+                (tokens.clone(), json!(5)),
+                (requests, json!(30)),
+                (tokens, json!(30)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_saturation_read_falls_back_to_this_workers_copy_like_python() {
+        let limiter = Arc::new(FakeLimiter::new(
+            Err("redis down".into()),
+            Some(json!(3)),
+            answer("OK", Vec::new()),
+        ));
+        let host = Arc::new(FakeHost::default());
+        let saturation = engine(&limiter, &host)
+            .saturation(&settings(json!(60)), "down", &group(None, Some(4)))
+            .await;
+        assert!((saturation - 0.75).abs() < f64::EPSILON);
+        assert_eq!(
+            *host.logged.lock(),
+            vec![(
+                "warning".to_owned(),
+                "Saturation read failed in Redis, using this worker's copy: redis down".to_owned()
+            )]
+        );
+    }
+
+    #[rstest]
+    #[case::each_raise_branch_unknown_descriptor_for_fail_closed_fallback(
+        "gpt-4",
+        group(Some(1000), Some(100)),
+        "unknown_descriptor_for_fail_closed_fallback",
+        "requests",
+        100
+    )]
+    #[case::fails_closed_on_unknown_descriptor(
+        "fail-closed-model",
+        group(Some(1000), None),
+        "future_unrecognized_descriptor",
+        "tokens",
+        100
+    )]
+    #[case::unknown_descriptor_path_populates_provider(
+        "gpt-4o-mini",
+        group(None, Some(1)),
+        "something_we_dont_handle",
+        "requests",
+        1
+    )]
+    #[tokio::test]
+    async fn dynamic_rate_limiter_v3_refuses_an_over_limit_answer_for_an_unknown_descriptor(
+        #[case] model: &str,
+        #[case] model_group: GroupInfo,
+        #[case] descriptor_key: &str,
+        #[case] rate_limit_type: &str,
+        #[case] current_limit: i64,
+    ) {
+        let unknown = Status {
+            code: "OVER_LIMIT".into(),
+            current_limit: Number::from(current_limit),
+            limit_remaining: Some(Number::from(0)),
+            rate_limit_type: rate_limit_type.into(),
+            descriptor_key: descriptor_key.into(),
+            descriptor_value: None,
+        };
+        let limiter = Arc::new(FakeLimiter::new(
+            Ok(None),
+            None,
+            answer("OVER_LIMIT", vec![unknown]),
+        ));
+        let host = Arc::new(FakeHost {
+            group: Some(model_group.clone()),
+            ..FakeHost::default()
+        });
+        let PreCall::Refuse(refusal) = pre_call(
+            &engine(&limiter, &host),
+            &settings(json!(60)),
+            model,
+            &model_group,
+        )
+        .await
+        else {
+            panic!("an unknown over-limit descriptor must be refused");
+        };
+        assert_eq!(refusal.model, model);
+        assert_eq!(refusal.rate_limit_type.as_deref(), Some(rate_limit_type));
+        assert_eq!(
+            refusal.detail,
+            vec![
+                ("error".to_owned(), json!("Rate limit exceeded")),
+                ("descriptor_key".to_owned(), json!(descriptor_key)),
+                ("rate_limit_type".to_owned(), json!(rate_limit_type)),
+            ]
+        );
+    }
+}

@@ -5,6 +5,7 @@ from contextlib import AsyncExitStack
 from typing import Final
 
 import pytest
+import pytest_asyncio
 from redis import Redis
 
 from litellm.caching.redis_cache import RedisCache
@@ -56,7 +57,7 @@ class WorkerFactory:
         return self(clock, **overrides), self(clock, **overrides)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def workers() -> AsyncIterator[WorkerFactory]:
     async with AsyncExitStack() as cleanup:
         yield WorkerFactory(cleanup)

@@ -37,7 +37,7 @@ from tests.unit.proxy.hooks.native_capacity_handler import (
 )
 from tests.unit.proxy.hooks.native_capacity_handler import (
     borrowing_team_share,
-    counter_count,
+    counter_key,
     model_saturation,
     model_tracking_descriptor,
     pre_call_at_saturation,
@@ -1343,6 +1343,7 @@ async def test_async_log_success_event_increments_by_actual_tokens(monkeypatch):
         ]
     )
     handler.update_variables(llm_router=llm_router)
+    redis = handler.saturation_redis()
 
     # Create mock response with 50 completion tokens
     mock_response = MagicMock(spec=ModelResponse)
@@ -1375,8 +1376,19 @@ async def test_async_log_success_event_increments_by_actual_tokens(monkeypatch):
             end_time=None,
         )
 
-    assert counter_count(handler, RateLimitScope("model_saturation_check", model).counter("tokens")) == 60
-    assert counter_count(handler, RateLimitScope("priority_model", f"{model}:dev").counter("tokens")) == 60
+    increment_calls = redis.increments()
+    assert len(increment_calls) == 2, f"Expected 2 increment calls, got {len(increment_calls)}"
+
+    for counter, increment_value in increment_calls:
+        assert increment_value == 60, f"Expected increment of 60 tokens, got {increment_value} for counter {counter}"
+
+    counters = [counter for counter, _ in increment_calls]
+    assert counter_key(RateLimitScope("model_saturation_check", model).counter("tokens")) in counters, (
+        "Should increment model_saturation_check"
+    )
+    assert counter_key(RateLimitScope("priority_model", f"{model}:dev").counter("tokens")) in counters, (
+        "Should increment priority_model with 'dev' priority"
+    )
 
 
 @pytest.mark.asyncio
@@ -1412,6 +1424,7 @@ async def test_async_log_success_event_uses_team_priority_from_auth_metadata(mon
         ]
     )
     handler.update_variables(llm_router=llm_router)
+    redis = handler.saturation_redis()
 
     # Create mock response
     mock_response = MagicMock(spec=ModelResponse)
@@ -1447,9 +1460,12 @@ async def test_async_log_success_event_uses_team_priority_from_auth_metadata(mon
             end_time=None,
         )
 
-    assert counter_count(handler, RateLimitScope("priority_model", f"{model}:team_priority").counter("tokens")) == 30
-    assert counter_count(handler, RateLimitScope("priority_model", f"{model}:default_pool").counter("tokens")) is None
-    assert counter_count(handler, RateLimitScope("priority_model", f"{model}:default").counter("tokens")) is None
+    priority_keys = [counter for counter, _ in redis.increments() if counter.startswith("{priority_model:")]
+    assert len(priority_keys) == 1, f"Expected 1 priority_model key, got {len(priority_keys)}"
+
+    assert priority_keys[0] == counter_key(
+        RateLimitScope("priority_model", f"{model}:team_priority").counter("tokens")
+    ), f"Expected priority key to use 'team_priority' from user_api_key_auth_metadata, got key: {priority_keys[0]}"
 
 
 @pytest.mark.asyncio
@@ -2396,6 +2412,7 @@ async def test_a_request_served_by_another_model_counts_its_images_for_that_mode
         asked.append(model)
         return (model,)
 
+    handler.saturation_redis()
     handler.v3_limiter = PROXY_MaxParallelRequestsHandler_v3(
         handler.internal_usage_cache, media_model_resolver=resolver
     )
@@ -2790,6 +2807,7 @@ async def test_a_capped_borrowers_reservation_is_sized_by_its_share_not_its_cap(
     against the cap would refuse a request its own share would let through, and would admit different
     requests depending on whether the model happened to be saturated."""
     handler: Final = _borrowing_handler(monkeypatch, borrows=True)
+    handler.saturation_redis()
     await _admit_at_the_hook(handler, _capped_team_key(2), tokens=160)
     short_prompt_without_max_tokens: Final[dict[str, object]] = {"messages": [{"role": "user", "content": "hi"}]}
     await _check(handler, _capped_team_key(2), saturation=saturation, data=short_prompt_without_max_tokens)
@@ -3450,6 +3468,47 @@ async def test_a_failing_metrics_sink_never_changes_admission(monkeypatch: pytes
     assert refusal.headers["rate_limited_by"] == "model_per_team_saturated"
 
 
+@pytest.mark.asyncio
+async def test_saturation_check_cache_ttl_configuration(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_check_cache_ttl", 5)
+
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    model = "test-saturation-ttl"
+    llm_router = Router(
+        model_list=[
+            {
+                "model_name": model,
+                "litellm_params": {
+                    "model": "gpt-3.5-turbo",
+                    "api_key": "test-key",
+                    "api_base": "test-base",
+                    "rpm": 100,
+                    "tpm": 1000,
+                },
+            }
+        ]
+    )
+    handler.update_variables(llm_router=llm_router)
+
+    redis = handler.saturation_redis()
+    counter = counter_key(RateLimitScope("model_saturation_check", model).counter("requests"))
+    unread = {counter: None, counter_key(RateLimitScope("model_saturation_check", model).counter("tokens")): None}
+
+    with redis.answering(unread):
+        await handler.async_pre_call_hook(UserAPIKeyAuth(), DualCache(), {"model": model}, "acompletion")
+
+    get_cache_calls = [key for key in redis.read_keys() if key == counter]
+    assert len(get_cache_calls) == 1, "Expected 1 cache call"
+
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_check_cache_ttl", 30)
+
+    with redis.answering(unread):
+        await handler.async_pre_call_hook(UserAPIKeyAuth(), DualCache(), {"model": model}, "acompletion")
+
+    assert [key for key in redis.read_keys() if key == counter] == [counter, counter]
+
+
 def _unreachable_redis_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -3474,7 +3533,9 @@ async def test_every_worker_reads_the_models_saturation_from_redis_not_from_what
 ):
     busy, idle = (_borrowing_handler(monkeypatch, borrows=True) for _ in range(2))
     counter: Final = RateLimitScope("model_saturation_check", "shared-model").counter("tokens")
-    with redis_answering_counts({"{model_saturation_check:shared-model}:tokens": "700"}) as port:
+    with redis_answering_counts(
+        {"{model_saturation_check:shared-model}:tokens": "700", "{model_saturation_check:shared-model}:requests": None}
+    ) as port:
         for worker in (busy, idle):
             _worker_on_redis(worker, port)
         busy.rate_limits.set_local(counter, 700, 60)

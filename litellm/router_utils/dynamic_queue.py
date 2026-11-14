@@ -331,10 +331,14 @@ class DynamicQueue:
         ready_in_ms: Final = await self._ready_in_ms(readiness, min(operation_s, budget_s))
         if ready_in_ms is None:
             return QueueTimeout() if budget_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
-        budget_ms: Final = max(int((deadline - self._timer.now()) * 1000), 0)
-        first: Final = await self._within(self._backend.admit(request, budget_ms, ready_in_ms), operation_s)
+        left: Final = deadline - self._timer.now()
+        if budget_s > 0 and left <= 0:
+            return QueueTimeout()
+        bound_s: Final = operation_s if budget_s <= 0 else min(operation_s, left)
+        budget_ms: Final = max(int(left * 1000), 0)
+        first: Final = await self._within(self._backend.admit(request, budget_ms, ready_in_ms), bound_s)
         if first is None:
-            return CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+            return QueueTimeout() if bound_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         if isinstance(first, Gone):
             return QueueTimeout()
         if isinstance(first, Waiting):
@@ -364,11 +368,15 @@ class DynamicQueue:
         ready_in_ms: Final = await self._ready_in_ms(readiness, min(operation_s, left))
         if ready_in_ms is None:
             return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+        refreshed: Final = deadline - self._timer.now()
+        if refreshed <= 0:
+            return QueueTimeout()
+        bound_s: Final = min(operation_s, refreshed)
         polled: Final = await self._within(
-            self._backend.poll(request.capacity, request.waiter_id, ready_in_ms), min(operation_s, left)
+            self._backend.poll(request.capacity, request.waiter_id, ready_in_ms), bound_s
         )
         if polled is None:
-            return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+            return QueueTimeout() if bound_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         if isinstance(polled, Gone):
             return QueueTimeout()
         if isinstance(polled, Waiting):

@@ -10,6 +10,7 @@ from queue import Empty, SimpleQueue
 from typing import Final
 
 import pytest
+import pytest_asyncio
 from integration._support.client import eventually
 from integration._support.openai_wire import chat_reply
 from integration._support.wire import Reply, Request, Wire, wire_server
@@ -99,7 +100,7 @@ class RouterFactory:
         return router
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def routers(upstream: Upstream) -> AsyncIterator[RouterFactory]:
     async with AsyncExitStack() as cleanup:
         yield RouterFactory(cleanup, upstream)

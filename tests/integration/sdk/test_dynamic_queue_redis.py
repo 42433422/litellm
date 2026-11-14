@@ -527,3 +527,45 @@ async def test_a_recovery_snapshot_admits_its_first_ready_member_across_workers(
     assert cooling_early == Waiting(ahead=0)
     assert isinstance(ready, Released)
     assert isinstance(cooling_late, Released)
+
+
+COOLING_AHEAD: Final = 70
+
+
+@pytest.mark.asyncio
+async def test_a_ready_waiter_behind_more_cooling_waiters_than_one_sweep_still_gets_the_probe(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    clock.ms = 1_000
+    for index in range(COOLING_AHEAD):
+        reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
+        assert reply == Waiting(), (index, reply)
+
+    ready: Final = await second.admit(WaitRequest(capacity, "ready", 9), FAR)
+
+    assert isinstance(ready, Probe)
+
+
+@pytest.mark.asyncio
+async def test_a_ready_snapshot_member_behind_more_cooling_members_than_one_sweep_still_claims(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, required_successes=1, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("prober", -1, first)])
+    for index in range(COOLING_AHEAD):
+        reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
+        assert reply == Waiting(), (index, reply)
+    await _enqueue(capacity, [("ready", 9, second)])
+    clock.ms = 1_000
+    probe: Final = await first.poll(capacity, "prober")
+    assert isinstance(probe, Probe)
+    assert await first.report(capacity, "prober", probe, Succeeded()) is None
+
+    claimed: Final = await second.poll(capacity, "ready")
+
+    assert isinstance(claimed, Released)

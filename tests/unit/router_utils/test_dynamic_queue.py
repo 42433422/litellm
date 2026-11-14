@@ -1110,3 +1110,96 @@ async def test_a_controller_wait_stays_queued_until_its_readiness_ends() -> None
 
     assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
     assert timer.at == 5.0
+
+
+COOLING_AHEAD: Final = 70
+
+
+async def test_a_ready_waiter_behind_more_cooling_waiters_than_one_sweep_still_gets_the_probe() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.at = 1.0
+    cooling: Final = [
+        await backend.admit(_request(f"cooling-{index}", priority=0), FAR, ready_in_ms=FAR)
+        for index in range(COOLING_AHEAD)
+    ]
+
+    ready: Final = await backend.admit(_request("ready", priority=9), FAR)
+
+    assert all(reply == Waiting() for reply in cooling)
+    assert isinstance(ready, Probe)
+
+
+async def test_a_ready_snapshot_member_behind_more_cooling_members_than_one_sweep_still_claims() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _congest(backend)
+    _ = await backend.admit(_request("prober", priority=-1), FAR)
+    for index in range(COOLING_AHEAD):
+        _ = await backend.admit(_request(f"cooling-{index}", priority=0), FAR, ready_in_ms=FAR)
+    _ = await backend.admit(_request("ready", priority=9), FAR)
+    timer.at = 1.0
+    probe: Final = await backend.poll(CAPACITY, "prober")
+    assert isinstance(probe, Probe)
+    await backend.report(CAPACITY, "prober", probe, Succeeded())
+
+    claimed: Final = await backend.poll(CAPACITY, "ready")
+
+    assert isinstance(claimed, Released)
+
+
+class CountsAdmits(StallsAfterEnqueue):
+    def __init__(self, inner: LocalQueueBackend) -> None:
+        super().__init__(inner)
+        self.admits = 0
+
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        self.admits += 1
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
+
+
+def _readiness_lookup_taking(timer: ManualTimer, seconds: float) -> "Callable[[], Coroutine[object, object, float]]":
+    async def lookup() -> float:
+        timer.at += seconds
+        return 0.0
+
+    return lookup
+
+
+async def test_a_readiness_lookup_that_used_up_the_budget_times_out_before_admitting() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer)
+    await _congest(inner, retry_after_ms=FAR)
+    counting: Final = CountsAdmits(inner)
+
+    result: Final = await DynamicQueue(counting, timer).admit(
+        _request("late"), 0.125, _readiness_lookup_taking(timer, 0.125)
+    )
+
+    assert isinstance(result, QueueTimeout)
+    assert counting.admits == 0
+    assert timer.at == 0.125
+
+
+async def test_a_poll_after_a_slow_readiness_lookup_only_gets_the_time_that_is_left() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer, recheck_ms=250, operation_timeout_ms=1_000)
+    await _congest(inner, retry_after_ms=FAR)
+    silent: Final = NeverAnswersPolls(inner)
+    waiter: Final = asyncio.create_task(
+        DynamicQueue(silent, timer).admit(_request("a"), 1.0, _readiness_lookup_taking(timer, 0.125))
+    )
+    try:
+        await timer.parked(waiter)
+        assert timer.at == 0.125
+        timer.advance(0.25)
+        await _signalled(silent.polled)
+        await timer.parked()
+        timer.advance(0.5)
+        result: Final = await _finished(waiter)
+    finally:
+        await _reap(waiter)
+
+    assert isinstance(result, QueueTimeout)
+    assert timer.at == 1.0

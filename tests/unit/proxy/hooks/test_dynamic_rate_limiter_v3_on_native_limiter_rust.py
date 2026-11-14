@@ -1,4 +1,3 @@
-import socket
 from typing import Final
 
 import pytest
@@ -11,7 +10,7 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitErro
 from litellm.proxy.utils import InternalUsageCache
 from litellm.redis.stores.rate_limits import RateLimitScope
 from tests._support.rust_parallel_request_limiter import PROXY_MaxParallelRequestsHandler_v3
-from tests.unit.proxy.hooks.native_capacity_handler import NativeDynamicRateLimitHandler
+from tests.unit.proxy.hooks.native_capacity_handler import NativeDynamicRateLimitHandler, listening
 
 
 def _borrowing_handler(monkeypatch: pytest.MonkeyPatch) -> NativeDynamicRateLimitHandler:
@@ -57,9 +56,8 @@ async def _model_saturation_at_the_hook(handler: NativeDynamicRateLimitHandler) 
 
 
 def _unreachable_redis_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    with listening() as (_, port):
+        return port
 
 
 @pytest.mark.asyncio

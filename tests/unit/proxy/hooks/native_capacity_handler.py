@@ -702,7 +702,7 @@ def fake_redis(
     def serve() -> None:
         while not stopped.is_set():
             try:
-                connection, _ = listener.accept()
+                connection = listener.accept()[0]
             except OSError:
                 return
             threading.Thread(target=redis.answer, args=(connection,), daemon=True).start()

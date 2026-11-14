@@ -5,7 +5,6 @@ Core tests to validate that priority weights are respected (0.9/0.1) instead of 
 """
 
 import asyncio
-import socket
 import time
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timedelta
@@ -39,6 +38,7 @@ from tests.unit.proxy.hooks.native_capacity_handler import (
 from tests.unit.proxy.hooks.native_capacity_handler import (
     borrowing_team_share,
     counter_key,
+    listening,
     model_saturation,
     model_tracking_descriptor,
     pre_call_at_saturation,
@@ -3511,9 +3511,8 @@ async def test_saturation_check_cache_ttl_configuration(monkeypatch: pytest.Monk
 
 
 def _unreachable_redis_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    with listening() as (_, port):
+        return port
 
 
 def _worker_on_redis(handler: PROXY_DynamicRateLimitHandlerV3, port: int) -> None:

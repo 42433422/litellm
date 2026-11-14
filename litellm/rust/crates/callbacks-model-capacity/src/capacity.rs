@@ -75,7 +75,7 @@ fn socket_turn_tpm_windows(descriptors: &[Descriptor]) -> Vec<Descriptor> {
 }
 
 pub enum PreCall {
-    Allow,
+    Allow(Option<Published>),
     Refuse(Refusal),
     Raise(CapacityError),
 }
@@ -522,7 +522,7 @@ impl Engine {
         request: &Request<'_>,
         model: &str,
         group: &GroupInfo,
-    ) -> Result<(), AdmitError> {
+    ) -> Result<Published, AdmitError> {
         let saturation = self.saturation(request.settings, model, group).await;
         let threshold = request.settings.saturation_threshold;
         if saturation >= threshold && self.fallback_requested(&request.fallback).await {
@@ -556,7 +556,7 @@ impl Engine {
         model: &str,
         group: &GroupInfo,
         saturation: f64,
-    ) -> Result<(), AdmitError> {
+    ) -> Result<Published, AdmitError> {
         let settings = request.settings;
         let enforce_priority = saturation >= settings.saturation_threshold;
         let model_wide = Self::model_wide(settings, model, group);
@@ -675,8 +675,7 @@ impl Engine {
                 .await?;
             published.statuses.extend(tracking.statuses);
         }
-        self.host.publish(&published).await?;
-        Ok(())
+        Ok(published)
     }
 
     fn refusal(
@@ -708,7 +707,7 @@ impl Engine {
 
     pub async fn pre_call(&self, request: &Request<'_>, model: &str, group: &GroupInfo) -> PreCall {
         match self.admit(request, model, group).await {
-            Ok(()) => PreCall::Allow,
+            Ok(published) => PreCall::Allow(Some(published)),
             Err(AdmitError::Refused(refusal)) => {
                 self.throttled(&refusal, model, request.key).await;
                 PreCall::Refuse(refusal)
@@ -720,7 +719,7 @@ impl Engine {
                     error.python_message()
                 );
                 let _ = self.host.log("error", &message).await;
-                PreCall::Allow
+                PreCall::Allow(None)
             }
         }
     }
@@ -1390,10 +1389,6 @@ mod tests {
             _tpm_share: i64,
             _call_type: Option<&'a str>,
         ) -> SeamFuture<'a, ()> {
-            done(())
-        }
-
-        fn publish<'a>(&'a self, _published: &'a Published) -> SeamFuture<'a, ()> {
             done(())
         }
 

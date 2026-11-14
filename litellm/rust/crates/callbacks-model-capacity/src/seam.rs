@@ -95,7 +95,6 @@ pub trait CapacityHost: Send + Sync {
         call_type: Option<&'a str>,
     ) -> SeamFuture<'a, Estimate>;
     fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()>;
-    fn publish<'a>(&'a self, published: &'a Published) -> SeamFuture<'a, ()>;
     fn stash_call_type(&self) -> SeamFuture<'_, Option<String>>;
     fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()>;
 }
@@ -209,10 +208,6 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
             "cap_output",
             json!({"tpm_share": tpm_share, "call_type": call_type}),
         )
-    }
-
-    fn publish<'a>(&'a self, published: &'a Published) -> SeamFuture<'a, ()> {
-        self.invoke("publish", json!(published))
     }
 
     fn stash_call_type(&self) -> SeamFuture<'_, Option<String>> {

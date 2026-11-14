@@ -219,7 +219,6 @@ PROJECTIONS: Final[Mapping[Field, Callable[[object], object]]] = {
 
 _ARGS: Final = TypeAdapter(dict[str, object])
 _PAIRS: Final = TypeAdapter(tuple[tuple[str, object], ...])
-_PUBLISHED: Final = TypeAdapter(RateLimitResponse)
 
 
 def _registry_unavailable(error: Exception) -> bool:
@@ -366,14 +365,6 @@ class CapacityDelegate:
         data: Final = _live().data
         call_type: Final = args["call_type"] if isinstance(args["call_type"], str) else None
         self.v3_limiter.bound_output_for_limit(data, int(str(args["tpm_share"])), call_type)
-        return None
-
-    @_seam
-    async def publish(self, args: Mapping[str, object]) -> object:
-        published: Final = _PUBLISHED.validate_python(args)
-        get_or_create_request_stash().rate_limit_response = RateLimitResponse(
-            overall_code=published["overall_code"], statuses=published["statuses"]
-        )
         return None
 
     @_seam

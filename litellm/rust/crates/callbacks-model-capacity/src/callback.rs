@@ -3,12 +3,12 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use litellm_callbacks::{
     Activation, Callback, CallbackError, Field, FieldSet, Hook, HookInput, HookOutput,
-    LimiterRequest, LoggedKeyIdentity, Manifest, MetadataKind, Outcome, Scalar, Selection,
+    LimiterRequest, LoggedKeyIdentity, Manifest, MetadataKind, Outcome, Patch, Scalar, Selection,
     Subscription, Verdict, typed,
 };
 use litellm_redis_store::RequestRedis;
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     capacity::{Engine, Frame, PreCall, Request, SaturationFallback, Settlement},
@@ -143,7 +143,7 @@ impl ModelCapacity {
                             Field::LimiterRequest,
                             Field::DeprecatedKwargs,
                         ]),
-                        writes: FieldSet::of(&[Field::OptionalParams]),
+                        writes: FieldSet::of(&[Field::OptionalParams, Field::RateLimitStatuses]),
                         may_abort: true,
                         ..Subscription::on(Hook::PreCall)
                     },
@@ -209,7 +209,10 @@ impl ModelCapacity {
             redis,
         };
         match self.engine.pre_call(&request, &model, &group).await {
-            PreCall::Allow => Ok(None),
+            PreCall::Allow(None) => Ok(None),
+            PreCall::Allow(Some(published)) => Ok(Some(Verdict::Patch(
+                Patch::default().set(Field::RateLimitStatuses, json!(published)),
+            ))),
             PreCall::Refuse(refusal) => Ok(Some(Verdict::Abort(refusal.into_abort()))),
             PreCall::Raise(error) => raise(error),
         }

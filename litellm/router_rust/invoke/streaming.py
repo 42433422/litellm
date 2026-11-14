@@ -67,6 +67,8 @@ from litellm.litellm_core_utils.core_helpers import as_str_mapping, without
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR, get_hidden_params, set_hidden_params
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.router_rust.surface.health import failure_already_logged, logged_call
+from litellm.router_utils.dynamic_queue import Succeeded
+from litellm.router_utils.dynamic_queue_router import Admission, RequestQueue, bound_request_queue
 from litellm.types.utils import ModelResponseStream, Usage
 
 if TYPE_CHECKING:
@@ -124,6 +126,10 @@ class StreamAttempt:
     # The background recording of the stream's failure, which a same-group retry waits for so it
     # picks with the failed deployment already cooled down.
     failure_recording: "asyncio.Task[None] | None" = None
+    # The dynamic queue's turn the attempt holds until its stream ends, and the request's queue state,
+    # which a recovery of the stream waits with in whichever task consumes it.
+    admission: Admission | None = None
+    request_queue: RequestQueue | None = None
 
     @property
     def model_group(self) -> str:
@@ -163,14 +169,16 @@ class StreamAttempt:
 
     async def fallback(self, trigger: BaseException, request: Mapping[str, object] | None = None) -> object:
         """The fallback walk for this stream's failure; raises when no fallback answers."""
-        return await self.core.recover_stream("fallback", self.op, request or self.request, self.origin(), trigger)
+        with bound_request_queue(self.request_queue):
+            return await self.core.recover_stream("fallback", self.op, request or self.request, self.origin(), trigger)
 
     def fallback_sync(self, trigger: BaseException) -> object:
         return self.core.recover_stream_sync("fallback", self.op, self.request, self.origin(), trigger)
 
     async def retry(self, trigger: BaseException) -> "tuple[object, int, int] | BaseException":
         """A same-group retry: the retried response with the retry count and budget, or the newest failure."""
-        return await self.core.retry_stream(self.op, self.request, self.origin(), trigger)
+        with bound_request_queue(self.request_queue):
+            return await self.core.retry_stream(self.op, self.request, self.origin(), trigger)
 
     # -- the stream's outcome, reported once when it ends --------------------------------------
 
@@ -230,6 +238,33 @@ class StreamAttempt:
                 self.core.report_stream_failure(self._failure_logged(error), self._callbacks(sync=False))
             )
 
+    def settle_admission(self, error: BaseException | None = None, *, succeeded: bool = False) -> None:
+        """Reports the stream's outcome to the dynamic queue once, in the background so it never holds up or replaces
+        what the client already read: a success only when the stream completed, the failure it raised, or nothing
+        when it was closed early."""
+        admission: Final = self.admission
+        if admission is None:
+            return
+        self.admission = None
+        from litellm.router_rust.core import retry_after_seconds
+
+        outcome: Final = (
+            Succeeded()
+            if succeeded
+            else None
+            if error is None
+            else admission.router.outcome_of(_provider_error(error), retry_after_seconds(_provider_error(error)))
+        )
+        _ = _record_in_background(admission.finish(outcome))
+
+    def release_admission_when_dropped(self, stream: object) -> None:
+        """A stream its caller drops before reading it never runs its generator's cleanup, so the queue turn is
+        given back without credit once the stream object itself is collected."""
+        if self.admission is None:
+            return
+        loop: Final = asyncio.get_running_loop()
+        _ = weakref.finalize(stream, _settle_dropped, loop, self)
+
     async def failure_recorded(self) -> None:
         """Wait for the stream's failure to be recorded, if one is being recorded."""
         recording: Final = self.failure_recording
@@ -283,6 +318,11 @@ def _record_in_background(recording: Coroutine[object, object, object]) -> "asyn
     return task
 
 
+def _settle_dropped(loop: asyncio.AbstractEventLoop, attempt: StreamAttempt) -> None:
+    if attempt.admission is not None and not loop.is_closed():
+        _ = loop.call_soon_threadsafe(attempt.settle_admission)
+
+
 def _record_now(recording: Callable[[], object]) -> None:
     try:
         _ = recording()
@@ -315,12 +355,16 @@ async def _areported(
             if observe is not None:
                 observe(item)
             yield item
+        attempt.settle_admission(succeeded=True)
     except Exception as error:
+        attempt.settle_admission(error)
         if started or fails_before_first_item:
             attempt.report_failure(error)
         else:
             attempt.outcome_reported = True  # rebind-ok: a stream that never opened counts nothing
         raise
+    finally:
+        attempt.settle_admission()
     attempt.report_success(total_tokens(last), last)
 
 
@@ -1025,6 +1069,7 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
                 verbose_router_logger.error("Fallback also failed: %s", fallback_error)
                 _raise_fallback_failure(fallback_error)
         finally:
+            attempt.settle_admission()
             with anyio.CancelScope(shield=True):
                 await close_model_response()
                 slot.close()
@@ -1039,6 +1084,7 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
     wrapped_response: Final = _AsyncChatStream(stream_with_fallbacks(), model_response)
     # weak, so the generator closing over it does not keep the wrapper alive
     wrapper_ref: Final[weakref.ref[FallbackAwareStreamWrapper]] = weakref.ref(wrapped_response)
+    attempt.release_admission_when_dropped(wrapped_response)
     return wrapped_response
 
 
@@ -1898,6 +1944,7 @@ def _reported_text_completion_stream(attempt: StreamAttempt, response: object) -
     response.completion_stream = _areported(  # rebind-ok: the stream's own iterator, wrapped
         attempt, chunks, _chat_total_tokens, fails_before_first_item=False
     )
+    attempt.release_admission_when_dropped(response)
     return response
 
 

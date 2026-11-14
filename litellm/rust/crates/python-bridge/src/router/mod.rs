@@ -1760,6 +1760,7 @@ fn host_call_items(py: Python<'_>, dict: &Bound<'_, PyDict>, call: HostCall) -> 
                 Stage::Tags => ("tags", None),
                 Stage::PreCall => ("pre_call", None),
                 Stage::TextOnly => ("text_only", None),
+                Stage::DynamicCongested => ("dynamic_congested", None),
                 Stage::RouteIncapable { handler } => {
                     dict.set_item("handler", handler)?;
                     ("route_incapable", None)

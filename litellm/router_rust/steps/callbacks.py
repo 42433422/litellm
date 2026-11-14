@@ -44,6 +44,7 @@ from litellm.litellm_core_utils.routing_common_utils import get_request_team_id
 from litellm.router_strategy.base_routing_strategy import BaseRoutingStrategy
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
 from litellm.router_strategy.least_busy import LeastBusyLoggingHandler
+from litellm.router_utils.dynamic_queue_router import prefer_uncongested
 from litellm.router_utils.global_callback_holders import (
     live_check_owners,
     routers_holding_global_callbacks,
@@ -766,7 +767,8 @@ class RustOptionalChecks:
 
         candidates: Final = [str(id) for id in step.get("candidates") or ()]  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType, reportUnknownArgumentType]  # the step's id list
         if not self._opt.has_filters():
-            return (list(dict.fromkeys(candidates)), None), None
+            unique: Final = tuple(dict.fromkeys(candidates))
+            return (await prefer_uncongested(unique, self._records_of), None), None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]  # RustCore's deployment dicts
         records: Final = self._records_of(candidates)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # RustCore's deployment dicts
         narrowed: Final = _request_with_failed_ids(request, step)
         try:
@@ -782,7 +784,7 @@ class RustOptionalChecks:
         if narrowed is not request and narrowed.get(_ENCRYPTED_PIN) and isinstance(request, dict):
             request[_ENCRYPTED_PIN] = True  # rebind-ok: the request dict the pick goes on to read
         kept: Final = filtered_ids(remaining, candidates)  # pyright: ignore[reportUnknownArgumentType]  # see above
-        return (kept, preferred_id), None
+        return (await prefer_uncongested(kept, self._records_of), preferred_id), None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]  # see above
 
 
 __all__ = [

@@ -52,6 +52,7 @@ from litellm.router_strategy.complexity_router.context_compaction import (
     initialize_compaction_state,
     surface_for_call,
 )
+from litellm.router_utils.dynamic_queue_router import DynamicQueueRouter, bound_request_queue
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, endpoint_selection
 from litellm.vector_stores.search_query import store_search_params
 
@@ -793,6 +794,12 @@ def clean_realtime_session_deployment(call: AttemptCall) -> str | None:
     return None if deployment_id is None else str(deployment_id)
 
 
+def _brings_own_credentials(request: Mapping[str, object]) -> bool:
+    from litellm.litellm_core_utils.clientside_credential_handler import is_clientside_credential
+
+    return is_clientside_credential(dict(request)) or request.get("provider_specific_header") is not None
+
+
 # `_scheduler` once `del router.scheduler` ran (None is a scheduler not built yet).
 _NO_SCHEDULER: Final = object()
 
@@ -1482,6 +1489,7 @@ class RustEndpoints:
         self._caching_groups: Final = config.get("caching_groups")
         self._default_max_parallel_requests: object = config.get("default_max_parallel_requests")
         self._scheduler: object = None
+        self._queue_router: DynamicQueueRouter | None = None
 
     @property
     def cache_responses(self) -> bool:
@@ -2042,12 +2050,34 @@ class RustEndpoints:
             def factory() -> Awaitable[object]:
                 return prompt_management_acompletion(self._core, model, messages, prepared)
 
-            if priority is None:
-                return await factory()
-            return await self._schedule(model, priority, factory, prepared)
-        if priority is None:
-            return await self._core.drive(plan, rest)
-        return await self._schedule(model, priority, lambda: self._core.drive(plan, rest), rest)
+            return await self._prioritized(model, priority, factory, prepared)
+        return await self._prioritized(model, priority, lambda: self._core.drive(plan, rest), rest)
+
+    def _dynamic_queue(self) -> DynamicQueueRouter | None:
+        settings: Final = self._core.resolved.dynamic_queue
+        if settings is None:
+            return None
+        if self._queue_router is None or self._queue_router.settings is not settings:
+            self._queue_router = DynamicQueueRouter(
+                settings,
+                redis=lambda: self._core.routing_cache.redis_cache,
+                cooldown_s=lambda: self._core.resolved.cooldown_time,
+            )
+        return self._queue_router
+
+    async def _prioritized(
+        self, model: str, priority: int | None, run: Callable[[], Awaitable[object]], request: Mapping[str, object]
+    ) -> object:
+        """A prioritized call: with the dynamic queue enabled each provider attempt waits for its capacity's turn
+        instead of the call waiting in the scheduler once. A caller bringing its own credentials keeps today's
+        routing."""
+        queue_router: Final = self._dynamic_queue()
+        if queue_router is None:
+            return await run() if priority is None else await self._schedule(model, priority, run, request)
+        if priority is None or _brings_own_credentials(request):
+            return await run()
+        with bound_request_queue(queue_router.request(priority, str(uuid.uuid4()))):
+            return await run()
 
     async def atext_completion(self, request: Mapping[str, object]) -> object:
         model: Final = request.get("model")
@@ -2060,9 +2090,7 @@ class RustEndpoints:
         kwargs: Final = without(request, "is_retry", "is_fallback", "is_async")
         plan: Final = PLANS["atext_completion"]
         priority, rest = self._split_priority(model, kwargs)  # pyright: ignore[reportArgumentType]  # the name as given
-        if priority is None:
-            return await self._core.drive(plan, rest)
-        return await self._schedule(model, priority, lambda: self._core.drive(plan, rest), rest)  # pyright: ignore[reportArgumentType]  # see above
+        return await self._prioritized(model, priority, lambda: self._core.drive(plan, rest), rest)  # pyright: ignore[reportArgumentType]  # see above
 
     async def schedule_acompletion(
         self,

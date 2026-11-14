@@ -310,6 +310,14 @@ if op == 'report' then
   return {'ok'}
 end
 
+if op == 'busy' then
+  if healthy() then
+    return {'healthy'}
+  end
+  touch()
+  return {'busy'}
+end
+
 if op == 'abandon' then
   drop(waiter)
   grant_probe()
@@ -468,3 +476,8 @@ class RedisQueueBackend:
     async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
         reply: Final = await self._call("abandon", capacity, waiter_id, ())
         return reply if isinstance(reply, CoordinationUnavailable) else None
+
+    async def busy(self, capacity: str) -> bool | CoordinationUnavailable:
+        """Whether the capacity is congested or still admitting the waiters it recovered with."""
+        reply: Final = await self._call("busy", capacity, "", ())
+        return reply if isinstance(reply, CoordinationUnavailable) else reply == ("busy",)

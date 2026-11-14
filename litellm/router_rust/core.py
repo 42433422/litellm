@@ -243,6 +243,16 @@ from litellm.router_strategy.least_busy import (
     release_started_attempt,
 )
 from litellm.router_utils.cooldown_handlers import get_cooldown_deployment_info, mark_deployment_selection_failure
+from litellm.router_utils.dynamic_queue import Succeeded
+from litellm.router_utils.dynamic_queue_router import (
+    Admission,
+    DynamicQueueSettings,
+    QueueRejectedError,
+    capacity_of,
+    congested_ids,
+    current_request_queue,
+    parse_dynamic_queue,
+)
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, selected_endpoint
 from litellm.router_utils.kubernetes_pod_discovery import (
     KubernetesPodDiscovery,
@@ -382,6 +392,9 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "background_health_check_model_groups",
         "enable_weighted_failover",
         "fallback_on_unsupported_params",
+        # Per-attempt admission (litellm/router_utils/dynamic_queue_router.py); router-core keeps the
+        # congested deployments of a pick left with only cooling ones.
+        "dynamic_queue",
         # Built host-side as CustomLogger checks (litellm/router_rust/steps/callbacks.py); router-core runs
         # their deployment filters through its callback_filters stage.
         "optional_pre_call_checks",
@@ -521,12 +534,21 @@ class RustCoreUnsupported(AttributeError):
 
 
 def failure_kind(error: BaseException) -> str:
+    if isinstance(error, QueueRejectedError):
+        return "QueueRejected"
     names: Final = tuple(cls.__name__ for cls in type(error).__mro__)
     if not _DECLINED.isdisjoint(names):
         return "Declined"
     if is_guardrail_intervention(error):  # pyright: ignore[reportArgumentType]  # every attempt error is an Exception
         return "GuardrailIntervention"
     return next((name for name in names if name in _FAILURE_KINDS), "APIError")
+
+
+def _dynamic_queue(value: object, default_priority: object) -> DynamicQueueSettings | None:
+    from litellm.router_utils.request_priority import parse_default_priority
+
+    priority: Final = parse_default_priority(default_priority)
+    return parse_dynamic_queue(value, priority if isinstance(priority, int) else None)
 
 
 def retry_after_seconds(error: BaseException) -> float | None:
@@ -688,6 +710,7 @@ class Resolved:
     retry_policy: object = None
     model_group_retry_policy: object = None
     health_routing: HealthRouting = dataclasses.field(default_factory=HealthRouting)
+    dynamic_queue: "DynamicQueueSettings | None" = None
     # `_core_default_deployment`, as assigned (detached).
     default_deployment: object = None
     # `_model_to_group` as the Python core last built it, kept once a raw `routing_groups` write
@@ -813,6 +836,7 @@ class Resolved:
             retry_policy=resolved_retry_policy(get("retry_policy")),
             model_group_retry_policy=get("model_group_retry_policy"),
             health_routing=HealthRouting.of(config),
+            dynamic_queue=_dynamic_queue(get("dynamic_queue"), get("default_priority")),
         )
 
     def changed(self, values: Mapping[str, object], updated: frozenset[str] = frozenset()) -> "Resolved":
@@ -905,6 +929,7 @@ class Resolved:
             "routing_plugins": True if self.routing_plugins else None,
             # `async_callback_filter_deployments` runs on every async candidate list.
             "callback_filters": True,
+            "dynamic_queue": True if self.dynamic_queue is not None else None,
             "retry_policy": _plain(self.retry_policy),
             "model_group_retry_policy": _plain(static_group_policies(self.model_group_retry_policy)) or None,
             "routing_group_members": dict(self.routing_group_members)
@@ -3518,6 +3543,9 @@ class RustCore(
             return await self._answer_tags(step, request)
         if step.get("stage") == "text_only":
             return self._text_only(step)
+        if step.get("stage") == "dynamic_congested":
+            cooling: Final = tuple(str(id) for id in _as_list(step.get("candidates")))
+            return tuple(sorted(await congested_ids(cooling, self._records_of)))
         if step.get("stage") == "route_incapable":
             return self._route_incapable(step)
         if step.get("stage") == "media_refusing":
@@ -3584,6 +3612,9 @@ class RustCore(
         if step.get("stage") == "callback_filters":
             # Only the async candidate lists run the callback filters.
             return step["candidates"]
+        if step.get("stage") == "dynamic_congested":
+            # Only async chat and text completions queue.
+            return []
         if step.get("stage") == "text_only":
             return self._text_only(step)
         if step.get("stage") == "route_incapable":
@@ -4472,6 +4503,8 @@ class _Driver:
         self._level_errors: Final[dict[int, BaseException]] = dict(  # mutable-ok: filled as the call runs
             (stream_failure,) if stream_failure else ()
         )
+        # A wait the dynamic queue refused, which ends the request with that error at whichever level.
+        self._queue_rejection: QueueRejectedError | None = None
         # The retry counts an exhausted retry loop stamps on the pick error its level then raises.
         self._pending_stamps: Final[dict[int, tuple[object, object]]] = {}  # mutable-ok: filled as the call runs
         # Each level's current hop's first failure, once it retries: the error its retry loop raises
@@ -5006,7 +5039,11 @@ class _Driver:
         return self._last_error
 
     def _stream_attempt(
-        self, step: Mapping[str, object], kwargs: Mapping[str, object], slot: "contextlib.ExitStack | None" = None
+        self,
+        step: Mapping[str, object],
+        kwargs: Mapping[str, object],
+        slot: "contextlib.ExitStack | None" = None,
+        admission: "Admission | None" = None,
     ) -> StreamAttempt:
         def number(key: str) -> int:
             value: Final = step.get(key)
@@ -5028,6 +5065,8 @@ class _Driver:
             attempted_retries=number("retry"),
             routed=routed if isinstance(routed, str) else None,
             slot=slot,
+            admission=admission,
+            request_queue=current_request_queue(),
         )
 
     def _failed(
@@ -5274,6 +5313,19 @@ class _Driver:
         )
         return tuple(release for release in releases if release is not None)
 
+    async def _admit(self, deployment: Mapping[str, object], call: "AttemptCall") -> Admission | None:
+        """Waits for the deployment's dynamic queue turn when the request queues. A deployment the caller's own
+        credentials stand in for keeps today's routing. Raises the public error of a refused wait."""
+        request_queue: Final = current_request_queue()
+        if request_queue is None or self._plan.sync or self._plan.kind not in ("chat", "text"):
+            return None
+        own_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
+        served_as: Final = (as_str_mapping(call.kwargs.get("model_info")) or {}).get("id")
+        if served_as != own_id or self._core.per_user_deployment(own_id):
+            return None
+        capacity: Final = capacity_of(deployment)
+        return None if capacity is None else await request_queue.admit(capacity, call.model_name)
+
     async def _routed_attempt(self, step: Mapping[str, object], attempt: RoutedAttempt) -> Mapping[str, object]:
         step = await self._resolve_pods(step)  # rebind-ok: the picked deployment, resolved to a pod
         deployment: Mapping[str, object] = as_str_mapping(step.get("deployment")) or {}  # rebind-ok: the picked one
@@ -5283,6 +5335,7 @@ class _Driver:
         logs_failure: bool = False  # rebind-ok: set around the litellm call
         in_call: bool = False  # rebind-ok: set around the litellm call, whichever attempt logs its failure
         reading_stream: StreamAttempt | None = None  # rebind-ok: set while the first chunk is read
+        admission: Admission | None = None  # rebind-ok: the dynamic queue's turn, held until the outcome is known
         refused_call: Final = self._default_call_error(step)
         if refused_call is not None:
             return {**self._failed(step, self._default_copy(step), None, refused_call), "recorded": True}
@@ -5297,6 +5350,7 @@ class _Driver:
                 compacted: Final = await compacted_attempt(self._core._port, self._plan, deployment, call)  # pyright: ignore[reportPrivateUsage]  # see above
             except Exception as refused:  # noqa: BLE001  # raised before the provider call, so no cooldown reads it
                 return {**self._failed(step, deployment, call, refused), "recorded": True}
+            admission = await self._admit(deployment, call)  # rebind-ok: see above
             # The deployment's max_parallel_requests slot; an open chat stream takes it along.
             port = self._core._port  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core  # rebind-ok: the same port on every attempt
             with enter_deployment_slot(port, self._plan, deployment, call.kwargs) as slot:
@@ -5312,6 +5366,8 @@ class _Driver:
                         # Only `_acompletion` hands the check its logging object.
                         if self._plan.kind == "chat":
                             _log_refused_pick(self._request, refused)
+                        if admission is not None:
+                            await admission.finish(None)
                         return await self._refused(step, deployment, call, refused)
                 first_to_log: Final = not failure_already_logged(call.kwargs, "async_failure")
                 logs_failure = first_to_log  # rebind-ok: whether a failure here is this attempt's to log
@@ -5331,7 +5387,7 @@ class _Driver:
                 logs_failure = False  # rebind-ok: see above
                 in_call = False  # rebind-ok: see above
                 self._core._endpoints.check_response(self._plan, answered, call)  # pyright: ignore[reportPrivateUsage, reportUnknownArgumentType]  # see above
-                stream: Final = self._stream_attempt(step, call.kwargs, slot)
+                stream: Final = self._stream_attempt(step, call.kwargs, slot, admission)
                 logs_failure = first_to_log  # rebind-ok: the stream's own failure logging, for its first chunk
                 in_call = True  # rebind-ok: see above
                 reading_stream = stream  # rebind-ok: None until the attempt opens a stream
@@ -5342,6 +5398,8 @@ class _Driver:
                 # plain dict fails the attempt.
                 self._core._endpoints.counters.succeeded(self._plan, call)  # pyright: ignore[reportPrivateUsage]  # see above
         except asyncio.CancelledError:
+            if admission is not None:
+                await admission.finish(None)
             if call is not None:
                 await released(
                     self._release(call, attempt, refund_io_tokens=not attempt.answered),
@@ -5354,6 +5412,11 @@ class _Driver:
             if call is not None:
                 await released(self._release(call, attempt, refund_io_tokens=True))
             failed: Final = self._failed(step, deployment, call, error)
+            if isinstance(error, QueueRejectedError):
+                self._queue_rejection = error
+                return {**failed, "recorded": True}
+            if admission is not None:
+                await admission.finish(admission.router.outcome_of(error, retry_after_seconds(error)))
             if reading_stream is None or not logs_failure:
                 return {
                     **failed,
@@ -5362,6 +5425,8 @@ class _Driver:
             # `_dispatch_stream_failure`: the stream logs its failure in a task of its own.
             reading_stream.report_first_chunk_failure(error)
             return {**failed, "recorded": True}
+        if admission is not None and not stream.reports_outcome:
+            await admission.finish(Succeeded())
         served: Final = self._succeeded(call, response, call.host_op, stream)
         # The session re-pin the Python core's success callback runs; a wrapped stream runs it when it ends.
         if not served.get("deferred") and self._core.outcome_callbacks(call.kwargs, sync=False).get("success", True):
@@ -5577,6 +5642,8 @@ class _Driver:
         return self._request.get("messages") is not None or self._request.get("input") is not None
 
     def failed(self, step: Mapping[str, object]) -> BaseException:
+        if self._queue_rejection is not None:
+            return self._queue_rejection
         model: Final = str(self._request.get("model"))
         primary: Final = self._level_errors.get(self._base_level)
         if primary is None:

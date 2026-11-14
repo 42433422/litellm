@@ -206,6 +206,9 @@ pub struct RouterConfig {
     /// The host's `CustomLogger` deployment filters run on every async candidate list
     /// (`async_callback_filter_deployments`).
     pub callback_filters: bool,
+    /// `dynamic_queue.enabled`: a pick left with only cooling deployments keeps the ones the host's
+    /// dynamic queue holds congested, so their attempts wait for a turn instead of failing.
+    pub dynamic_queue: bool,
     pub enable_health_check_routing: bool,
     /// How old (seconds) a background health check result may be and still count
     /// (`health_check_staleness_threshold`, else the default interval times its multiplier).

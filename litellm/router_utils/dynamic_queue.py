@@ -567,6 +567,11 @@ def _report(
     return _grant_probe(credited, now, settings)
 
 
+def _busy(capacity: _Capacity, now: int) -> tuple[_Capacity, bool]:
+    swept: Final = _sweep(capacity, now)
+    return swept, not swept.healthy
+
+
 def _abandon(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str) -> _Capacity:
     swept: Final = _sweep(capacity, now)
     lease: Final = swept.lease
@@ -658,3 +663,7 @@ class LocalQueueBackend:
 
     async def abandon(self, capacity: str, waiter_id: str) -> None:
         self._step(capacity, lambda state, now: (_abandon(state, now, self._settings, waiter_id), None))
+
+    async def busy(self, capacity: str) -> bool:
+        """Whether the capacity is congested or still admitting the waiters it recovered with."""
+        return self._step(capacity, _busy)

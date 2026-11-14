@@ -36,6 +36,8 @@ struct ScriptedHost {
     /// The callback filters pin to this deployment until an attempt of the request failed on it,
     /// as `encrypted_content_affinity` does.
     pinned: Option<&'static str>,
+    /// The deployments the dynamic queue stage reports congested.
+    congested: Vec<&'static str>,
 }
 
 impl ScriptedHost {
@@ -101,10 +103,16 @@ impl Host for ScriptedHost {
 
     async fn select(
         &self,
-        _stage: &SelectStage,
+        stage: &SelectStage,
         _ctx: &RoutingContext<'_>,
         candidates: Vec<Arc<Deployment>>,
     ) -> Result<Vec<Arc<Deployment>>, Error> {
+        if *stage == SelectStage::DynamicCongested {
+            return Ok(candidates
+                .into_iter()
+                .filter(|d| self.congested.contains(&d.id.as_str()))
+                .collect());
+        }
         match self.pick_failures.lock().pop_front() {
             Some(failure) => Err(failure.into()),
             None => Ok(candidates),
@@ -2147,4 +2155,78 @@ async fn every_event_of_a_retried_and_fallen_back_call_serializes_tagged_by_its_
             "FallbackDone",
         ])
     );
+}
+
+fn queue_rejected() -> AttemptError {
+    let mut rejected = AttemptError::new(FailureKind::QueueRejected, Some(503));
+    rejected.classes = vec!["DynamicQueueFullError".into(), "ServiceUnavailableError".into()];
+    rejected
+}
+
+fn event_count(host: &ScriptedHost, name: &str) -> usize {
+    host.events
+        .lock()
+        .iter()
+        .filter(|event| serde_json::to_value(event).unwrap()["event"] == name)
+        .count()
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_queue_rejection_ends_the_request_with_no_retry_fallback_or_cooldown(
+    config: RouterConfig,
+) {
+    let host = Arc::new(ScriptedHost::failing("primary", vec![queue_rejected()]));
+    let router = router(
+        config,
+        json!({"num_retries": 3, "fallbacks": [{"primary": ["backup"]}]}),
+        host.clone(),
+    );
+    let refused = router.call(Op::from("acompletion"), request()).await;
+    assert!(matches!(refused, Err(Error::Attempt(failed)) if failed.queue_rejected()));
+    assert_eq!((host.retries(), host.selected().len()), (0, 1));
+    assert_eq!(event_count(&host, "AttemptFailed"), 0);
+    assert_eq!(event_count(&host, "CooldownSet"), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_queue_rejection_on_a_fallback_hop_ends_the_request_with_that_rejection() {
+    let host = Arc::new(ScriptedHost::scripted(vec![
+        ("primary", vec![server_error()]),
+        ("backup", vec![queue_rejected()]),
+    ]));
+    let router = router(
+        tiers(false),
+        json!({"num_retries": 0, "fallbacks": [{"primary": ["backup", "context"]}]}),
+        host.clone(),
+    );
+    let refused = router.call(Op::from("acompletion"), request()).await;
+    assert!(matches!(refused, Err(Error::Attempt(failed)) if failed.queue_rejected()));
+    assert_eq!(host.selected(), vec!["p1".to_owned(), "b1".to_owned()]);
+}
+
+#[rstest]
+#[case::off_keeps_failing_the_pick(false, vec!["a1"], None)]
+#[case::on_with_nothing_congested_keeps_failing_the_pick(true, vec![], None)]
+#[case::on_keeps_the_congested_one(true, vec!["a1"], Some("a1"))]
+#[tokio::test]
+async fn a_pick_left_with_only_cooling_deployments_keeps_only_the_congested_ones(
+    mut config: RouterConfig,
+    #[case] dynamic_queue: bool,
+    #[case] congested: Vec<&'static str>,
+    #[case] served_by: Option<&str>,
+) {
+    config.dynamic_queue = dynamic_queue;
+    let host = Arc::new(ScriptedHost {
+        congested,
+        ..ScriptedHost::failing("primary", vec![failure(FailureKind::RateLimit, 429); 2])
+    });
+    let router = router(config, json!({"num_retries": 1}), host.clone());
+    let cooled = router.call(Op::from("acompletion"), request()).await;
+    assert!(cooled.is_err());
+    assert_eq!(event_count(&host, "CooldownSet"), 2);
+    let next = router.call(Op::from("acompletion"), request()).await;
+    let served = next.ok().map(|response| response.deployment_id);
+    assert_eq!(served.as_deref(), served_by);
 }

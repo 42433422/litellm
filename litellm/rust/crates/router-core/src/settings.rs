@@ -29,6 +29,7 @@ pub struct Settings {
     pub enable_pre_call_checks: bool,
     pub routing_plugins: bool,
     pub callback_filters: bool,
+    pub dynamic_queue: bool,
     pub enable_health_check_routing: bool,
     pub health_check_staleness: Duration,
     pub background_health_check_model_groups: Option<Arc<[String]>>,
@@ -64,6 +65,7 @@ impl Settings {
             enable_pre_call_checks: config.enable_pre_call_checks,
             routing_plugins: config.routing_plugins,
             callback_filters: config.callback_filters,
+            dynamic_queue: config.dynamic_queue,
             enable_health_check_routing: config.enable_health_check_routing,
             health_check_staleness: config
                 .health_check_staleness_threshold

@@ -35,6 +35,7 @@ const STATIC_KEYS: &[&str] = &[
     "enable_pre_call_checks",
     "routing_plugins",
     "callback_filters",
+    "dynamic_queue",
     "enable_health_check_routing",
     "health_check_staleness_threshold",
     "background_health_check_model_groups",

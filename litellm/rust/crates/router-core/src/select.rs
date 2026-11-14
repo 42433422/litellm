@@ -440,6 +440,27 @@ impl Core {
             .filter(|d| !cooling.iter().any(|(id, _)| *id == d.id))
             .cloned()
             .collect();
+        // Only cooling deployments are left: the ones the dynamic queue holds congested stay
+        // candidates, for the pick and the retry count alike, so the attempt waits for its turn.
+        if healthy.is_empty() && settings.dynamic_queue && !listed && !cooling.is_empty() {
+            let cooled: Vec<Arc<Deployment>> = checked
+                .iter()
+                .filter(|d| cooling.iter().any(|(id, _)| *id == d.id))
+                .cloned()
+                .collect();
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            healthy = self
+                .host
+                .select(&SelectStage::DynamicCongested, &ctx, cooled)
+                .await?;
+        }
         // The safety net when health-check routing drives cooldowns (an allowed_fails_policy):
         // never on a listed pass-through pick or the healthy count.
         if healthy.is_empty()

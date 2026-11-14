@@ -394,6 +394,9 @@ pub enum SelectStage {
     Tags,
     /// `_deployment_declares_no_vision`: return the candidates that declare no vision support.
     TextOnly,
+    /// Every candidate is cooling down: return the ones the dynamic queue holds congested, which
+    /// stay candidates so the attempt waits for its capacity's turn.
+    DynamicCongested,
     /// `_deployment_serves_route`: return the candidates whose provider cannot serve the call
     /// `handler` names (a Decisions call on a provider with no Decisions config).
     RouteIncapable { handler: String },

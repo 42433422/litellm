@@ -1,6 +1,7 @@
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from contextlib import AsyncExitStack
 from typing import Final
 
 import pytest
@@ -36,21 +37,39 @@ class SharedClock:
         return self.ms
 
 
-def _worker(clock: SharedClock | None, **overrides: int) -> RedisQueueBackend:
-    return RedisQueueBackend(
-        RedisCache(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])),
-        QueueSettings(**overrides),
-        clock,
-    )
+class WorkerFactory:
+    def __init__(self, cleanup: AsyncExitStack) -> None:
+        self._cleanup = cleanup
 
+    def __call__(self, clock: SharedClock | None, **overrides: int) -> RedisQueueBackend:
+        cache: Final = RedisCache(
+            host=os.environ["REDIS_HOST"],
+            port=int(os.environ["REDIS_PORT"]),
+            client_name=f"dynamic-queue-test-{uuid.uuid4()}",
+        )
+        self._cleanup.push_async_callback(cache.disconnect)
+        client: Final = cache.init_async_client()
+        self._cleanup.push_async_callback(client.aclose)
+        return RedisQueueBackend(cache, QueueSettings(**overrides), clock)
 
-def _pair(clock: SharedClock, **overrides: int) -> tuple[RedisQueueBackend, RedisQueueBackend]:
-    return _worker(clock, **overrides), _worker(clock, **overrides)
+    def pair(self, clock: SharedClock, **overrides: int) -> tuple[RedisQueueBackend, RedisQueueBackend]:
+        return self(clock, **overrides), self(clock, **overrides)
 
 
 @pytest.fixture
-def capacity() -> str:
-    return f"integration-{uuid.uuid4()}"
+async def workers() -> AsyncIterator[WorkerFactory]:
+    async with AsyncExitStack() as cleanup:
+        yield WorkerFactory(cleanup)
+
+
+@pytest.fixture
+def capacity() -> Iterator[str]:
+    capacity_id: Final = f"integration-{uuid.uuid4()}"
+    try:
+        yield capacity_id
+    finally:
+        with Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])) as client:
+            _ = client.delete(*_keys(capacity_id))
 
 
 async def _congest(worker: RedisQueueBackend, capacity: str, retry_after_ms: int = 0) -> None:
@@ -76,9 +95,11 @@ async def _enqueue(capacity: str, arrivals: Sequence[tuple[str, int, RedisQueueB
 
 
 @pytest.mark.asyncio
-async def test_waiters_on_two_workers_probe_in_one_priority_order_with_fifo_ties(capacity: str) -> None:
+async def test_waiters_on_two_workers_probe_in_one_priority_order_with_fifo_ties(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, required_successes=100)
+    first, second = workers.pair(clock, required_successes=100)
     await _congest(first, capacity)
     arrivals: Final = (
         ("five-first", 5, first),
@@ -111,9 +132,11 @@ async def test_waiters_on_two_workers_probe_in_one_priority_order_with_fifo_ties
 
 
 @pytest.mark.asyncio
-async def test_probe_backoff_doubles_to_its_cap_and_honors_a_longer_retry_after(capacity: str) -> None:
+async def test_probe_backoff_doubles_to_its_cap_and_honors_a_longer_retry_after(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, initial_backoff_ms=1_000, max_backoff_ms=3_000, liveness_ms=FAR)
+    first, second = workers.pair(clock, initial_backoff_ms=1_000, max_backoff_ms=3_000, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [(waiter_id, 0, second) for waiter_id in "abcd"])
 
@@ -127,9 +150,11 @@ async def test_probe_backoff_doubles_to_its_cap_and_honors_a_longer_retry_after(
 
 
 @pytest.mark.asyncio
-async def test_consecutive_successes_recover_into_a_snapshot_claimed_in_order_ahead_of_arrivals(capacity: str) -> None:
+async def test_consecutive_successes_recover_into_a_snapshot_claimed_in_order_ahead_of_arrivals(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, required_successes=2)
+    first, second = workers.pair(clock, required_successes=2)
     await _congest(first, capacity)
     arrivals: Final = (
         ("a", 0, first),
@@ -162,9 +187,9 @@ async def test_consecutive_successes_recover_into_a_snapshot_claimed_in_order_ah
 
 
 @pytest.mark.asyncio
-async def test_a_success_from_a_superseded_generation_does_not_recover(capacity: str) -> None:
+async def test_a_success_from_a_superseded_generation_does_not_recover(capacity: str, workers: WorkerFactory) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, required_successes=1)
+    first, second = workers.pair(clock, required_successes=1)
     await _congest(first, capacity)
     await _enqueue(capacity, [("a", 0, second)])
     clock.ms = 1_000
@@ -183,9 +208,11 @@ async def test_a_success_from_a_superseded_generation_does_not_recover(capacity:
 
 
 @pytest.mark.asyncio
-async def test_a_renewed_lease_stays_exclusive_and_an_unrenewed_one_expires_to_the_next_waiter(capacity: str) -> None:
+async def test_a_renewed_lease_stays_exclusive_and_an_unrenewed_one_expires_to_the_next_waiter(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, required_successes=1, lease_ms=3_000, liveness_ms=FAR)
+    first, second = workers.pair(clock, required_successes=1, lease_ms=3_000, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [("prober", 0, first), ("next", 0, second)])
     clock.ms = 1_000
@@ -207,9 +234,11 @@ async def test_a_renewed_lease_stays_exclusive_and_an_unrenewed_one_expires_to_t
 
 
 @pytest.mark.asyncio
-async def test_a_waiter_whose_worker_stops_polling_is_dropped_after_its_liveness_window(capacity: str) -> None:
+async def test_a_waiter_whose_worker_stops_polling_is_dropped_after_its_liveness_window(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    lost, alive = _pair(clock, liveness_ms=5_000)
+    lost, alive = workers.pair(clock, liveness_ms=5_000)
     await _congest(lost, capacity, retry_after_ms=6_000)
     await _enqueue(capacity, [("from-lost-worker", 0, lost), ("from-live-worker", 0, alive)])
 
@@ -222,9 +251,9 @@ async def test_a_waiter_whose_worker_stops_polling_is_dropped_after_its_liveness
 
 
 @pytest.mark.asyncio
-async def test_a_full_queue_refuses_until_a_waiter_passes_its_deadline(capacity: str) -> None:
+async def test_a_full_queue_refuses_until_a_waiter_passes_its_deadline(capacity: str, workers: WorkerFactory) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, max_waiting=1, liveness_ms=FAR)
+    first, second = workers.pair(clock, max_waiting=1, liveness_ms=FAR)
     await _congest(first, capacity, retry_after_ms=FAR)
     await _enqueue(capacity, [("a", 0, first)], budget_ms=2_000)
 
@@ -235,9 +264,9 @@ async def test_a_full_queue_refuses_until_a_waiter_passes_its_deadline(capacity:
 
 
 @pytest.mark.asyncio
-async def test_an_abandoned_waiter_frees_its_place_on_every_worker(capacity: str) -> None:
+async def test_an_abandoned_waiter_frees_its_place_on_every_worker(capacity: str, workers: WorkerFactory) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, max_waiting=1)
+    first, second = workers.pair(clock, max_waiting=1)
     await _congest(first, capacity, retry_after_ms=FAR)
     await _enqueue(capacity, [("a", 0, first)])
 
@@ -248,8 +277,8 @@ async def test_an_abandoned_waiter_frees_its_place_on_every_worker(capacity: str
 
 
 @pytest.mark.asyncio
-async def test_redis_time_drives_the_queue_when_no_clock_is_injected(capacity: str) -> None:
-    first, second = _worker(None), _worker(None)
+async def test_redis_time_drives_the_queue_when_no_clock_is_injected(capacity: str, workers: WorkerFactory) -> None:
+    first, second = workers(None), workers(None)
 
     assert isinstance(await first.admit(WaitRequest(capacity, "healthy", 0), FAR), PassThrough)
     await _congest(second, capacity, retry_after_ms=FAR)
@@ -260,9 +289,11 @@ async def test_redis_time_drives_the_queue_when_no_clock_is_injected(capacity: s
 
 
 @pytest.mark.asyncio
-async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_its_place(capacity: str) -> None:
+async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_its_place(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, liveness_ms=FAR)
+    first, second = workers.pair(clock, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [("owner", 0, first), ("later", 0, second)])
     clock.ms = 1_000
@@ -278,9 +309,11 @@ async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_it
 
 
 @pytest.mark.asyncio
-async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priority_and_deadline(capacity: str) -> None:
+async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priority_and_deadline(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, required_successes=1, liveness_ms=FAR)
+    first, second = workers.pair(clock, required_successes=1, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [("prober", -1, first), ("urgent", 1, second)])
     await _enqueue(capacity, [("short-budget", 3, first)], budget_ms=3_000)
@@ -300,9 +333,11 @@ async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priori
 
 
 @pytest.mark.asyncio
-async def test_a_congested_admit_with_no_budget_is_refused_even_when_a_probe_is_due(capacity: str) -> None:
+async def test_a_congested_admit_with_no_budget_is_refused_even_when_a_probe_is_due(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock)
+    first, second = workers.pair(clock)
     await _congest(first, capacity)
     clock.ms = 1_000
 
@@ -311,9 +346,11 @@ async def test_a_congested_admit_with_no_budget_is_refused_even_when_a_probe_is_
 
 
 @pytest.mark.asyncio
-async def test_expired_waiters_beyond_the_sweep_limit_are_never_granted_or_revived(capacity: str) -> None:
+async def test_expired_waiters_beyond_the_sweep_limit_are_never_granted_or_revived(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, sweep_limit=2, liveness_ms=FAR)
+    first, second = workers.pair(clock, sweep_limit=2, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [(f"stale-{index}", -10, first) for index in range(6)], budget_ms=500)
     await _enqueue(capacity, [("live", 0, second)])
@@ -336,9 +373,11 @@ def _state_ttl_ms(capacity: str) -> int:
 
 
 @pytest.mark.asyncio
-async def test_congestion_outlives_a_retry_after_longer_than_the_idle_ttl_and_then_expires(capacity: str) -> None:
+async def test_congestion_outlives_a_retry_after_longer_than_the_idle_ttl_and_then_expires(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    worker: Final = _worker(clock, required_successes=1, state_ttl_ms=60_000)
+    worker: Final = workers(clock, required_successes=1, state_ttl_ms=60_000)
     await _congest(worker, capacity, retry_after_ms=900_000)
 
     congested_ttl: Final = _state_ttl_ms(capacity)

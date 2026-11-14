@@ -3718,6 +3718,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "litellm-callbacks",
+ "litellm-callbacks-parallel-request-limiter",
  "litellm-python-compat",
  "parking_lot",
  "rstest",

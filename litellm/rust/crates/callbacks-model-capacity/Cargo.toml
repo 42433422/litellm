@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 litellm-callbacks.workspace = true
+litellm-callbacks-parallel-request-limiter.workspace = true
 litellm-python-compat.workspace = true
 
 futures-util.workspace = true

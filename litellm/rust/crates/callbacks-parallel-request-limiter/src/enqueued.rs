@@ -519,14 +519,20 @@ mod tests {
             panic!("fits");
         };
         let stored: serde_json::Value = serde_json::from_str(&serialized(&granted)).unwrap();
-        assert_eq!(stored["scopes"], json!([{"key": "team", "value": "v", "limit": 100, "tokens": null}]));
+        assert_eq!(
+            stored["scopes"],
+            json!([{"key": "team", "value": "v", "limit": 100, "tokens": null}])
+        );
         assert_eq!(
             stored["project_scopes"],
             json!([{"key": "project_model", "value": "project-1:gpt-5.5", "limit": 100, "tokens": 40}])
         );
         store.save("b", &granted).await;
         let popped = store.pop("b").await.unwrap();
-        assert_eq!(popped.scopes, vec![scope("team", 100), project_scope(100, 40)]);
+        assert_eq!(
+            popped.scopes,
+            vec![scope("team", 100), project_scope(100, 40)]
+        );
     }
 
     #[rstest]

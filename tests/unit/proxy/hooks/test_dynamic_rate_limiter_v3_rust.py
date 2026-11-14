@@ -28,6 +28,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 from litellm.proxy.hooks.priority_class_share import pool_member
 from litellm.proxy.utils import InternalUsageCache
 from litellm.redis.stores.rate_limits import RateLimitScope
+from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from tests.unit.proxy.hooks.native_capacity_handler import NativeDynamicRateLimitHandler as DynamicRateLimitHandler
 from tests.unit.proxy.hooks.native_capacity_handler import (
     NativeDynamicRateLimitHandler as PROXY_DynamicRateLimitHandlerV3,
@@ -3576,3 +3577,27 @@ async def test_the_limiter_loads_and_admits_requests_without_redis_installed(
     handler.update_variables(llm_router=_borrowing_handler(monkeypatch, borrows=False).llm_router)
 
     await _check(handler, _class_team("team-a"), saturation=0.0, priority="interactive")
+
+
+@pytest.mark.asyncio
+async def test_a_responses_api_calls_tokens_count_against_the_team_limit(monkeypatch: pytest.MonkeyPatch):
+    handler = _borrowing_handler(monkeypatch, borrows=True)
+    await _check(handler, _team_key(), saturation=0.5)
+    await _settle_tokens(
+        handler,
+        150,
+        response=ResponsesAPIResponse(
+            id="resp",
+            created_at=0,
+            model="m",
+            object="response",
+            output=[],
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
+            usage=ResponseAPIUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+        ),
+    )
+    with pytest.raises(ProxyRateLimitError) as exc:
+        await _check(handler, _team_key(), saturation=0.5)
+    _held_to_team_limit(exc.value, "tokens", "model_tpm_limit")

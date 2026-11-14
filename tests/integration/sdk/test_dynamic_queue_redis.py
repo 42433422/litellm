@@ -38,16 +38,29 @@ class SharedClock:
         return self.ms
 
 
+def _delete(*keys: str) -> None:
+    with Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])) as client:
+        _ = client.delete(*keys)
+
+
 class WorkerFactory:
     def __init__(self, cleanup: AsyncExitStack) -> None:
         self._cleanup = cleanup
+        self._capacity_keys: tuple[str, ...] = ()
 
-    def __call__(self, clock: SharedClock | None, **overrides: int) -> RedisQueueBackend:
+    def owns(self, capacity: str) -> None:
+        """Namespaced workers built after this delete ``capacity``'s keys under their namespace on teardown."""
+        self._capacity_keys = _keys(capacity)
+
+    def __call__(self, clock: SharedClock | None, namespace: str | None = None, **overrides: int) -> RedisQueueBackend:
         cache: Final = RedisCache(
             host=os.environ["REDIS_HOST"],
             port=int(os.environ["REDIS_PORT"]),
             client_name=f"dynamic-queue-test-{uuid.uuid4()}",
+            namespace=namespace,
         )
+        if namespace is not None:
+            self._cleanup.callback(_delete, *(cache.check_and_fix_namespace(key=key) for key in self._capacity_keys))
         self._cleanup.push_async_callback(cache.disconnect)
         client: Final = cache.init_async_client()
         self._cleanup.push_async_callback(client.aclose)
@@ -433,18 +446,15 @@ async def test_congestion_outlives_a_retry_after_longer_than_the_idle_ttl_and_th
 
 
 @pytest.mark.asyncio
-async def test_a_shared_capacity_is_shared_within_one_redis_namespace_and_never_across_two(capacity: str) -> None:
+async def test_a_shared_capacity_is_shared_within_one_redis_namespace_and_never_across_two(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-
-    def worker(namespace: str) -> RedisQueueBackend:
-        port: Final = int(os.environ["REDIS_PORT"])
-        cache: Final = RedisCache(host=os.environ["REDIS_HOST"], port=port, namespace=namespace)
-        return RedisQueueBackend(cache, QueueSettings(), clock)
-
-    congesting: Final = worker(f"router-a-{capacity}")
-    same_router: Final = worker(f"router-a-{capacity}")
-    other_router: Final = worker(f"router-b-{capacity}")
     shared: Final = f"shared:{capacity}"
+    workers.owns(shared)
+    congesting: Final = workers(clock, namespace=f"router-a-{capacity}")
+    same_router: Final = workers(clock, namespace=f"router-a-{capacity}")
+    other_router: Final = workers(clock, namespace=f"router-b-{capacity}")
     await _congest(congesting, shared)
 
     assert isinstance(await same_router.admit(WaitRequest(shared, "same-namespace", 0), FAR), Waiting)
@@ -452,9 +462,11 @@ async def test_a_shared_capacity_is_shared_within_one_redis_namespace_and_never_
 
 
 @pytest.mark.asyncio
-async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_on_another_worker(capacity: str) -> None:
+async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_on_another_worker(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, liveness_ms=FAR)
+    first, second = workers.pair(clock, liveness_ms=FAR)
     await _congest(first, capacity)
     clock.ms = 1_000
     assert isinstance(await first.admit(WaitRequest(capacity, "p1", 1), FAR, ready_in_ms=4_000), Waiting)
@@ -476,9 +488,11 @@ async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_on_anot
 
 
 @pytest.mark.asyncio
-async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place(capacity: str) -> None:
+async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, liveness_ms=FAR)
+    first, second = workers.pair(clock, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [("owner", 0, first), ("later", 1, second)])
     clock.ms = 1_000
@@ -493,9 +507,11 @@ async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place(ca
 
 
 @pytest.mark.asyncio
-async def test_a_recovery_snapshot_admits_its_first_ready_member_across_workers(capacity: str) -> None:
+async def test_a_recovery_snapshot_admits_its_first_ready_member_across_workers(
+    capacity: str, workers: WorkerFactory
+) -> None:
     clock: Final = SharedClock()
-    first, second = _pair(clock, required_successes=1, liveness_ms=FAR)
+    first, second = workers.pair(clock, required_successes=1, liveness_ms=FAR)
     await _congest(first, capacity)
     await _enqueue(capacity, [("prober", -5, first), ("cooling", 1, first), ("ready", 2, second)])
     clock.ms = 1_000

@@ -3,7 +3,8 @@ import json
 import os
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from typing import Final
@@ -58,32 +59,50 @@ def upstream() -> Iterator[Upstream]:
         yield Upstream(wire, replies)
 
 
-def _worker(
-    upstream: Upstream, capacity: str, max_parallel_requests: int | None = None, **queue: object
-) -> litellm.Router:
-    """One proxy worker's router: its own process state, the shared Redis, the same deployment."""
-    slots: Final = {} if max_parallel_requests is None else {"max_parallel_requests": max_parallel_requests}
-    return litellm.Router(
-        model_list=[
-            {
-                "model_name": "group",
-                "litellm_params": {
-                    "model": "openai/gpt-x",
-                    "api_base": f"{upstream.wire.url}/v1",
-                    "api_key": "integration-key",
-                    "max_retries": 0,
-                    **slots,
-                },
-                "model_info": {"id": capacity},
-            }
-        ],
-        redis_host=os.environ["REDIS_HOST"],
-        redis_port=int(os.environ["REDIS_PORT"]),
-        default_priority=0,
-        num_retries=0,
-        cooldown_time=1,
-        dynamic_queue={"enabled": True, **queue},
-    )
+class RouterFactory:
+    """Builds one proxy worker's router per call, each on its own named Redis connection, and closes them all."""
+
+    def __init__(self, cleanup: AsyncExitStack, upstream: Upstream) -> None:
+        self._cleanup = cleanup
+        self._upstream = upstream
+
+    def __call__(self, capacity: str, max_parallel_requests: int | None = None, **queue: object) -> litellm.Router:
+        slots: Final = {} if max_parallel_requests is None else {"max_parallel_requests": max_parallel_requests}
+        router: Final = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "group",
+                    "litellm_params": {
+                        "model": "openai/gpt-x",
+                        "api_base": f"{self._upstream.wire.url}/v1",
+                        "api_key": "integration-key",
+                        "max_retries": 0,
+                        **slots,
+                    },
+                    "model_info": {"id": capacity},
+                }
+            ],
+            redis_host=os.environ["REDIS_HOST"],
+            redis_port=int(os.environ["REDIS_PORT"]),
+            cache_kwargs={"client_name": f"dynamic-queue-routing-test-{uuid.uuid4()}"},
+            default_priority=0,
+            num_retries=0,
+            cooldown_time=1,
+            dynamic_queue={"enabled": True, **queue},
+        )
+        cache: Final = router.health().store.redis_cache
+        assert cache is not None
+        self._cleanup.push_async_callback(cache.disconnect)
+        client: Final = cache.init_async_client()
+        self._cleanup.push_async_callback(client.aclose)
+        self._cleanup.callback(router.retire)
+        return router
+
+
+@pytest.fixture
+async def routers(upstream: Upstream) -> AsyncIterator[RouterFactory]:
+    async with AsyncExitStack() as cleanup:
+        yield RouterFactory(cleanup, upstream)
 
 
 def _queued(capacity: str) -> int:
@@ -94,17 +113,22 @@ def _queued(capacity: str) -> int:
 
 
 @pytest.fixture
-def capacity() -> str:
-    return f"dynamic-queue-{uuid.uuid4()}"
+def capacity() -> Iterator[str]:
+    capacity_id: Final = f"dynamic-queue-{uuid.uuid4()}"
+    try:
+        yield capacity_id
+    finally:
+        with Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])) as client:
+            _ = client.delete(*_keys(f"deployment:{capacity_id}"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("triggers", "held_back"), [([429, 529], True), ([], False)])
 async def test_a_provider_429_holds_back_another_workers_request_only_when_429_is_a_trigger(
-    upstream: Upstream, capacity: str, triggers: list[int], held_back: bool
+    upstream: Upstream, routers: RouterFactory, capacity: str, triggers: list[int], held_back: bool
 ) -> None:
-    first: Final = _worker(upstream, capacity, trigger_status_codes=triggers)
-    second: Final = _worker(upstream, capacity, trigger_status_codes=triggers, queue_timeout=0.5)
+    first: Final = routers(capacity, trigger_status_codes=triggers)
+    second: Final = routers(capacity, trigger_status_codes=triggers, queue_timeout=0.5)
     upstream.replies.put(_rate_limited(retry_after_s=30))
 
     with pytest.raises(litellm.RateLimitError) as rate_limited:
@@ -123,10 +147,10 @@ async def test_a_provider_429_holds_back_another_workers_request_only_when_429_i
 
 @pytest.mark.asyncio
 async def test_a_congested_capacity_serves_a_waiting_request_once_its_probe_succeeds(
-    upstream: Upstream, capacity: str
+    upstream: Upstream, routers: RouterFactory, capacity: str
 ) -> None:
-    first: Final = _worker(upstream, capacity)
-    second: Final = _worker(upstream, capacity, queue_timeout=30)
+    first: Final = routers(capacity)
+    second: Final = routers(capacity, queue_timeout=30)
     upstream.replies.put(_rate_limited(retry_after_s=None))
     with pytest.raises(litellm.RateLimitError):
         _ = await first.acompletion(model="group", messages=MESSAGES)
@@ -139,10 +163,10 @@ async def test_a_congested_capacity_serves_a_waiting_request_once_its_probe_succ
 
 @pytest.mark.asyncio
 async def test_a_rate_limit_litellm_raises_itself_for_a_full_deployment_does_not_congest_it(
-    upstream: Upstream, capacity: str
+    upstream: Upstream, routers: RouterFactory, capacity: str
 ) -> None:
-    first: Final = _worker(upstream, capacity, max_parallel_requests=1)
-    second: Final = _worker(upstream, capacity, queue_timeout=0.5)
+    first: Final = routers(capacity, max_parallel_requests=1)
+    second: Final = routers(capacity, queue_timeout=0.5)
     released: Final = threading.Event()
     upstream.replies.put(
         Reply(chunks=(chat_reply("chatcmpl-held", "gpt-x", "held", stream=False).body,), gate_before_first=released)
@@ -166,11 +190,11 @@ async def test_a_rate_limit_litellm_raises_itself_for_a_full_deployment_does_not
 
 @pytest.mark.asyncio
 async def test_a_full_queue_refuses_with_503_queue_full_and_a_cancelled_waiter_leaves_it(
-    upstream: Upstream, capacity: str
+    upstream: Upstream, routers: RouterFactory, capacity: str
 ) -> None:
-    first: Final = _worker(upstream, capacity, max_waiting=1)
-    waiting_worker: Final = _worker(upstream, capacity, max_waiting=1, queue_timeout=30)
-    refused_worker: Final = _worker(upstream, capacity, max_waiting=1, queue_timeout=30)
+    first: Final = routers(capacity, max_waiting=1)
+    waiting_worker: Final = routers(capacity, max_waiting=1, queue_timeout=30)
+    refused_worker: Final = routers(capacity, max_waiting=1, queue_timeout=30)
     upstream.replies.put(_rate_limited(retry_after_s=30))
     with pytest.raises(litellm.RateLimitError):
         _ = await first.acompletion(model="group", messages=MESSAGES)

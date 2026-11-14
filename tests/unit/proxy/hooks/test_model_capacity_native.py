@@ -67,7 +67,7 @@ from litellm.rust_bridge.host import redis_events
 from litellm.types.integrations.custom_logger_v2 import Outcome as AttemptOutcome
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
 from tests.unit.proxy.hooks.model_capacity_golden import golden
-from tests.unit.proxy.hooks.native_capacity_handler import redis_answering_counts
+from tests.unit.proxy.hooks.native_capacity_handler import FakeRedis, counter_key, fake_redis, redis_answering_counts
 from tests.unit.redis.stores.fake_rate_limits import FakeRateLimits
 
 pytestmark = pytest.mark.asyncio
@@ -503,15 +503,28 @@ class _MetricsTap(PrometheusLogger):
 
 
 class _UnlicensedTap(logging.Handler):
-    def __init__(self) -> None:
+    def __init__(self, refused: str | None = None, renamed: Mapping[str, str] = MappingProxyType({})) -> None:
         super().__init__(level=logging.INFO)
         self.count = 0
         self.lines: list[tuple[str, str]] = []
+        self.refused: Final = refused
+        self.renamed: Final = renamed
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.getMessage() == UNLICENSED_PRIORITY_MESSAGE:
             self.count += 1
-        self.lines.append((record.levelname, record.getMessage()))
+        message: Final = record.getMessage()
+        if self.refused is not None and self.refused in message:
+            return
+        self.lines.append(
+            (
+                record.levelname,
+                next(
+                    (message.replace(native, python) for native, python in self.renamed.items() if native in message),
+                    message,
+                ),
+            )
+        )
 
     def take(self) -> int:
         taken: Final = self.count
@@ -532,12 +545,22 @@ async def _differential(
     scopes: Sequence[tuple[str, str]],
     prepare: Callable[[Side], None] | None = None,
     metrics: bool = False,
+    redis: FakeRedis | None = None,
+    renamed: Mapping[str, str] = MappingProxyType({}),
 ) -> list[object]:
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
-    tap: Final = _UnlicensedTap()
+    tap: Final = _UnlicensedTap(None if redis is None else redis.error, renamed)
     verbose_proxy_logger.addHandler(tap)
     monkeypatch.setattr(verbose_proxy_logger, "level", logging.INFO)
-    side: Final = NativeSide(router, clock)
+    side: Final = NativeSide(
+        router,
+        clock,
+        None
+        if redis is None
+        else build_native_dynamic_rate_limiter(
+            DualCache(redis_cache=RedisCache(host="127.0.0.1", port=redis.port)), time_provider=clock.now
+        ),
+    )
     if prepare is not None:
         prepare(side)
     gauges: Final = _MetricsTap()
@@ -1120,6 +1143,24 @@ async def test_socket_frames_hold_turns_to_the_class_share(monkeypatch: pytest.M
     ), native[1]
 
 
+async def test_an_unverifiable_frame_check_is_a_service_unavailable(monkeypatch: pytest.MonkeyPatch, isolated: Clock):
+    _borrowing(monkeypatch, 0.0)
+    router: Final = _router(("sock", 1000, None))
+    team: Final = _key("team", team_id="team-u", team_metadata={"model_tpm_limit": {"sock": 150}})
+
+    def prepare(side: Side) -> None:
+        monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {"fail_closed_rate_limit_enforcement": True})
+
+    with fake_redis(emulate=True) as redis:
+        redis.refused_reads.add(
+            counter_key(RateLimitScope("model_per_team_saturated", "team-u:sock").counter("tokens"))
+        )
+        native: Final = await _differential(
+            monkeypatch, isolated, router, [_socket_connection("u", team, (Turn("sock"),))], [], prepare, redis=redis
+        )
+    assert native[0][1][0] == "ServiceUnavailableError", native[0]
+
+
 async def _settled() -> None:
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
@@ -1561,6 +1602,7 @@ async def test_every_redis_call_of_an_attempt_runs_under_the_rate_limits_service
     steps: Final = [
         Step(Request(team, "traced", "t0"), tokens=(20, 10)),
         Step(Request(team, "traced", "t1"), tokens=(30, 0), failed=True, partial=(5, 5)),
+        Step(Request(team, "traced", "t2"), refused=True),
     ]
     targets: Final[list[str | None]] = []  # mutable-ok: the service target of each Redis call, in order
 
@@ -1629,6 +1671,36 @@ async def test_a_capped_team_holds_its_cap_on_fallbacks_and_frames_like_python(
     assert {call[0] for call in native[-1]} >= {"share"}, native[-1]
 
 
+_NATIVE_REDIS_DOWN: Final = (
+    "('rejected', 'Redis rejected the command: ResponseError: redis down: ResponseError: redis down')"
+)
+
+
+async def test_a_failing_redis_saturation_read_falls_back_to_this_workers_copy_like_python(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock
+) -> None:
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.5})
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
+    router: Final = _router(("down", None, 4))
+    high: Final = _key("high", metadata={"priority": "high"})
+    with fake_redis(read_error="redis down") as redis:
+        native: Final = await _differential(
+            monkeypatch,
+            isolated,
+            router,
+            [Step(Request(high, "down", f"d{index}")) for index in range(4)],
+            [("model_saturation_check", "down"), ("priority_model", "down:high")],
+            redis=redis,
+            renamed={_NATIVE_REDIS_DOWN: "redis down"},
+        )
+    assert {
+        line for step in native[:4] for line in step[-1][1]
+    } == {  # comprehension-ok: every log line of the first four steps
+        ("WARNING", "Saturation read failed in Redis, using this worker's copy: redis down")
+    }, native
+    assert set(_refusal_prefixes(native)) == {"Priority-based rate limit exceeded"}, native
+
+
 @pytest.mark.parametrize("model_group", [5, True, "", ["listed"], ("tupled",)])
 async def test_logged_model_groups_of_any_type_settle_like_python(
     monkeypatch: pytest.MonkeyPatch, isolated: Clock, model_group: object
@@ -1648,6 +1720,33 @@ async def test_logged_model_groups_of_any_type_settle_like_python(
             ("priority_model", f"{model_group}:default_pool"),
         ],
     )
+
+
+async def test_saturation_is_read_from_redis_on_every_check_like_python(
+    monkeypatch: pytest.MonkeyPatch, isolated: Clock
+) -> None:
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.5})
+    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
+    router: Final = _router(("shared", None, 4))
+    high: Final = _key("high", metadata={"priority": "high"})
+    with (
+        fake_redis() as redis,
+        redis.answering({counter_key(RateLimitScope("model_saturation_check", "shared").counter("requests")): "3"}),
+    ):
+        native: Final = await _differential(
+            monkeypatch,
+            isolated,
+            router,
+            [Step(Request(high, "shared", f"h{index}")) for index in range(3)],
+            [("model_saturation_check", "shared"), ("priority_model", "shared:high")],
+            redis=redis,
+        )
+    seen: Final = [("redis", key.removeprefix("{").split(":")[0], 60) for key in redis.read_keys()] + [
+        ("memory", "RateLimitCounter", None)
+    ] * 4
+    golden.check(seen)
+    assert [read for read in seen if read[0] == "redis"] == [("redis", "model_saturation_check", 60)] * 3, seen
+    assert _refusal_prefixes(native) == ["Priority-based rate limit exceeded"], native
 
 
 @dataclass(frozen=True)

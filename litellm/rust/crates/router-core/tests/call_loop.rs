@@ -2159,7 +2159,10 @@ async fn every_event_of_a_retried_and_fallen_back_call_serializes_tagged_by_its_
 
 fn queue_rejected() -> AttemptError {
     let mut rejected = AttemptError::new(FailureKind::QueueRejected, Some(503));
-    rejected.classes = vec!["DynamicQueueFullError".into(), "ServiceUnavailableError".into()];
+    rejected.classes = vec![
+        "DynamicQueueFullError".into(),
+        "ServiceUnavailableError".into(),
+    ];
     rejected
 }
 

@@ -7,6 +7,7 @@ from typing import Final, Protocol, runtime_checkable
 import pytest
 
 import litellm
+from litellm._internal_context import current_service_target
 from litellm import DualCache, Router
 from litellm.caching.redis_batch import request_redis_batch_scope
 from litellm.caching.redis_cache import RedisCache
@@ -17,8 +18,9 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     claim_request_stash_for_data,
 )
 from litellm.redis.stores.rate_limits import RateLimitScope, RateLimitStore
+from litellm.rust_bridge.host import redis_events
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
-from tests.unit.proxy.hooks.native_capacity_handler import fake_redis, listening
+from tests.unit.proxy.hooks.native_capacity_handler import counter_key, fake_redis, listening
 
 
 class Limiter(Protocol):
@@ -45,6 +47,10 @@ class CapacityHandler(Protocol):
     ) -> None: ...
 
     async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: object, end_time: object
+    ) -> None: ...
+
+    async def async_log_failure_event(
         self, kwargs: dict[str, object], response_obj: object, start_time: object, end_time: object
     ) -> None: ...
 
@@ -254,6 +260,77 @@ async def fallback_idle_forgiven(monkeypatch: pytest.MonkeyPatch, build: Build, 
     return await _isolated(run())
 
 
+async def redis_call_targets(monkeypatch: pytest.MonkeyPatch, build: Build, pre_call: PreCall) -> object:
+    async def run() -> object:
+        targets: Final[list[tuple[str, str | None]]] = []  # mutable-ok: each Redis call and its service target
+
+        def record(
+            event_loop: asyncio.AbstractEventLoop | None,
+            call_type: str,
+            start_time: float,
+            end_time: float,
+            failure: redis_events.Failure | None,
+        ) -> None:
+            targets.append((call_type, current_service_target()))
+
+        monkeypatch.setattr(redis_events, "record_redis_call", record)
+        _borrowing(monkeypatch, fail_closed=False, saturation_threshold=0.0)
+        router: Final = _router()
+        monkeypatch.setattr(litellm, "callbacks", ["dynamic_rate_limiter_v3"])
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+        with fake_redis(emulate=True) as redis:
+            handler: Final = build(DualCache(redis_cache=RedisCache(host="127.0.0.1", port=redis.port)))
+            handler.update_variables(llm_router=router)
+            admitted: Final = await _attempt(pre_call(handler, _borrower(), {"model": _MODEL, "max_tokens": 0}))
+            await handler.async_log_failure_event(
+                kwargs={
+                    "litellm_params": {"metadata": {"model_group": _MODEL}},
+                    "standard_logging_object": {
+                        "metadata": {"user_api_key_team_id": "team-a", "user_api_key_auth_metadata": {}}
+                    },
+                },
+                response_obj=ModelResponse(usage=Usage(prompt_tokens=5, completion_tokens=5, total_tokens=10)),
+                start_time=datetime.now(),
+                end_time=datetime.now(),
+            )
+            settled = -1
+            while settled != len(targets):
+                settled = len(targets)
+                await asyncio.sleep(0.2)
+            return [admitted, sorted(targets, key=str)]
+
+    return await _isolated(run())
+
+
+async def saturation_read_each_check(monkeypatch: pytest.MonkeyPatch, build: Build, pre_call: PreCall) -> object:
+    async def run() -> object:
+        monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+        monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.5})
+        monkeypatch.setattr(
+            litellm, "priority_reservation_settings", PriorityReservationSettings(saturation_threshold=0.5)
+        )
+        router: Final = Router(
+            model_list=[
+                {
+                    "model_name": "shared",
+                    "litellm_params": {"model": "gpt-3.5-turbo", "api_key": "k", "api_base": "b", "rpm": 4},
+                }
+            ]
+        )
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+        high: Final = UserAPIKeyAuth(api_key="sk-high", metadata={"priority": "high"})
+        saturation: Final = counter_key(RateLimitScope("model_saturation_check", "shared").counter("requests"))
+        with fake_redis(emulate=True) as redis, redis.answering({saturation: "3"}):
+            handler: Final = build(DualCache(redis_cache=RedisCache(host="127.0.0.1", port=redis.port)))
+            handler.update_variables(llm_router=router)
+            outcomes: Final = [
+                await _attempt(pre_call(handler, high, {"model": "shared", "max_tokens": 0})) for _ in range(3)
+            ]
+            return [outcomes, redis.read_keys()]
+
+    return await _isolated(run())
+
+
 SCENARIOS: Final[Mapping[str, Scenario]] = {
     "test_a_request_batch_takes_the_round_trips_python_takes": batch_trips,
     "test_a_redis_outage_fails_open_like_python": redis_down_fails_open,
@@ -261,4 +338,6 @@ SCENARIOS: Final[Mapping[str, Scenario]] = {
     "test_a_nested_calls_tokens_are_not_charged_to_the_requests_team_share": nested_call_not_charged,
     "test_a_borrowers_usage_while_the_model_was_idle_is_forgiven_once_it_saturates": idle_usage_forgiven,
     "test_a_fallback_target_still_borrows_while_idle_and_its_tokens_are_forgiven_once_it_saturates": fallback_idle_forgiven,
+    "test_every_redis_call_of_an_attempt_runs_under_the_rate_limits_service_target_like_python": redis_call_targets,
+    "test_saturation_is_read_from_redis_on_every_check_like_main": saturation_read_each_check,
 }

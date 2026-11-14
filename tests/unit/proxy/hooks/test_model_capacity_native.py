@@ -1639,6 +1639,9 @@ async def test_every_redis_call_of_an_attempt_runs_under_the_rate_limits_service
             await asyncio.sleep(0.2)
     assert targets, targets
     assert set(targets) == {RATE_LIMITS_TARGET}, targets
+    await _recorded_scenario(
+        monkeypatch, "test_every_redis_call_of_an_attempt_runs_under_the_rate_limits_service_target_like_python"
+    )
 
 
 async def test_a_capped_team_holds_its_cap_on_fallbacks_and_frames_like_python(
@@ -2303,3 +2306,7 @@ async def test_a_fallback_target_still_borrows_while_idle_and_its_tokens_are_for
     await _recorded_scenario(
         monkeypatch, "test_a_fallback_target_still_borrows_while_idle_and_its_tokens_are_forgiven_once_it_saturates"
     )
+
+
+async def test_saturation_is_read_from_redis_on_every_check_like_main(monkeypatch: pytest.MonkeyPatch) -> None:
+    await _recorded_scenario(monkeypatch, "test_saturation_is_read_from_redis_on_every_check_like_main")

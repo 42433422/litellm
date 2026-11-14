@@ -731,28 +731,46 @@ impl ParallelRequestLimiter {
         ctx: Ctx<'_>,
     ) -> Result<Option<Abort>, Unverifiable> {
         state.stash().batch_tpd_refunds.clear();
-        if !batch.enqueued_scopes.is_empty() {
-            return Ok(
-                match self
-                    .enqueued
-                    .reserve(batch.total_tokens, batch.enqueued_scopes.clone())
-                    .await
-                {
-                    EnqueuedOutcome::OverLimit { scope, enqueued } => {
-                        Some(refusal::batch_enqueued_limited(
-                            &scope,
-                            enqueued,
-                            batch.total_tokens,
-                            facts.requested_model.as_deref(),
-                        ))
-                    }
-                    EnqueuedOutcome::Reservation(reservation) => {
-                        state.stash().batch_enqueued = Some(reservation);
-                        None
-                    }
-                },
-            );
+        if batch.enqueued_scopes.is_empty() {
+            return self.charge_batch_counters(state, batch, facts, ctx).await;
         }
+        match self
+            .enqueued
+            .reserve(batch.total_tokens, batch.enqueued_scopes.clone())
+            .await
+        {
+            EnqueuedOutcome::OverLimit { scope, enqueued } => {
+                return Ok(Some(refusal::batch_enqueued_limited(
+                    &scope,
+                    enqueued,
+                    batch.total_tokens,
+                    facts.requested_model.as_deref(),
+                )));
+            }
+            EnqueuedOutcome::Reservation(reservation) => {
+                state.stash().batch_enqueued = Some(reservation);
+            }
+        }
+        if !batch.counters_after_reservation {
+            return Ok(None);
+        }
+        let charged = self.charge_batch_counters(state, batch, facts, ctx).await;
+        if !matches!(charged, Ok(None)) {
+            let reservation = state.stash().batch_enqueued.take();
+            if let Some(reservation) = reservation {
+                self.enqueued.refund(&reservation).await;
+            }
+        }
+        charged
+    }
+
+    async fn charge_batch_counters(
+        &self,
+        state: &LimiterState,
+        batch: &BatchFacts,
+        facts: &PreCallFacts,
+        ctx: Ctx<'_>,
+    ) -> Result<Option<Abort>, Unverifiable> {
         let response = self
             .engine
             .atomic_check_and_increment(&batch.descriptors, &batch.increments, ctx)

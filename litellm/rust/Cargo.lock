@@ -3904,6 +3904,7 @@ dependencies = [
  "litellm-http",
  "litellm-inference",
  "litellm-llms",
+ "litellm-model-catalog",
  "litellm-redis-client",
  "litellm-redis-connect",
  "litellm-redis-resolve",
@@ -3925,6 +3926,7 @@ dependencies = [
  "tracing",
  "uuid",
  "veil",
+ "wiremock",
 ]
 
 [[package]]
@@ -4383,6 +4385,7 @@ dependencies = [
  "litellm-host",
  "litellm-http",
  "litellm-llms-types",
+ "litellm-model-catalog",
  "litellm-python-compat",
  "litellm-router-types",
  "litellm-secret-value",
@@ -4420,6 +4423,7 @@ name = "litellm-model-catalog"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "fancy-regex 0.19.2",
  "indexmap 2.14.0",
  "jiff",
  "jsonschema",
@@ -4668,8 +4672,11 @@ dependencies = [
  "litellm-core-utils",
  "litellm-inference",
  "litellm-inference-messages",
+ "litellm-llms",
+ "litellm-model-catalog",
  "litellm-router-types",
  "rstest",
+ "serde_json",
 ]
 
 [[package]]

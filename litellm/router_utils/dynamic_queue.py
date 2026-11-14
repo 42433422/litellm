@@ -238,11 +238,14 @@ class Attempt:
 
     async def _renew(self, token: int) -> None:
         interval: Final = self._backend.settings.lease_ms / 3000
-        while True:
-            await self._timer.sleep(interval)
-            renewed: Final = await self._backend.renew(self._request.capacity, self._request.waiter_id, token)
-            if renewed is False:
-                return
+        while await self._renewed_after(interval, token):
+            pass
+
+    async def _renewed_after(self, interval: float, token: int) -> bool:
+        """Renews the lease once ``interval`` passed; False once it is lost. An unreachable backend keeps trying."""
+        await self._timer.sleep(interval)
+        renewed: Final = await self._backend.renew(self._request.capacity, self._request.waiter_id, token)
+        return renewed is not False
 
     def _stop_renewal(self) -> "tuple[asyncio.Task[None], ...]":
         renewal: Final = self._renewal
@@ -303,26 +306,31 @@ class DynamicQueue:
         return self._in_time(first, deadline)
 
     async def _wait(self, request: WaitRequest, deadline: float, waiting: Waiting) -> Grant | Rejection:
+        reply: Grant | Rejection | Waiting = waiting  # rebind-ok: each poll's reply decides whether to wait on
+        while isinstance(reply, Waiting):
+            reply = await self._recheck(request, deadline, reply)
+        return reply
+
+    async def _recheck(self, request: WaitRequest, deadline: float, waiting: Waiting) -> Grant | Rejection | Waiting:
+        """One recheck: sleeps as long as ``waiting`` asks, within the deadline, then polls once."""
+        remaining: Final = deadline - self._timer.now()
+        if remaining <= 0:
+            return QueueTimeout()
+        await self._timer.sleep(min(self._delay(waiting), remaining))
+        left: Final = deadline - self._timer.now()
+        if left <= 0:
+            return QueueTimeout()
         operation_s: Final = _operation_s(self._backend)
-        delay: float = self._delay(waiting)  # rebind-ok: each poll's reply sets how soon to recheck
-        while True:
-            remaining: Final = deadline - self._timer.now()
-            if remaining <= 0:
-                return QueueTimeout()
-            await self._timer.sleep(min(delay, remaining))
-            left: Final = deadline - self._timer.now()
-            if left <= 0:
-                return QueueTimeout()
-            polled: Final = await self._within(
-                self._backend.poll(request.capacity, request.waiter_id), min(operation_s, left)
-            )
-            if polled is None:
-                return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
-            if isinstance(polled, Gone):
-                return QueueTimeout()
-            if not isinstance(polled, Waiting):
-                return self._in_time(polled, deadline)
-            delay = self._delay(polled)
+        polled: Final = await self._within(
+            self._backend.poll(request.capacity, request.waiter_id), min(operation_s, left)
+        )
+        if polled is None:
+            return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+        if isinstance(polled, Gone):
+            return QueueTimeout()
+        if isinstance(polled, Waiting):
+            return polled
+        return self._in_time(polled, deadline)
 
     async def _abandon(self, request: WaitRequest) -> None:
         release: Final = asyncio.create_task(self._backend.abandon(request.capacity, request.waiter_id))

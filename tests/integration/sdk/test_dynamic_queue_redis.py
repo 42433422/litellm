@@ -1,0 +1,251 @@
+import os
+import uuid
+from collections.abc import Mapping, Sequence
+from typing import Final
+
+import pytest
+
+from litellm.caching.redis_cache import RedisCache
+from litellm.router_utils.dynamic_queue import (
+    Gone,
+    MatchingFailure,
+    OtherFailure,
+    PassThrough,
+    PollReply,
+    Probe,
+    QueueFull,
+    QueueSettings,
+    Released,
+    Succeeded,
+    Waiting,
+    WaitRequest,
+)
+from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend
+
+FAR: Final = 1_000_000
+
+
+class SharedClock:
+    """Stands in for Redis TIME so both workers see time move only when the test moves it."""
+
+    def __init__(self) -> None:
+        self.ms = 0
+
+    def __call__(self) -> int:
+        return self.ms
+
+
+def _worker(clock: SharedClock | None, **overrides: int) -> RedisQueueBackend:
+    return RedisQueueBackend(
+        RedisCache(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])),
+        QueueSettings(**overrides),
+        clock,
+    )
+
+
+def _pair(clock: SharedClock, **overrides: int) -> tuple[RedisQueueBackend, RedisQueueBackend]:
+    return _worker(clock, **overrides), _worker(clock, **overrides)
+
+
+@pytest.fixture
+def capacity() -> str:
+    return f"integration-{uuid.uuid4()}"
+
+
+async def _congest(worker: RedisQueueBackend, capacity: str, retry_after_ms: int = 0) -> None:
+    assert await worker.report(capacity, "in-flight", PassThrough(0), MatchingFailure(retry_after_ms)) is None
+
+
+async def _polls(workers: Mapping[str, RedisQueueBackend], capacity: str) -> dict[str, PollReply]:
+    return {waiter_id: await worker.poll(capacity, waiter_id) for waiter_id, worker in workers.items()}
+
+
+async def _probed(workers: Mapping[str, RedisQueueBackend], capacity: str) -> tuple[str, Probe]:
+    replies: Final = await _polls(workers, capacity)
+    probes: Final = [(waiter_id, reply) for waiter_id, reply in replies.items() if isinstance(reply, Probe)]
+    assert len(probes) == 1, replies
+    assert all(isinstance(reply, (Probe, Waiting)) for reply in replies.values()), replies
+    return probes[0]
+
+
+async def _enqueue(capacity: str, arrivals: Sequence[tuple[str, int, RedisQueueBackend]], budget_ms: int = FAR) -> None:
+    for waiter_id, priority, worker in arrivals:
+        reply: Final = await worker.admit(WaitRequest(capacity, waiter_id, priority), budget_ms)
+        assert isinstance(reply, Waiting), (waiter_id, reply)
+
+
+@pytest.mark.asyncio
+async def test_waiters_on_two_workers_probe_in_one_priority_order_with_fifo_ties(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, required_successes=100)
+    await _congest(first, capacity)
+    arrivals: Final = (
+        ("five-first", 5, first),
+        ("minus-three-first", -3, second),
+        ("zero", 0, first),
+        ("five-second", 5, second),
+        ("huge", 2**80, first),
+        ("minus-three-second", -3, first),
+        ("minus-huge", -(2**80), second),
+    )
+    await _enqueue(capacity, arrivals)
+    clock.ms = 1_000
+
+    order: list[str] = []
+    remaining: Final = {waiter_id: worker for waiter_id, _, worker in arrivals}
+    while remaining:
+        waiter_id, probe = await _probed(remaining, capacity)
+        assert await remaining.pop(waiter_id).report(capacity, waiter_id, probe, OtherFailure()) is None
+        order.append(waiter_id)
+
+    assert order == [
+        "minus-huge",
+        "minus-three-first",
+        "minus-three-second",
+        "zero",
+        "five-first",
+        "five-second",
+        "huge",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_probe_backoff_doubles_to_its_cap_and_honors_a_longer_retry_after(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, initial_backoff_ms=1_000, max_backoff_ms=3_000, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [(waiter_id, 0, second) for waiter_id in "abcd"])
+
+    for waiter_id, due, retry_after_ms in (("a", 1_000, 0), ("b", 3_000, 0), ("c", 6_000, 10_000), ("d", 16_000, 0)):
+        clock.ms = due - 1
+        assert isinstance(await second.poll(capacity, waiter_id), Waiting)
+        clock.ms = due
+        probe = await second.poll(capacity, waiter_id)
+        assert isinstance(probe, Probe), (waiter_id, probe)
+        assert await first.report(capacity, waiter_id, probe, MatchingFailure(retry_after_ms)) is None
+
+
+@pytest.mark.asyncio
+async def test_consecutive_successes_recover_and_release_the_snapshot_ahead_of_later_arrivals(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, required_successes=2)
+    await _congest(first, capacity)
+    arrivals: Final = (
+        ("a", 0, first),
+        ("b", 1, second),
+        ("c", 2, first),
+        ("d", 3, second),
+        ("e", 4, first),
+        ("f", 4, second),
+    )
+    await _enqueue(capacity, arrivals)
+    clock.ms = 1_000
+    remaining: Final = {waiter_id: worker for waiter_id, _, worker in arrivals}
+
+    for expected, outcome in (("a", Succeeded()), ("b", OtherFailure()), ("c", Succeeded()), ("d", Succeeded())):
+        waiter_id, probe = await _probed(remaining, capacity)
+        assert waiter_id == expected
+        assert await remaining.pop(waiter_id).report(capacity, waiter_id, probe, outcome) is None
+    arrival: Final = await first.admit(WaitRequest(capacity, "after-recovery", -100), FAR)
+    released: Final = await _polls(remaining, capacity)
+
+    assert isinstance(arrival, PassThrough)
+    assert released == {"e": Released(arrival.generation, 1), "f": Released(arrival.generation, 2)}
+
+
+@pytest.mark.asyncio
+async def test_a_success_from_a_superseded_generation_does_not_recover(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, required_successes=1)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("a", 0, second)])
+    clock.ms = 1_000
+    stale: Final = await second.poll(capacity, "a")
+    assert isinstance(stale, Probe)
+
+    await _congest(first, capacity)
+    assert await second.report(capacity, "a", stale, Succeeded()) is None
+
+    assert isinstance(await first.admit(WaitRequest(capacity, "b", 0), FAR), Waiting)
+    clock.ms = 2_000
+    fresh: Final = await first.poll(capacity, "b")
+    assert isinstance(fresh, Probe) and fresh.generation > stale.generation
+    assert await first.report(capacity, "b", fresh, Succeeded()) is None
+    assert isinstance(await second.admit(WaitRequest(capacity, "c", 0), FAR), PassThrough)
+
+
+@pytest.mark.asyncio
+async def test_a_renewed_lease_stays_exclusive_and_an_unrenewed_one_expires_to_the_next_waiter(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, required_successes=1, lease_ms=3_000, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("prober", 0, first), ("next", 0, second)])
+    clock.ms = 1_000
+    probe: Final = await first.poll(capacity, "prober")
+    assert isinstance(probe, Probe)
+
+    clock.ms = 3_500
+    assert await first.renew(capacity, "prober", probe.token) is True
+    clock.ms = 6_000
+    held: Final = await second.poll(capacity, "next")
+    clock.ms = 6_500
+    takeover: Final = await second.poll(capacity, "next")
+
+    assert isinstance(held, Waiting)
+    assert isinstance(takeover, Probe)
+    assert await first.renew(capacity, "prober", probe.token) is False
+    assert await first.report(capacity, "prober", probe, Succeeded()) is None
+    assert isinstance(await first.admit(WaitRequest(capacity, "later", 0), FAR), Waiting)
+
+
+@pytest.mark.asyncio
+async def test_a_waiter_whose_worker_stops_polling_is_dropped_after_its_liveness_window(capacity: str) -> None:
+    clock: Final = SharedClock()
+    lost, alive = _pair(clock, liveness_ms=5_000)
+    await _congest(lost, capacity, retry_after_ms=6_000)
+    await _enqueue(capacity, [("from-lost-worker", 0, lost), ("from-live-worker", 0, alive)])
+
+    clock.ms = 3_000
+    assert isinstance(await alive.poll(capacity, "from-live-worker"), Waiting)
+    clock.ms = 6_000
+
+    assert isinstance(await alive.poll(capacity, "from-live-worker"), Probe)
+    assert isinstance(await lost.poll(capacity, "from-lost-worker"), Gone)
+
+
+@pytest.mark.asyncio
+async def test_a_full_queue_refuses_until_a_waiter_passes_its_deadline(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, max_waiting=1, liveness_ms=FAR)
+    await _congest(first, capacity, retry_after_ms=FAR)
+    await _enqueue(capacity, [("a", 0, first)], budget_ms=2_000)
+
+    assert isinstance(await second.admit(WaitRequest(capacity, "b", 0), FAR), QueueFull)
+    clock.ms = 2_000
+    assert isinstance(await second.admit(WaitRequest(capacity, "b", 0), FAR), Waiting)
+    assert isinstance(await first.poll(capacity, "a"), Gone)
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_waiter_frees_its_place_on_every_worker(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, max_waiting=1)
+    await _congest(first, capacity, retry_after_ms=FAR)
+    await _enqueue(capacity, [("a", 0, first)])
+
+    assert await first.abandon(capacity, "a") is None
+
+    assert isinstance(await second.admit(WaitRequest(capacity, "b", 0), FAR), Waiting)
+    assert isinstance(await first.poll(capacity, "a"), Gone)
+
+
+@pytest.mark.asyncio
+async def test_redis_time_drives_the_queue_when_no_clock_is_injected(capacity: str) -> None:
+    first, second = _worker(None), _worker(None)
+
+    assert isinstance(await first.admit(WaitRequest(capacity, "healthy", 0), FAR), PassThrough)
+    await _congest(second, capacity, retry_after_ms=FAR)
+    assert isinstance(await first.admit(WaitRequest(capacity, "queued", 0), FAR), Waiting)
+    assert isinstance(await second.poll(capacity, "queued"), Waiting)
+    assert await second.abandon(capacity, "queued") is None
+    assert isinstance(await first.poll(capacity, "queued"), Gone)

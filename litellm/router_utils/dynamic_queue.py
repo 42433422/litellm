@@ -16,7 +16,6 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType, TracebackType
 from typing import Final, Protocol, TypeAlias, TypeVar
 
-
 OPERATION_TIMED_OUT: Final = "operation_timed_out"
 
 
@@ -115,7 +114,7 @@ class Admitted:
     remaining_s: float
 
 
-_R = TypeVar("_R")
+_R: Final = TypeVar("_R")
 
 
 class QueueBackend(Protocol):

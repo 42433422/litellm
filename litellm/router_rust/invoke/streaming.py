@@ -130,6 +130,10 @@ class StreamAttempt:
     # which a recovery of the stream waits with in whichever task consumes it.
     admission: Admission | None = None
     request_queue: RequestQueue | None = None
+    # Set once a reader starts the stream; until then only the unread watch can give the queue turn back.
+    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    # The background report of the stream's outcome to the dynamic queue, once it ended.
+    settling: "asyncio.Task[None] | None" = None
 
     @property
     def model_group(self) -> str:
@@ -238,13 +242,15 @@ class StreamAttempt:
                 self.core.report_stream_failure(self._failure_logged(error), self._callbacks(sync=False))
             )
 
-    def settle_admission(self, error: BaseException | None = None, *, succeeded: bool = False) -> None:
+    def settle_admission(
+        self, error: BaseException | None = None, *, succeeded: bool = False
+    ) -> "asyncio.Task[None] | None":
         """Reports the stream's outcome to the dynamic queue once, in the background so it never holds up or replaces
         what the client already read: a success only when the stream completed, the failure it raised, or nothing
         when it was closed early."""
         admission: Final = self.admission
         if admission is None:
-            return
+            return None
         self.admission = None
         from litellm.router_rust.core import retry_after_seconds
 
@@ -255,15 +261,22 @@ class StreamAttempt:
             if error is None
             else admission.router.outcome_of(_provider_error(error), retry_after_seconds(_provider_error(error)))
         )
-        _ = _record_in_background(admission.finish(outcome))
+        self.settling = _record_in_background(admission.finish(outcome))
+        return self.settling
 
-    def release_admission_when_dropped(self, stream: object) -> None:
-        """A stream its caller drops before reading it never runs its generator's cleanup, so the queue turn is
-        given back without credit once the stream object itself is collected."""
-        if self.admission is None:
-            return
-        loop: Final = asyncio.get_running_loop()
-        _ = weakref.finalize(stream, _settle_dropped, loop, self)
+    def watch_unread(self) -> "asyncio.Task[None] | None":
+        """A stream its caller never starts reading, or closes unread, never runs its generator's cleanup: its queue
+        turn is given back without credit once a probe lease's worth of time passes unread."""
+        admission: Final = self.admission
+        if admission is None:
+            return None
+
+        async def watch() -> None:
+            await admission.release_unless_started(self.started)
+            if not self.started.is_set():
+                self.admission = None
+
+        return _record_in_background(watch())
 
     async def failure_recorded(self) -> None:
         """Wait for the stream's failure to be recorded, if one is being recorded."""
@@ -318,11 +331,6 @@ def _record_in_background(recording: Coroutine[object, object, object]) -> "asyn
     return task
 
 
-def _settle_dropped(loop: asyncio.AbstractEventLoop, attempt: StreamAttempt) -> None:
-    if attempt.admission is not None and not loop.is_closed():
-        _ = loop.call_soon_threadsafe(attempt.settle_admission)
-
-
 def _record_now(recording: Callable[[], object]) -> None:
     try:
         _ = recording()
@@ -348,6 +356,7 @@ async def _areported(
     answers."""
     last: object = None  # rebind-ok: the newest item
     started = False  # rebind-ok: whether an item came
+    attempt.started.set()
     try:
         async for item in items:
             last = item
@@ -1084,7 +1093,7 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
     wrapped_response: Final = _AsyncChatStream(stream_with_fallbacks(), model_response)
     # weak, so the generator closing over it does not keep the wrapper alive
     wrapper_ref: Final[weakref.ref[FallbackAwareStreamWrapper]] = weakref.ref(wrapped_response)
-    attempt.release_admission_when_dropped(wrapped_response)
+    _ = attempt.watch_unread()
     return wrapped_response
 
 
@@ -1944,7 +1953,7 @@ def _reported_text_completion_stream(attempt: StreamAttempt, response: object) -
     response.completion_stream = _areported(  # rebind-ok: the stream's own iterator, wrapped
         attempt, chunks, _chat_total_tokens, fails_before_first_item=False
     )
-    attempt.release_admission_when_dropped(response)
+    _ = attempt.watch_unread()
     return response
 
 

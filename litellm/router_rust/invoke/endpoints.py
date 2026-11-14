@@ -794,12 +794,6 @@ def clean_realtime_session_deployment(call: AttemptCall) -> str | None:
     return None if deployment_id is None else str(deployment_id)
 
 
-def _brings_own_credentials(request: Mapping[str, object]) -> bool:
-    from litellm.litellm_core_utils.clientside_credential_handler import is_clientside_credential
-
-    return is_clientside_credential(dict(request)) or request.get("provider_specific_header") is not None
-
-
 # `_scheduler` once `del router.scheduler` ran (None is a scheduler not built yet).
 _NO_SCHEDULER: Final = object()
 
@@ -2058,23 +2052,19 @@ class RustEndpoints:
         if settings is None:
             return None
         if self._queue_router is None or self._queue_router.settings is not settings:
-            self._queue_router = DynamicQueueRouter(
-                settings,
-                redis=lambda: self._core.routing_cache.redis_cache,
-                cooldown_s=lambda: self._core.resolved.cooldown_time,
-            )
+            self._queue_router = DynamicQueueRouter(settings, redis=lambda: self._core.routing_cache.redis_cache)
         return self._queue_router
 
     async def _prioritized(
         self, model: str, priority: int | None, run: Callable[[], Awaitable[object]], request: Mapping[str, object]
     ) -> object:
         """A prioritized call: with the dynamic queue enabled each provider attempt waits for its capacity's turn
-        instead of the call waiting in the scheduler once. A caller bringing its own credentials keeps today's
-        routing."""
+        instead of the call waiting in the scheduler once. An attempt on the caller's own credentials keeps today's
+        routing (``serves_caller_credentials``)."""
         queue_router: Final = self._dynamic_queue()
         if queue_router is None:
             return await run() if priority is None else await self._schedule(model, priority, run, request)
-        if priority is None or _brings_own_credentials(request):
+        if priority is None:
             return await run()
         with bound_request_queue(queue_router.request(priority, str(uuid.uuid4()))):
             return await run()

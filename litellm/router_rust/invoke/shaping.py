@@ -395,6 +395,33 @@ def _clientside_deployment(
 # --- the deployment --------------------------------------------------------------------------
 
 
+def forwarded_caller_authorization(kwargs: Mapping[str, object], deployment_params: Mapping[str, object]) -> str | None:
+    """The caller's own ``Authorization`` a provider that isolates forwarded credentials sends on instead of the
+    deployment's key, or None."""
+    from litellm.litellm_core_utils.get_provider_specific_headers import ProviderSpecificHeaderUtils
+
+    declared_provider: Final = deployment_params.get("custom_llm_provider")
+    declared_model: Final = deployment_params.get("model")
+    deployment_provider: Final = (
+        declared_provider
+        if isinstance(declared_provider, str)
+        else inferred_provider(declared_model if isinstance(declared_model, str) else None)
+    )
+    if deployment_provider not in _FORWARDED_CREDENTIAL_ISOLATION_PROVIDERS:
+        return None
+    header: Final = kwargs.get("provider_specific_header")
+    return ProviderSpecificHeaderUtils.forwarded_authorization(header, deployment_provider)
+
+
+def serves_caller_credentials(kwargs: Mapping[str, object], deployment: Mapping[str, object]) -> bool:
+    """The request reaches ``deployment`` on the caller's own credentials, as the request-scoped deployment the router
+    builds for it then, rather than on the deployment's."""
+    return (
+        is_clientside_credential(request_kwargs=dict(kwargs))
+        or forwarded_caller_authorization(kwargs, as_dict(deployment.get("litellm_params"))) is not None
+    )
+
+
 def update_kwargs_with_deployment(
     shaping: Shaping,
     deployment: Mapping[str, object],
@@ -421,22 +448,9 @@ def update_kwargs_with_deployment(
     deployment_model: object = deployment_params.get("model")  # rebind-ok: same
     deployment_api_base: object = deployment_params.get("api_base")  # rebind-ok: same
     deployment_model_name: Final = deployment.get("model_name")
-    from litellm.litellm_core_utils.get_provider_specific_headers import ProviderSpecificHeaderUtils
-
     for key in _malformed_request_params_the_deployment_sets(deployment_params, defaults, kwargs):
         kwargs.pop(key)
-    declared_provider: Final = deployment_params.get("custom_llm_provider")
-    declared_model: Final = deployment_params.get("model")
-    deployment_provider: Final = (
-        declared_provider
-        if isinstance(declared_provider, str)
-        else inferred_provider(declared_model if isinstance(declared_model, str) else None)
-    )
-    forwarded_authorization: Final = (
-        ProviderSpecificHeaderUtils.forwarded_authorization(kwargs.get("provider_specific_header"), deployment_provider)
-        if deployment_provider in _FORWARDED_CREDENTIAL_ISOLATION_PROVIDERS
-        else None
-    )
+    forwarded_authorization: Final = forwarded_caller_authorization(kwargs, deployment_params)
     if is_clientside_credential(request_kwargs=dict(kwargs)) or forwarded_authorization is not None:
         model_info, deployment_model, deployment_api_base = (  # rebind-ok: rebound as the Python router rebinds it
             _clientside_deployment(

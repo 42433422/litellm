@@ -768,7 +768,7 @@ class RustOptionalChecks:
         candidates: Final = [str(id) for id in step.get("candidates") or ()]  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType, reportUnknownArgumentType]  # the step's id list
         if not self._opt.has_filters():
             unique: Final = tuple(dict.fromkeys(candidates))
-            return (await prefer_uncongested(unique, self._records_of), None), None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]  # RustCore's deployment dicts
+            return (await prefer_uncongested(unique, self._records_of, self.queues_on(request)), None), None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]  # RustCore's deployment dicts and queue rule
         records: Final = self._records_of(candidates)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # RustCore's deployment dicts
         narrowed: Final = _request_with_failed_ids(request, step)
         try:
@@ -784,7 +784,7 @@ class RustOptionalChecks:
         if narrowed is not request and narrowed.get(_ENCRYPTED_PIN) and isinstance(request, dict):
             request[_ENCRYPTED_PIN] = True  # rebind-ok: the request dict the pick goes on to read
         kept: Final = filtered_ids(remaining, candidates)  # pyright: ignore[reportUnknownArgumentType]  # see above
-        return (await prefer_uncongested(kept, self._records_of), preferred_id), None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]  # see above
+        return (await prefer_uncongested(kept, self._records_of, self.queues_on(request)), preferred_id), None  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]  # see above
 
 
 __all__ = [

@@ -88,7 +88,7 @@ def _worker(
 
 def _queued(capacity: str) -> int:
     with Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])) as redis:
-        count: Final = redis.zcard(_keys(capacity)[1])
+        count: Final = redis.zcard(_keys(f"deployment:{capacity}")[1])
     assert isinstance(count, int)
     return count
 

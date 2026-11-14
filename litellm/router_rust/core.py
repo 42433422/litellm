@@ -117,7 +117,7 @@ from litellm.router_rust.invoke.endpoints import (
     stamp_error,
     unrouted_fields,
 )
-from litellm.router_rust.invoke.shaping import Shaping, non_stream_timeout
+from litellm.router_rust.invoke.shaping import Shaping, non_stream_timeout, serves_caller_credentials
 from litellm.router_rust.invoke.slots import enter_deployment_slot, max_parallel_requests_limit
 from litellm.router_rust.invoke.streaming import (
     StreamAttempt,
@@ -243,7 +243,7 @@ from litellm.router_strategy.least_busy import (
     release_started_attempt,
 )
 from litellm.router_utils.cooldown_handlers import get_cooldown_deployment_info, mark_deployment_selection_failure
-from litellm.router_utils.dynamic_queue import Succeeded
+from litellm.router_utils.dynamic_queue import CoordinationUnavailable, Succeeded
 from litellm.router_utils.dynamic_queue_router import (
     Admission,
     DynamicQueueSettings,
@@ -252,6 +252,7 @@ from litellm.router_utils.dynamic_queue_router import (
     congested_ids,
     current_request_queue,
     parse_dynamic_queue,
+    rejection_error,
 )
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, selected_endpoint
 from litellm.router_utils.kubernetes_pod_discovery import (
@@ -3407,6 +3408,16 @@ class RustCore(
         )
         return strategy, selector, str(step.get("model")), candidates
 
+    def queues_on(self, request: Mapping[str, object]) -> Callable[[Mapping[str, object]], bool]:
+        """Whether ``request`` queues on a deployment: not one it reaches on its caller's own credentials, nor one
+        that authenticates per caller."""
+
+        def queues(deployment: Mapping[str, object]) -> bool:
+            deployment_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
+            return not serves_caller_credentials(request, deployment) and not self.per_user_deployment(deployment_id)
+
+        return queues
+
     def _records_of(self, ids: object) -> list[dict[str, object]]:  # mutable-ok: the deployment dicts filters take
         return [dict(as_str_mapping(self._handle.deployment(str(id))) or {}) for id in _as_list(ids)]
 
@@ -3545,7 +3556,10 @@ class RustCore(
             return self._text_only(step)
         if step.get("stage") == "dynamic_congested":
             cooling: Final = tuple(str(id) for id in _as_list(step.get("candidates")))
-            return tuple(sorted(await congested_ids(cooling, self._records_of)))
+            busy: Final = await congested_ids(cooling, self._records_of, self.queues_on(request))
+            if isinstance(busy, CoordinationUnavailable):
+                raise rejection_error(busy, str(step.get("model")))
+            return tuple(sorted(busy))
         if step.get("stage") == "route_incapable":
             return self._route_incapable(step)
         if step.get("stage") == "media_refusing":
@@ -4646,6 +4660,8 @@ class _Driver:
         when the async pick's ``except`` reports it, as ``_async_get_available_deployment`` does."""
         if isinstance(error, RustCoreUnsupported):
             raise error
+        if isinstance(error, QueueRejectedError):
+            self._queue_rejection = error
         if logged:
             self._log_pick_failure(error)
         else:
@@ -5324,7 +5340,17 @@ class _Driver:
         if served_as != own_id or self._core.per_user_deployment(own_id):
             return None
         capacity: Final = capacity_of(deployment)
-        return None if capacity is None else await request_queue.admit(capacity, call.model_name)
+        if capacity is None:
+            return None
+        return await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
+
+    async def _cooldown_left_s(self, deployment_id: object) -> float:
+        """What is left of the deployment's own cooldown, as the router recorded it, or 0 when it has none."""
+        if not isinstance(deployment_id, str):
+            return 0.0
+        active: Final = await self._core._cooldowns.async_get_active_cooldowns([deployment_id], None)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        ends: Final = max((value["timestamp"] + value["cooldown_time"] for _, value in active), default=0.0)
+        return max(ends - unix_time(), 0.0)
 
     async def _routed_attempt(self, step: Mapping[str, object], attempt: RoutedAttempt) -> Mapping[str, object]:
         step = await self._resolve_pods(step)  # rebind-ok: the picked deployment, resolved to a pod

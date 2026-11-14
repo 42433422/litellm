@@ -6,6 +6,7 @@ use litellm_callbacks::{
     LimiterRequest, LoggedKeyIdentity, Manifest, MetadataKind, Outcome, Scalar, Selection,
     Subscription, Verdict, typed,
 };
+use litellm_redis_store::RequestRedis;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -177,7 +178,12 @@ impl ModelCapacity {
         }
     }
 
-    async fn pre_call(&self, input: &HookInput, stash: Option<&SharedStash>) -> HookOutput {
+    async fn pre_call(
+        &self,
+        input: &HookInput,
+        stash: Option<&SharedStash>,
+        redis: Option<&RequestRedis>,
+    ) -> HookOutput {
         let Some(Value::String(model)) = input.fields.raw(Field::Model)?.cloned() else {
             return Ok(None);
         };
@@ -200,7 +206,7 @@ impl ModelCapacity {
             settings: &settings,
             stash: &stash,
             fallback,
-            redis: None,
+            redis,
         };
         match self.engine.pre_call(&request, &model, &group).await {
             PreCall::Allow => Ok(None),
@@ -353,6 +359,21 @@ impl ModelCapacity {
         Ok(None)
     }
 
+    pub async fn handle_with(
+        &self,
+        input: &HookInput,
+        state: Option<&SharedStash>,
+        redis: Option<&RequestRedis>,
+    ) -> HookOutput {
+        match input.hook {
+            Hook::PreCall => self.pre_call(input, state, redis).await,
+            Hook::PostCallSuccess => self.post_call_success(input).await,
+            Hook::PostCallFailure => self.post_call_failure(state).await,
+            Hook::AttemptEnded => self.attempt_ended(input, state).await,
+            _ => Ok(None),
+        }
+    }
+
     pub fn post_call_headers(&self, key: &KeyFacts) -> Vec<(String, Value)> {
         Engine::post_call_headers(key)
     }
@@ -363,6 +384,7 @@ impl ModelCapacity {
         key: &KeyFacts,
         model: &str,
         commit: bool,
+        redis: Option<&RequestRedis>,
     ) -> Result<bool, CapacityError> {
         let settings = self.engine.host.settings().await?;
         let request = Request {
@@ -371,7 +393,7 @@ impl ModelCapacity {
             settings: &settings,
             stash,
             fallback: SaturationFallback::default(),
-            redis: None,
+            redis,
         };
         self.engine
             .fallback_target_allowed(&request, model, commit)
@@ -383,6 +405,7 @@ impl ModelCapacity {
         connection: Option<&SharedStash>,
         key: &KeyFacts,
         model: &str,
+        redis: Option<&RequestRedis>,
     ) -> Result<Frame, CapacityError> {
         let stash = connection.cloned().unwrap_or_default();
         let settings = self.engine.host.settings().await?;
@@ -392,7 +415,7 @@ impl ModelCapacity {
             settings: &settings,
             stash: &stash,
             fallback: SaturationFallback::default(),
-            redis: None,
+            redis,
         };
         self.engine.enforce_frame(&request, model, connection).await
     }
@@ -410,15 +433,7 @@ impl Callback for ModelCapacity {
         input: &'a HookInput,
         state: Option<&'a SharedStash>,
     ) -> BoxFuture<'a, HookOutput> {
-        Box::pin(async move {
-            match input.hook {
-                Hook::PreCall => self.pre_call(input, state).await,
-                Hook::PostCallSuccess => self.post_call_success(input).await,
-                Hook::PostCallFailure => self.post_call_failure(state).await,
-                Hook::AttemptEnded => self.attempt_ended(input, state).await,
-                _ => Ok(None),
-            }
-        })
+        Box::pin(self.handle_with(input, state, None))
     }
 }
 

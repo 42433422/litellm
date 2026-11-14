@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::{
     parallel_request_limiter::{limiter_async, python_clock, system_now},
-    redis::store::{rate_limits::NativeRateLimits, relabel},
+    redis::store::{rate_limits::NativeRateLimits, relabel, request::NativeRequestRedis},
 };
 
 struct PyDelegate(Py<PyAny>);
@@ -99,7 +99,7 @@ impl NativeModelCapacity {
         NativeModelCapacityState(SharedStash::default())
     }
 
-    #[pyo3(signature = (hook, fields, call, state, /))]
+    #[pyo3(signature = (hook, fields, call, state, /, request = None))]
     fn handle<'py>(
         &self,
         py: Python<'py>,
@@ -107,6 +107,7 @@ impl NativeModelCapacity {
         fields: &Bound<'py, PyDict>,
         call: Option<&Bound<'py, PyAny>>,
         state: Option<PyRef<'py, NativeModelCapacityState>>,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let hook = named(hook)?;
         let subscription = Callback::manifest(&*self.inner)
@@ -122,9 +123,11 @@ impl NativeModelCapacity {
             call: call.map(from_py::<CallFacts>).transpose()?,
         };
         let stash = state.map(|state| Arc::clone(&state.0));
+        let redis = request.map(|request| request.0.clone());
         let inner = Arc::clone(&self.inner);
         limiter_async(py, async move {
-            let verdict = Callback::handle(&*inner, &input, stash.as_ref())
+            let verdict = inner
+                .handle_with(&input, stash.as_ref(), redis.as_ref())
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             Ok(Pythonized(verdict))
@@ -140,7 +143,7 @@ impl NativeModelCapacity {
         Ok(to_py(py, &json!(self.inner.post_call_headers(&key)))?.into_bound(py))
     }
 
-    #[pyo3(signature = (state, key, model, commit))]
+    #[pyo3(signature = (state, key, model, commit, request = None))]
     fn fallback_target_allowed<'py>(
         &self,
         py: Python<'py>,
@@ -148,13 +151,15 @@ impl NativeModelCapacity {
         key: &Bound<'py, PyAny>,
         model: String,
         commit: bool,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let key = key_facts(key)?;
         let inner = Arc::clone(&self.inner);
         let stash = Arc::clone(&state.0);
+        let redis = request.map(|request| request.0.clone());
         limiter_async(py, async move {
             let answer = match inner
-                .fallback_target_allowed(&stash, &key, &model, commit)
+                .fallback_target_allowed(&stash, &key, &model, commit, redis.as_ref())
                 .await
             {
                 Ok(allowed) => json!({"allowed": allowed}),
@@ -164,19 +169,24 @@ impl NativeModelCapacity {
         })
     }
 
-    #[pyo3(signature = (connection, key, model))]
+    #[pyo3(signature = (connection, key, model, request = None))]
     fn enforce_frame<'py>(
         &self,
         py: Python<'py>,
         connection: Option<PyRef<'py, NativeModelCapacityState>>,
         key: &Bound<'py, PyAny>,
         model: String,
+        request: Option<PyRef<'py, NativeRequestRedis>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let key = key_facts(key)?;
         let inner = Arc::clone(&self.inner);
         let connection = connection.map(|state| Arc::clone(&state.0));
+        let redis = request.map(|request| request.0.clone());
         limiter_async(py, async move {
-            let answer = match inner.enforce_frame(connection.as_ref(), &key, &model).await {
+            let answer = match inner
+                .enforce_frame(connection.as_ref(), &key, &model, redis.as_ref())
+                .await
+            {
                 Ok(Frame::Allow) => json!({"allowed": true}),
                 Ok(Frame::Refuse(refusal)) => json!({"refused": {
                     "detail": refusal.detail,

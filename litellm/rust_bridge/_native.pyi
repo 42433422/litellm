@@ -648,13 +648,23 @@ class NativeModelCapacity:
         call: Mapping[str, object] | None,
         state: NativeModelCapacityState | None,
         /,
+        request: NativeRequestRedis | None = None,
     ) -> Future[object]: ...
     def post_call_headers(self, key: Mapping[str, object]) -> list[list[object]]: ...
     def fallback_target_allowed(
-        self, state: NativeModelCapacityState, key: Mapping[str, object], model: str, commit: bool
+        self,
+        state: NativeModelCapacityState,
+        key: Mapping[str, object],
+        model: str,
+        commit: bool,
+        request: NativeRequestRedis | None = None,
     ) -> Future[dict[str, object]]: ...
     def enforce_frame(
-        self, connection: NativeModelCapacityState | None, key: Mapping[str, object], model: str
+        self,
+        connection: NativeModelCapacityState | None,
+        key: Mapping[str, object],
+        model: str,
+        request: NativeRequestRedis | None = None,
     ) -> Future[dict[str, object]]: ...
 
 @final

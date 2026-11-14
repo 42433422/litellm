@@ -56,6 +56,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     request_stash_for_callback,
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy as limiter_policy
+from litellm.proxy.hooks.parallel_request_limiter_v3_native import pre_call_request
 from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.proxy.request_auth_context import REQUEST_AUTH
@@ -535,7 +536,8 @@ class _StashedNative:
         self, hook: str, fields: Mapping[str, object], call: Mapping[str, object] | None, _state: object, /
     ) -> Awaitable[object]:
         live: Final = _LIVE.get()
-        return self.capacity.handle(hook, fields, call, None if live is None else live.state)
+        request: Final = pre_call_request() if hook == Hook.pre_call.value else None
+        return self.capacity.handle(hook, fields, call, None if live is None else live.state, request=request)
 
 
 def _request_stash(hook: Hook, data: Mapping[str, object] | None) -> RequestRateLimiterStash | None:
@@ -691,7 +693,7 @@ class NativeDynamicRateLimiter(RustLogger):
         try:
             async with _admission(self.v3_limiter):
                 answer: Final = await self.capacity.fallback_target_allowed(
-                    state, key_inputs(user_api_key_dict), model, commit
+                    state, key_inputs(user_api_key_dict), model, commit, request=pre_call_request()
                 )
         finally:
             _LIVE.reset(token)
@@ -707,7 +709,9 @@ class NativeDynamicRateLimiter(RustLogger):
         token: Final = _LIVE.set(live)
         try:
             async with _admission(self.v3_limiter):
-                answer: Final = await self.capacity.enforce_frame(state, key_inputs(user_api_key_dict), requested_model)
+                answer: Final = await self.capacity.enforce_frame(
+                    state, key_inputs(user_api_key_dict), requested_model, request=pre_call_request()
+                )
         finally:
             _LIVE.reset(token)
         if answer.get("unverifiable") is True:

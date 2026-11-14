@@ -45,7 +45,6 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RATE_LIMIT_UNVERIFIABLE_MESSAGE,
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitedModel,
-    RateLimitResponse,
     RateLimitUnverifiableError,
     RequestRateLimiterStash,
     borrowing_team_model_limits,
@@ -93,7 +92,6 @@ class LiveRequest:
     kwargs: Mapping[str, object] | None = None
     state: "NativeModelCapacityState | None" = None
     raised: dict[int, BaseException] = field(default_factory=dict)  # mutable-ok: exceptions the seam re-raises
-    responses: dict[int, RateLimitResponse] = field(default_factory=dict)  # mutable-ok: limiter replies by id
 
 
 _LIVE: Final[ContextVar[LiveRequest | None]] = ContextVar("native_model_capacity_live", default=None)

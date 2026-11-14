@@ -2281,3 +2281,25 @@ async def test_a_redis_outage_fails_open_like_python(monkeypatch: pytest.MonkeyP
 
 async def test_a_redis_outage_under_fail_closed_is_handled_like_python(monkeypatch: pytest.MonkeyPatch) -> None:
     await _recorded_scenario(monkeypatch, "test_a_redis_outage_under_fail_closed_is_handled_like_python")
+
+
+async def test_a_nested_calls_tokens_are_not_charged_to_the_requests_team_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _recorded_scenario(monkeypatch, "test_a_nested_calls_tokens_are_not_charged_to_the_requests_team_share")
+
+
+async def test_a_borrowers_usage_while_the_model_was_idle_is_forgiven_once_it_saturates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _recorded_scenario(
+        monkeypatch, "test_a_borrowers_usage_while_the_model_was_idle_is_forgiven_once_it_saturates"
+    )
+
+
+async def test_a_fallback_target_still_borrows_while_idle_and_its_tokens_are_forgiven_once_it_saturates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _recorded_scenario(
+        monkeypatch, "test_a_fallback_target_still_borrows_while_idle_and_its_tokens_are_forgiven_once_it_saturates"
+    )

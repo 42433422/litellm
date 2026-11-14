@@ -1,4 +1,7 @@
-from collections.abc import Awaitable, Callable, Mapping
+import asyncio
+import contextvars
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from datetime import datetime
 from typing import Final, Protocol, runtime_checkable
 
 import pytest
@@ -8,14 +11,26 @@ from litellm import DualCache, Router
 from litellm.caching.redis_batch import request_redis_batch_scope
 from litellm.caching.redis_cache import RedisCache
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    RateLimitDescriptor,
+    RateLimitResponse,
+    claim_request_stash_for_data,
+)
 from litellm.redis.stores.rate_limits import RateLimitScope, RateLimitStore
-from litellm.types.utils import PriorityReservationSettings
+from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
 from tests.unit.proxy.hooks.native_capacity_handler import fake_redis, listening
 
 
 class Limiter(Protocol):
     @property
     def rate_limits(self) -> RateLimitStore: ...
+
+    @property
+    def window_size(self) -> int: ...
+
+    async def should_rate_limit(
+        self, descriptors: list[RateLimitDescriptor], *, read_only: bool, skip_parallel_check: bool
+    ) -> RateLimitResponse: ...
 
 
 @runtime_checkable
@@ -28,6 +43,14 @@ class CapacityHandler(Protocol):
     async def enforce_token_limits_for_frame(
         self, user_api_key_dict: UserAPIKeyAuth, requested_model: str | None
     ) -> None: ...
+
+    async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: object, end_time: object
+    ) -> None: ...
+
+    async def async_fallback_target_allowed(
+        self, user_api_key_dict: UserAPIKeyAuth, model: str, request_data: Mapping[str, object], *, commit: bool = True
+    ) -> bool: ...
 
 
 PreCall = Callable[[CapacityHandler, UserAPIKeyAuth, dict[str, object]], Awaitable[object]]
@@ -48,14 +71,14 @@ def _router() -> Router:
     )
 
 
-def _borrowing(monkeypatch: pytest.MonkeyPatch, fail_closed: bool) -> None:
+def _borrowing(monkeypatch: pytest.MonkeyPatch, fail_closed: bool, saturation_threshold: float = 0.1) -> None:
     monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
     monkeypatch.setattr(litellm, "priority_reservation", {"interactive": 0.6, "batch": 0.4})
     monkeypatch.setattr(
         litellm,
         "priority_reservation_settings",
         PriorityReservationSettings(
-            saturation_threshold=0.1, team_model_limit_borrows_idle_capacity_from_other_teams=True
+            saturation_threshold=saturation_threshold, team_model_limit_borrows_idle_capacity_from_other_teams=True
         ),
     )
     monkeypatch.setattr(
@@ -137,8 +160,105 @@ async def redis_down_fails_closed(monkeypatch: pytest.MonkeyPatch, build: Build,
     return [admitted, framed]
 
 
+def _borrower(team_id: str = "team-a") -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(api_key="sk-borrow", team_id=team_id, team_metadata={"model_tpm_limit": {_MODEL: 100}})
+
+
+async def _pre_call_at(pre_call: PreCall, handler: CapacityHandler, auth: UserAPIKeyAuth, saturation: float) -> object:
+    _saturate(handler, saturation)
+    return await _attempt(pre_call(handler, auth, {"model": _MODEL, "max_tokens": 0}))
+
+
+def _saturate(handler: CapacityHandler, saturation: float) -> None:
+    handler.v3_limiter.rate_limits.set_local(
+        RateLimitScope("model_saturation_check", _MODEL).counter("tokens"), round(saturation * 1000), 60
+    )
+
+
+async def _settle(handler: CapacityHandler, tokens: int, call_id: str | None = None) -> None:
+    await handler.async_log_success_event(
+        kwargs={
+            "litellm_params": {"metadata": {"model_group": _MODEL}},
+            "standard_logging_object": {
+                "metadata": {"user_api_key_team_id": "team-a", "user_api_key_auth_metadata": {}}
+            },
+            **({"litellm_call_id": call_id} if call_id is not None else {}),
+        },
+        response_obj=ModelResponse(usage=Usage(prompt_tokens=tokens, completion_tokens=0, total_tokens=tokens)),
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+
+
+async def _team_tokens_remaining(handler: CapacityHandler, team_id: str = "team-a") -> object:
+    share: Final = RateLimitDescriptor(
+        key="model_per_team_saturated",
+        value=f"{team_id}:{_MODEL}",
+        rate_limit={"tokens_per_unit": 100, "requests_per_unit": None, "window_size": handler.v3_limiter.window_size},
+    )
+    response: Final = await handler.v3_limiter.should_rate_limit([share], read_only=True, skip_parallel_check=True)
+    return next(status["limit_remaining"] for status in response["statuses"] if status["rate_limit_type"] == "tokens")
+
+
+async def _isolated(run: Coroutine[object, object, object]) -> object:
+    return await asyncio.get_running_loop().create_task(run, context=contextvars.Context())
+
+
+def _borrowing_in_memory(monkeypatch: pytest.MonkeyPatch, build: Build) -> CapacityHandler:
+    _borrowing(monkeypatch, fail_closed=False, saturation_threshold=0.5)
+    router: Final = _router()
+    monkeypatch.setattr(litellm, "callbacks", ["dynamic_rate_limiter_v3"])
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+    handler: Final = build(DualCache())
+    handler.update_variables(llm_router=router)
+    return handler
+
+
+async def nested_call_not_charged(monkeypatch: pytest.MonkeyPatch, build: Build, pre_call: PreCall) -> object:
+    async def run() -> object:
+        handler: Final = _borrowing_in_memory(monkeypatch, build)
+        claim_request_stash_for_data({"litellm_call_id": "outer-call"})
+        admitted: Final = await _pre_call_at(pre_call, handler, _borrower(), 0.5)
+        await _settle(handler, 60, call_id="llm-judge-call")
+        after_nested: Final = await _team_tokens_remaining(handler)
+        await _settle(handler, 60, call_id="outer-call")
+        return [admitted, after_nested, await _team_tokens_remaining(handler)]
+
+    return await _isolated(run())
+
+
+async def idle_usage_forgiven(monkeypatch: pytest.MonkeyPatch, build: Build, pre_call: PreCall) -> object:
+    async def run() -> object:
+        handler: Final = _borrowing_in_memory(monkeypatch, build)
+        idle: Final = await _pre_call_at(pre_call, handler, _borrower(), 0.0)
+        await _settle(handler, 150)
+        after_idle: Final = await _team_tokens_remaining(handler)
+        saturated: Final = await _pre_call_at(pre_call, handler, _borrower(), 0.5)
+        await _settle(handler, 30)
+        after_saturated: Final = await _team_tokens_remaining(handler)
+        other: Final = await _pre_call_at(pre_call, handler, _borrower("team-b"), 0.5)
+        return [idle, after_idle, saturated, after_saturated, other, await _team_tokens_remaining(handler, "team-b")]
+
+    return await _isolated(run())
+
+
+async def fallback_idle_forgiven(monkeypatch: pytest.MonkeyPatch, build: Build, pre_call: PreCall) -> object:
+    async def run() -> object:
+        handler: Final = _borrowing_in_memory(monkeypatch, build)
+        _saturate(handler, 0.0)
+        allowed: Final = await handler.async_fallback_target_allowed(_borrower(), _MODEL, {})
+        await _settle(handler, 150)
+        saturated: Final = await _pre_call_at(pre_call, handler, _borrower(), 0.5)
+        return [allowed, saturated, await _team_tokens_remaining(handler)]
+
+    return await _isolated(run())
+
+
 SCENARIOS: Final[Mapping[str, Scenario]] = {
     "test_a_request_batch_takes_the_round_trips_python_takes": batch_trips,
     "test_a_redis_outage_fails_open_like_python": redis_down_fails_open,
     "test_a_redis_outage_under_fail_closed_is_handled_like_python": redis_down_fails_closed,
+    "test_a_nested_calls_tokens_are_not_charged_to_the_requests_team_share": nested_call_not_charged,
+    "test_a_borrowers_usage_while_the_model_was_idle_is_forgiven_once_it_saturates": idle_usage_forgiven,
+    "test_a_fallback_target_still_borrows_while_idle_and_its_tokens_are_forgiven_once_it_saturates": fallback_idle_forgiven,
 }

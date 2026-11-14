@@ -396,8 +396,7 @@ def _clientside_deployment(
 
 
 def forwarded_caller_authorization(kwargs: Mapping[str, object], deployment_params: Mapping[str, object]) -> str | None:
-    """The caller's own ``Authorization`` a provider that isolates forwarded credentials sends on instead of the
-    deployment's key, or None."""
+    """The caller's ``Authorization`` a credential-isolating provider sends instead of the deployment's key."""
     from litellm.litellm_core_utils.get_provider_specific_headers import ProviderSpecificHeaderUtils
 
     declared_provider: Final = deployment_params.get("custom_llm_provider")
@@ -414,8 +413,6 @@ def forwarded_caller_authorization(kwargs: Mapping[str, object], deployment_para
 
 
 def serves_caller_credentials(kwargs: Mapping[str, object], deployment: Mapping[str, object]) -> bool:
-    """The request reaches ``deployment`` on the caller's own credentials, as the request-scoped deployment the router
-    builds for it then, rather than on the deployment's."""
     return (
         is_clientside_credential(request_kwargs=dict(kwargs))
         or forwarded_caller_authorization(kwargs, as_dict(deployment.get("litellm_params"))) is not None

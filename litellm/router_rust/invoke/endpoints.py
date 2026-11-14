@@ -2047,6 +2047,15 @@ class RustEndpoints:
             return await self._prioritized(model, priority, factory, prepared)
         return await self._prioritized(model, priority, lambda: self._core.drive(plan, rest), rest)
 
+    def _brings_caller_credentials(self, model: str, request: Mapping[str, object]) -> bool:
+        from litellm.litellm_core_utils.routing_common_utils import get_request_team_id
+        from litellm.router_rust.invoke.shaping import serves_caller_credentials
+
+        if serves_caller_credentials(request, {}):
+            return True
+        candidates: Final = self._core.registry().deployments(model, team_id=get_request_team_id(request)) or ()
+        return any(serves_caller_credentials(request, as_dict(record)) for record in candidates)
+
     def _dynamic_queue(self) -> DynamicQueueRouter | None:
         settings: Final = self._core.resolved.dynamic_queue
         if settings is None:
@@ -2058,11 +2067,9 @@ class RustEndpoints:
     async def _prioritized(
         self, model: str, priority: int | None, run: Callable[[], Awaitable[object]], request: Mapping[str, object]
     ) -> object:
-        """A prioritized call: with the dynamic queue enabled each provider attempt waits for its capacity's turn
-        instead of the call waiting in the scheduler once. An attempt on the caller's own credentials keeps today's
-        routing (``serves_caller_credentials``)."""
+        """A request on its caller's own credentials keeps the scheduler; any other waits per attempt instead."""
         queue_router: Final = self._dynamic_queue()
-        if queue_router is None:
+        if queue_router is None or self._brings_caller_credentials(model, request):
             return await run() if priority is None else await self._schedule(model, priority, run, request)
         if priority is None:
             return await run()

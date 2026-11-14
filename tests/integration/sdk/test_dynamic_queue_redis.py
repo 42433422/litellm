@@ -430,3 +430,22 @@ async def test_congestion_outlives_a_retry_after_longer_than_the_idle_ttl_and_th
 
     assert 900_000 < congested_ttl <= 960_000
     assert 0 < recovered_ttl <= 60_000
+
+
+@pytest.mark.asyncio
+async def test_a_shared_capacity_is_shared_within_one_redis_namespace_and_never_across_two(capacity: str) -> None:
+    clock: Final = SharedClock()
+
+    def worker(namespace: str) -> RedisQueueBackend:
+        port: Final = int(os.environ["REDIS_PORT"])
+        cache: Final = RedisCache(host=os.environ["REDIS_HOST"], port=port, namespace=namespace)
+        return RedisQueueBackend(cache, QueueSettings(), clock)
+
+    congesting: Final = worker(f"router-a-{capacity}")
+    same_router: Final = worker(f"router-a-{capacity}")
+    other_router: Final = worker(f"router-b-{capacity}")
+    shared: Final = f"shared:{capacity}"
+    await _congest(congesting, shared)
+
+    assert isinstance(await same_router.admit(WaitRequest(shared, "same-namespace", 0), FAR), Waiting)
+    assert isinstance(await other_router.admit(WaitRequest(shared, "other-namespace", 0), FAR), PassThrough)

@@ -120,8 +120,21 @@ def test_an_unknown_dynamic_queue_key_is_refused() -> None:
         {"trigger_status_codes": [600]},
         {"recovery_successes": 0},
         {"initial_backoff": 5, "max_backoff": 2},
+        {"queue_timeout": float("inf")},
+        {"queue_timeout": float("nan")},
+        {"max_backoff": float("inf")},
     ],
-    ids=["bool", "text", "success_status", "past_599", "no_successes", "cap_below_start"],
+    ids=[
+        "bool",
+        "text",
+        "success_status",
+        "past_599",
+        "no_successes",
+        "cap_below_start",
+        "endless_queue",
+        "nan_queue",
+        "endless_backoff",
+    ],
 )
 def test_an_invalid_recovery_or_trigger_setting_is_refused(block: Mapping[str, object]) -> None:
     with pytest.raises(ValidationError):
@@ -408,3 +421,98 @@ async def test_a_router_with_a_local_queue_serves_a_healthy_request_straight_thr
     response: Final = await getattr(router, call)(model="group", **request)
 
     assert "served" in str(response)
+
+
+def test_a_sub_millisecond_backoff_still_waits_at_least_a_millisecond() -> None:
+    settings: Final = DynamicQueueSettings(enabled=True, initial_backoff=0.0004, max_backoff=0.0004)
+
+    assert (settings.queue_settings().initial_backoff_ms, settings.queue_settings().max_backoff_ms) == (1, 1)
+
+
+def _never_answers(started: asyncio.Event) -> "Callable[[], Coroutine[object, object, float]]":
+    async def left() -> float:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    return left
+
+
+async def test_a_cooldown_lookup_that_never_answers_refuses_the_probe_after_the_operation_timeout() -> None:
+    timer: Final = ManualTimer()
+    router: Final = _router(timer)
+    await _congest(router, "cap", retry_after_ms=0)
+    timer.advance(1.0)
+    looking: Final = asyncio.Event()
+    probe: Final = asyncio.create_task(router.request(0, "r").admit("cap", "m", _never_answers(looking)))
+    try:
+        await asyncio.wait_for(looking.wait(), 10)
+        await timer.parked(count=2)
+        timer.advance(router.queue_settings.operation_timeout_ms / 1000)
+        refused: Final = await asyncio.wait_for(asyncio.gather(probe, return_exceptions=True), 10)
+    finally:
+        await _reap(probe)
+    handed_on: Final = await _waited(timer, router.request(0, "next").admit("cap", "m", _no_cooldown), 0.25)
+    assert isinstance(handed_on, Admission)
+    await handed_on.finish(None)
+
+    assert isinstance(refused[0], DynamicQueueCoordinationError)
+
+
+def _slow_cooldown_lookup(timer: ManualTimer, seconds: float) -> "Callable[[], Coroutine[object, object, float]]":
+    async def left() -> float:
+        await timer.sleep(seconds)
+        return 0.0
+
+    return left
+
+
+async def test_a_probe_whose_cooldown_lookup_used_up_the_queue_time_is_not_dispatched_late() -> None:
+    timer: Final = ManualTimer()
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, coordination="local", queue_timeout=0.5))
+    await _congest(router, "cap", retry_after_ms=0)
+    timer.advance(1.0)
+    probe: Final = asyncio.create_task(router.request(0, "r").admit("cap", "m", _slow_cooldown_lookup(timer, 0.75)))
+    try:
+        await timer.parked(count=3)
+        timer.advance(0.75)
+        refused: Final = await asyncio.wait_for(asyncio.gather(probe, return_exceptions=True), 10)
+    finally:
+        await _reap(probe)
+    handed_on: Final = await _waited(timer, router.request(0, "next").admit("cap", "m", _no_cooldown), 0.25)
+    assert isinstance(handed_on, Admission)
+    await handed_on.finish(None)
+
+    assert isinstance(refused[0], DynamicQueueTimeoutError)
+    assert timer.at == 1.75
+
+
+@pytest.mark.parametrize(("caller_key", "scheduled"), [(None, False), ("caller-own-key", True)])
+async def test_a_request_on_its_callers_own_credentials_keeps_the_priority_scheduler(
+    caller_key: str | None, scheduled: bool
+) -> None:
+    router: Final = litellm.Router(
+        model_list=_model_list(), default_priority=0, dynamic_queue={"enabled": True, "coordination": "local"}
+    )
+    credentials: Final = {} if caller_key is None else {"api_key": caller_key}
+
+    response: Final = await router.acompletion(
+        model="group", messages=[{"role": "user", "content": "hi"}], priority=1, **credentials
+    )
+
+    headers: Final = response._hidden_params.get("additional_headers") or {}  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # the response's hidden params
+    assert headers.get("x-litellm-request-prioritization-used") is (True if scheduled else None)  # pyright: ignore[reportUnknownMemberType]  # see above
+
+
+async def test_a_total_timeout_released_for_a_stream_never_bounds_its_queue_wait() -> None:
+    timer: Final = ManualTimer()
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, coordination="local", queue_timeout=3.0))
+    await _congest(router, "cap", retry_after_ms=10_000_000)
+
+    async with total_deadline(1.0, from_body=False, clock=timer.now) as deadline:
+        request_queue: Final = router.request(priority=0, request_id="r")
+        deadline.release()
+        refused: Final = await _waited(timer, request_queue.admit("cap", "m", _no_cooldown), 0.25)
+
+    assert isinstance(refused, DynamicQueueTimeoutError)
+    assert timer.at == 3.0

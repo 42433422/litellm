@@ -478,6 +478,5 @@ class RedisQueueBackend:
         return reply if isinstance(reply, CoordinationUnavailable) else None
 
     async def busy(self, capacity: str) -> bool | CoordinationUnavailable:
-        """Whether the capacity is congested or still admitting the waiters it recovered with."""
         reply: Final = await self._call("busy", capacity, "", ())
         return reply if isinstance(reply, CoordinationUnavailable) else reply == ("busy",)

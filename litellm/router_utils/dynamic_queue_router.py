@@ -8,10 +8,11 @@ a capacity. A refused wait ends the request with no retry, fallback or cooldown.
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+import math
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Annotated, Final, Literal, Protocol, TypeAlias
+from typing import Annotated, Final, Literal, Protocol, TypeAlias, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model_validator
 from typing_extensions import Self, assert_never
@@ -50,7 +51,7 @@ _HttpErrorStatus: TypeAlias = Annotated[StrictInt, Field(ge=400, le=599)]
 
 
 class DynamicQueueSettings(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     enabled: bool = False
     trigger_status_codes: tuple[_HttpErrorStatus, ...] = (429, 529)
@@ -70,8 +71,8 @@ class DynamicQueueSettings(BaseModel):
     def queue_settings(self) -> QueueSettings:
         return QueueSettings(
             required_successes=self.recovery_successes,
-            initial_backoff_ms=int(self.initial_backoff * 1000),
-            max_backoff_ms=int(self.max_backoff * 1000),
+            initial_backoff_ms=math.ceil(self.initial_backoff * 1000),
+            max_backoff_ms=math.ceil(self.max_backoff * 1000),
             max_waiting=self.max_waiting,
         )
 
@@ -80,8 +81,6 @@ _SETTINGS: Final = TypeAdapter(DynamicQueueSettings | None)
 
 
 def parse_dynamic_queue(value: object, default_priority: int | None) -> DynamicQueueSettings | None:
-    """The ``dynamic_queue`` router setting, or None when it is unset or off. Raises on an invalid block, and when the
-    queue is enabled without the ``default_priority`` every unlabelled request queues at."""
     settings: Final = _SETTINGS.validate_python(value)
     if settings is None or not settings.enabled:
         return None
@@ -91,7 +90,6 @@ def parse_dynamic_queue(value: object, default_priority: int | None) -> DynamicQ
 
 
 def refuse_local_queue_across_workers(value: object, num_workers: str) -> None:
-    """A proxy running several workers cannot share a process-local queue, so it refuses to start with one."""
     settings: Final = _SETTINGS.validate_python(value)
     if settings is not None and settings.enabled and settings.coordination == "local" and num_workers != "1":
         raise ValueError(
@@ -101,8 +99,7 @@ def refuse_local_queue_across_workers(value: object, num_workers: str) -> None:
 
 
 class QueueRejectedError(Exception):
-    """A request the dynamic queue refused. Each public error below is also this class, which the router reads to end
-    the request without a retry, fallback or cooldown."""
+    """Marks the public errors below so the router ends the request without a retry, fallback or cooldown."""
 
 
 class DynamicQueueTimeoutError(Timeout, QueueRejectedError):
@@ -135,10 +132,24 @@ def rejection_error(rejection: Rejection, model: str) -> QueueRejectedError:
             assert_never(rejection)
 
 
+_T: Final = TypeVar("_T")
+
+
+async def _within(timer: Timer, seconds: float, call: Coroutine[object, object, _T]) -> _T | None:
+    work: Final = asyncio.create_task(call)
+    guard: Final = asyncio.create_task(timer.sleep(seconds))
+    try:
+        _ = await asyncio.wait((work, guard), return_when=asyncio.FIRST_COMPLETED)
+        return work.result() if work.done() else None
+    finally:
+        for task in (work, guard):
+            _ = task.cancel()
+        _ = await asyncio.gather(work, guard, return_exceptions=True)
+
+
 @dataclass(frozen=True, slots=True)
 class Admission:
-    """An admitted attempt, held from before its provider call until its outcome is known: the call's answer, or its
-    stream's end. ``finish`` reports the outcome, if any, and releases the attempt exactly once."""
+    """An admitted attempt, held until its provider call answers or its stream ends."""
 
     attempt: Attempt
     held: contextlib.AsyncExitStack
@@ -149,20 +160,21 @@ class Admission:
             _ = await self.attempt.report(outcome)
         await self.held.aclose()
 
-    async def release_unless_started(self, started: asyncio.Event) -> None:
-        """A stream whose reader never starts it never runs its own cleanup, so its turn is given back, without
-        credit, once a probe lease's worth of time passes unread."""
-        timer: Final = self.router.timer
-        reading: Final = asyncio.create_task(started.wait())
-        lapse: Final = asyncio.create_task(timer.sleep(self.router.queue_settings.lease_ms / 1000))
-        try:
-            _ = await asyncio.wait((reading, lapse), return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for task in (reading, lapse):
-                _ = task.cancel()
-            _ = await asyncio.gather(reading, lapse, return_exceptions=True)
-        if not started.is_set():
-            await self.finish(None)
+    async def went_idle(self, reads: Callable[[], int | None]) -> bool:
+        """Whether a stream went a whole idle bound without a read while it still held its turn; ``reads`` is None
+        once the stream settled its turn itself."""
+        idle_s: Final = self.router.queue_settings.lease_ms * 3 / 1000
+        while await self._read_during(idle_s, reads):
+            pass
+        return reads() is not None
+
+    async def _read_during(self, idle_s: float, reads: Callable[[], int | None]) -> bool:
+        before: Final = reads()
+        if before is None:
+            return False
+        await self.router.timer.sleep(idle_s)
+        after: Final = reads()
+        return after is not None and after != before
 
 
 class _Backend(QueueBackend, Protocol):
@@ -170,9 +182,8 @@ class _Backend(QueueBackend, Protocol):
 
 
 class RequestQueue:
-    """The queue state one request owns across every provider attempt it makes, its stream's recovery included: its
-    priority, the queue time it has left, the request's total deadline, and a new waiter id for each wait. Only time
-    spent actually waiting is taken from the budget; an attempt a healthy capacity admits at once costs none of it."""
+    """The queue state one request owns across its attempts and its stream's recovery. Only time spent waiting is
+    taken from its budget."""
 
     def __init__(self, router: "DynamicQueueRouter", priority: int, request_id: str) -> None:
         self.router = router
@@ -188,9 +199,7 @@ class RequestQueue:
         return self._remaining_s if left is None else min(self._remaining_s, left)
 
     async def admit(self, capacity: str, model: str, cooldown_left_s: Callable[[], Awaitable[float]]) -> Admission:
-        """Waits for ``capacity``'s turn and returns the admitted attempt. A probe also waits out what is left of the
-        deployment's own cooldown, so it never runs earlier than the router would route to it. Raises the public error
-        of a refused wait."""
+        """Raises the public error of a refused wait. A probe also waits out its deployment's remaining cooldown."""
         queue: Final = self.router.queue()
         if isinstance(queue, CoordinationUnavailable):
             raise rejection_error(queue, model)
@@ -208,19 +217,33 @@ class RequestQueue:
         if not isinstance(admitted.grant, Probe):
             return admission
         try:
-            await self._wait_out_cooldown(await cooldown_left_s(), model)
+            await self._wait_out_cooldown(cooldown_left_s, model)
         except BaseException:
             await admission.finish(None)
             raise
         return admission
 
-    async def _wait_out_cooldown(self, cooldown_s: float, model: str) -> None:
-        if cooldown_s <= 0:
-            return
+    async def _wait_out_cooldown(self, cooldown_left_s: Callable[[], Awaitable[float]], model: str) -> None:
+        timer: Final = self.router.timer
+        started: Final = timer.now()
+
+        async def read() -> float:
+            return await cooldown_left_s()
+
+        try:
+            cooldown_s: Final = await _within(timer, self.router.queue_settings.operation_timeout_ms / 1000, read())
+        except Exception:  # noqa: BLE001  # an unreadable cooldown is unavailable coordination, never a free pass
+            raise rejection_error(CoordinationUnavailable(reason=OPERATION_TIMED_OUT), model) from None
+        if cooldown_s is None:
+            raise rejection_error(CoordinationUnavailable(reason=OPERATION_TIMED_OUT), model)
         if cooldown_s > self._budget_s():
             raise rejection_error(QueueTimeout(), model)
-        await self.router.timer.sleep(cooldown_s)
-        self._remaining_s = max(self._remaining_s - cooldown_s, 0.0)
+        if cooldown_s > 0:
+            await timer.sleep(cooldown_s)
+        spent_s: Final = timer.now() - started
+        self._remaining_s = max(self._remaining_s - spent_s, 0.0)
+        if spent_s > 0 and self._budget_s() <= 0:
+            raise rejection_error(QueueTimeout(), model)
 
 
 _CURRENT: Final[ContextVar[RequestQueue | None]] = ContextVar("dynamic_queue_request", default=None)
@@ -232,7 +255,6 @@ def current_request_queue() -> RequestQueue | None:
 
 @contextlib.contextmanager
 def bound_request_queue(request_queue: RequestQueue | None) -> Generator[None, None, None]:
-    """Runs the block as part of ``request_queue``'s request: its routed call, or a later recovery of its stream."""
     token: Final = _CURRENT.set(request_queue)
     try:
         yield
@@ -241,9 +263,8 @@ def bound_request_queue(request_queue: RequestQueue | None) -> Generator[None, N
 
 
 class DynamicQueueRouter:
-    """One router's queue. Redis coordination reads the router's Redis cache when the first request needs it, since
-    the proxy attaches that cache after the router is built; with none, every wait is refused rather than coordinated
-    in one process only. Its keys live under that cache's namespace."""
+    """Reads the router's Redis cache lazily, since the proxy attaches it after the router is built; with none, every
+    wait is refused rather than coordinated in one process."""
 
     def __init__(
         self,
@@ -281,8 +302,7 @@ class DynamicQueueRouter:
         return RequestQueue(self, priority, request_id)
 
     async def busy(self, capacities: Mapping[str, str]) -> frozenset[str] | CoordinationUnavailable:
-        """The ids in ``capacities`` (deployment id to capacity) whose capacity is congested or still admitting its
-        recovered waiters. An unreadable capacity is never taken for a healthy one."""
+        """The deployment ids whose capacity is congested or still admitting its recovered waiters."""
         queue: Final = self.queue()
         if isinstance(queue, CoordinationUnavailable):
             return queue
@@ -298,14 +318,11 @@ class DynamicQueueRouter:
         return frozenset(deployment for deployment, capacity in capacities.items() if capacity in busy_capacities)
 
     async def _read_busy(self, backend: _Backend, capacity: str) -> bool | CoordinationUnavailable:
-        try:
-            return await asyncio.wait_for(backend.busy(capacity), self.queue_settings.operation_timeout_ms / 1000)
-        except asyncio.TimeoutError:
-            return CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+        bound_s: Final = self.queue_settings.operation_timeout_ms / 1000
+        answer: Final = await _within(self.timer, bound_s, backend.busy(capacity))
+        return CoordinationUnavailable(reason=OPERATION_TIMED_OUT) if answer is None else answer
 
     def outcome_of(self, error: BaseException, retry_after_s: float | None) -> Outcome:
-        """A failure congests only when its provider answered with a trigger status; its ``retry-after`` holds the next
-        probe back. The deployment's own cooldown is waited out by the probe itself, at its grant."""
         from litellm.litellm_core_utils.exception_mapping_utils import provider_origin_status
 
         if provider_origin_status(error) not in self._triggers:
@@ -314,9 +331,6 @@ class DynamicQueueRouter:
 
 
 def capacity_of(deployment: Mapping[str, object]) -> str | None:
-    """The capacity a deployment draws on: the shared one its ``model_info.dynamic_queue_capacity_id`` names when
-    deployments share one provider quota, else its own. The two are kept apart, so a shared id never meets a
-    deployment id that happens to be spelled the same."""
     model_info: Final = deployment.get("model_info")
     if not isinstance(model_info, Mapping):
         return None
@@ -342,9 +356,8 @@ Records: TypeAlias = Callable[[Sequence[str]], Sequence[Mapping[str, object]]]
 async def congested_ids(
     ids: Sequence[str], records: Records, queues_on: Callable[[Mapping[str, object]], bool]
 ) -> frozenset[str] | CoordinationUnavailable:
-    """The deployments among ``ids`` whose capacity the current request's queue holds busy, reading their ``records``
-    only then. A deployment the request does not queue on (``queues_on``), such as one it reaches on its caller's own
-    credentials, is never busy for it."""
+    """Never busy for a deployment the request does not queue on, such as one it reaches on its caller's own
+    credentials."""
     request_queue: Final = current_request_queue()
     if request_queue is None or not ids:
         return frozenset()
@@ -357,8 +370,7 @@ async def congested_ids(
 async def prefer_uncongested(
     ids: Sequence[str], records: Records, queues_on: Callable[[Mapping[str, object]], bool]
 ) -> tuple[str, ...]:
-    """``ids`` less the ones whose capacity is busy, while at least one is not, so a healthy alternative is picked
-    first. Unknown congestion keeps them all; the admission that follows refuses the wait then."""
+    """Unknown congestion keeps every candidate; the admission that follows refuses the wait then."""
     busy: Final = await congested_ids(ids, records, queues_on)
     if isinstance(busy, CoordinationUnavailable):
         return tuple(ids)

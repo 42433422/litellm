@@ -393,8 +393,7 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "background_health_check_model_groups",
         "enable_weighted_failover",
         "fallback_on_unsupported_params",
-        # Per-attempt admission (litellm/router_utils/dynamic_queue_router.py); router-core keeps the
-        # congested deployments of a pick left with only cooling ones.
+        # Per-attempt admission (litellm/router_utils/dynamic_queue_router.py).
         "dynamic_queue",
         # Built host-side as CustomLogger checks (litellm/router_rust/steps/callbacks.py); router-core runs
         # their deployment filters through its callback_filters stage.
@@ -3409,9 +3408,6 @@ class RustCore(
         return strategy, selector, str(step.get("model")), candidates
 
     def queues_on(self, request: Mapping[str, object]) -> Callable[[Mapping[str, object]], bool]:
-        """Whether ``request`` queues on a deployment: not one it reaches on its caller's own credentials, nor one
-        that authenticates per caller."""
-
         def queues(deployment: Mapping[str, object]) -> bool:
             deployment_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
             return not serves_caller_credentials(request, deployment) and not self.per_user_deployment(deployment_id)
@@ -3627,7 +3623,6 @@ class RustCore(
             # Only the async candidate lists run the callback filters.
             return step["candidates"]
         if step.get("stage") == "dynamic_congested":
-            # Only async chat and text completions queue.
             return []
         if step.get("stage") == "text_only":
             return self._text_only(step)
@@ -4517,7 +4512,6 @@ class _Driver:
         self._level_errors: Final[dict[int, BaseException]] = dict(  # mutable-ok: filled as the call runs
             (stream_failure,) if stream_failure else ()
         )
-        # A wait the dynamic queue refused, which ends the request with that error at whichever level.
         self._queue_rejection: QueueRejectedError | None = None
         # The retry counts an exhausted retry loop stamps on the pick error its level then raises.
         self._pending_stamps: Final[dict[int, tuple[object, object]]] = {}  # mutable-ok: filled as the call runs
@@ -5330,8 +5324,6 @@ class _Driver:
         return tuple(release for release in releases if release is not None)
 
     async def _admit(self, deployment: Mapping[str, object], call: "AttemptCall") -> Admission | None:
-        """Waits for the deployment's dynamic queue turn when the request queues. A deployment the caller's own
-        credentials stand in for keeps today's routing. Raises the public error of a refused wait."""
         request_queue: Final = current_request_queue()
         if request_queue is None or self._plan.sync or self._plan.kind not in ("chat", "text"):
             return None
@@ -5345,7 +5337,6 @@ class _Driver:
         return await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
 
     async def _cooldown_left_s(self, deployment_id: object) -> float:
-        """What is left of the deployment's own cooldown, as the router recorded it, or 0 when it has none."""
         if not isinstance(deployment_id, str):
             return 0.0
         active: Final = await self._core._cooldowns.async_get_active_cooldowns([deployment_id], None)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core

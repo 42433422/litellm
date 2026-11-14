@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import contextvars
 from collections.abc import AsyncIterator
 from typing import Final
@@ -8,10 +9,30 @@ import pytest
 
 import litellm
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
-from litellm.router_rust.invoke.streaming import StreamAttempt, _areported, _chat_total_tokens
-from litellm.router_utils.dynamic_queue import MatchingFailure
+from litellm.router_rust.invoke.streaming import (
+    StreamAttempt,
+    _areported,
+    _chat_total_tokens,
+    _raise_fallback_failure,
+    open_attempt_stream,
+)
+from litellm.router_utils.dynamic_queue import (
+    AdmitReply,
+    Admitted,
+    CoordinationUnavailable,
+    DynamicQueue,
+    Grant,
+    LocalQueueBackend,
+    MatchingFailure,
+    Outcome,
+    PassThrough,
+    PollReply,
+    QueueSettings,
+    WaitRequest,
+)
 from litellm.router_utils.dynamic_queue_router import (
     Admission,
+    DynamicQueueFullError,
     DynamicQueueRouter,
     DynamicQueueSettings,
     RequestQueue,
@@ -197,44 +218,6 @@ async def test_cancelling_the_task_reading_a_stream_gives_its_turn_back_without_
     assert await _next_probe_granted_at_once(timer, router) is True
 
 
-async def test_a_stream_nobody_reads_gives_its_turn_back_once_a_lease_passes() -> None:
-    timer: Final = ManualTimer()
-    router, probe = await _probe(timer)
-    attempt: Final = _stream_attempt(probe)
-    stream: Final = _areported(attempt, _chunks("a"), _chat_total_tokens)
-    watch: Final = attempt.watch_unread()
-    assert watch is not None
-    try:
-        await timer.parked(count=2)
-        timer.advance(router.queue_settings.lease_ms / 1000)
-        await _finished(watch)
-        released: Final = await _next_probe_granted_at_once(timer, router)
-    finally:
-        await _reap(watch)
-        await stream.aclose()
-
-    assert released is True
-
-
-async def test_a_stream_its_reader_started_keeps_its_turn_past_the_unread_lease() -> None:
-    timer: Final = ManualTimer()
-    router, probe = await _probe(timer)
-    attempt: Final = _stream_attempt(probe)
-    stream: Final = _areported(attempt, _chunks("a", "b"), _chat_total_tokens)
-    watch: Final = attempt.watch_unread()
-    assert watch is not None
-    try:
-        assert await stream.__anext__() == "a"
-        await _finished(watch)
-        timer.advance(router.queue_settings.lease_ms / 1000)
-        held: Final = not await _next_probe_granted_at_once(timer, router)
-    finally:
-        await _reap(watch)
-        await stream.aclose()
-
-    assert held is True
-
-
 @pytest.mark.parametrize("recovery", ["fallback", "retry"])
 async def test_a_stream_recovered_from_another_task_waits_with_its_own_requests_queue(recovery: str) -> None:
     timer: Final = ManualTimer()
@@ -252,3 +235,238 @@ async def test_a_stream_recovered_from_another_task_waits_with_its_own_requests_
     assert core.recovered_with == [request_queue]
     assert current_request_queue() is None
 
+
+
+class _OuterStreamCore(_RecoveringCore):
+    """What the real chat and text stream wrappers ask of their core while they report a stream's end."""
+
+    def outcome_callbacks(self, kwargs: object, sync: bool) -> dict[str, bool]:
+        return {}
+
+    async def report_stream_success(self, *args: object) -> None:
+        return None
+
+    async def report_stream_failure(self, *args: object) -> None:
+        return None
+
+
+def _outer_attempt(op: str, admission: Admission) -> StreamAttempt:
+    return StreamAttempt(
+        core=_OuterStreamCore(),  # pyright: ignore[reportArgumentType]  # serves only the stream-end reporting
+        op=op,
+        request={"stream": True},
+        kwargs={"stream": True},
+        group="group",
+        order=None,
+        depth=0,
+        level=0,
+        deployment_id="d1",
+        attempted_retries=0,
+        admission=admission,
+    )
+
+
+async def _chat_stream(attempt: StreamAttempt) -> object:
+    response: Final = await litellm.acompletion(
+        model="openai/gpt-x",
+        messages=[{"role": "user", "content": "hi"}],
+        mock_response="one two three four five",
+        stream=True,
+    )
+    return await open_attempt_stream(attempt, response)
+
+
+async def _text_stream(attempt: StreamAttempt) -> object:
+    response: Final = await litellm.atext_completion(
+        model="openai/gpt-x", prompt="hi", mock_response="one two three four five", stream=True
+    )
+    return await open_attempt_stream(attempt, response)
+
+
+def _idle_bound_s(router: DynamicQueueRouter) -> float:
+    return router.queue_settings.lease_ms * 3 / 1000
+
+
+async def _watched(attempt: StreamAttempt) -> None:
+    watching: Final = attempt.watching
+    assert watching is not None
+    await _finished(watching)
+
+
+async def test_the_real_chat_stream_read_to_its_end_counts_as_the_probes_success() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("acompletion", probe)
+    stream: Final = await _chat_stream(attempt)
+
+    read: Final = [chunk async for chunk in stream]  # pyright: ignore[reportGeneralTypeIssues]  # the returned stream
+    await _settled(attempt)
+
+    assert read
+    assert await _busy(router) is False
+
+
+async def test_the_real_chat_stream_closed_after_some_output_gives_its_turn_back_without_credit() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("acompletion", probe)
+    stream: Final = await _chat_stream(attempt)
+
+    _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
+    await stream.aclose()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # see above
+    await _settled(attempt)
+
+    assert await _busy(router) is True
+    assert await _next_probe_granted_at_once(timer, router) is True
+
+
+async def test_the_real_chat_stream_nobody_reads_gives_its_turn_back_after_an_idle_bound() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("acompletion", probe)
+    _ = await _chat_stream(attempt)
+
+    await timer.parked(count=2)
+    timer.advance(_idle_bound_s(router))
+    await _watched(attempt)
+
+    assert await _busy(router) is True
+    assert await _next_probe_granted_at_once(timer, router) is True
+
+
+async def test_the_real_text_stream_its_reader_abandoned_gives_its_turn_back_and_still_streams() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("atext_completion", probe)
+    stream: Final = await _text_stream(attempt)
+    await timer.parked(count=2)
+    _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
+
+    timer.advance(_idle_bound_s(router))
+    await timer.parked(count=2)
+    timer.advance(_idle_bound_s(router))
+    await _watched(attempt)
+    released: Final = await _next_probe_granted_at_once(timer, router)
+    rest: Final = [chunk async for chunk in stream]  # pyright: ignore[reportGeneralTypeIssues]  # see above
+
+    assert released is True
+    assert rest
+
+
+async def test_the_real_text_stream_read_across_an_idle_bound_keeps_its_turn() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("atext_completion", probe)
+    stream: Final = await _text_stream(attempt)
+
+    await timer.parked(count=2)
+    _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
+    timer.advance(_idle_bound_s(router))
+    await timer.parked(count=2)
+    held: Final = not await _next_probe_granted_at_once(timer, router)
+    _ = [chunk async for chunk in stream]  # pyright: ignore[reportGeneralTypeIssues]  # see above
+    await _settled(attempt)
+
+    assert held is True
+    assert await _busy(router) is False
+
+
+class _ReportsOnTheTimer:
+    """A local queue whose outcome reports take half a second of the test's time to land, like a slow Redis."""
+
+    def __init__(self, timer: ManualTimer) -> None:
+        self.timer = timer
+        self.inner = LocalQueueBackend(QueueSettings(required_successes=1), clock=timer.now)
+        self.reported = False
+
+    @property
+    def settings(self) -> QueueSettings:
+        return self.inner.settings
+
+    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms)
+
+    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
+        return await self.inner.poll(capacity, waiter_id)
+
+    async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
+        return await self.inner.renew(capacity, waiter_id, token)
+
+    async def report(
+        self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
+    ) -> None | CoordinationUnavailable:
+        await self.timer.sleep(0.5)
+        await self.inner.report(capacity, waiter_id, grant, outcome)
+        self.reported = True
+        return None
+
+    async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
+        return await self.inner.abandon(capacity, waiter_id)
+
+
+class _RecordsWhetherTheFailureLanded(_RecoveringCore):
+    def __init__(self, backend: _ReportsOnTheTimer) -> None:
+        super().__init__()
+        self.backend = backend
+        self.landed_before_recovery: list[bool] = []
+
+    async def recover_stream(self, *args: object) -> object:
+        self.landed_before_recovery.append(self.backend.reported)
+        return await super().recover_stream(*args)
+
+    async def retry_stream(self, *args: object) -> object:
+        self.landed_before_recovery.append(self.backend.reported)
+        return await super().retry_stream(*args)
+
+
+@pytest.mark.parametrize("recovery", ["fallback", "retry"])
+async def test_a_stream_failure_reaches_the_queue_before_its_recovery_admits_anything(recovery: str) -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _ReportsOnTheTimer(timer)
+    await backend.inner.report(CAPACITY, "congests", PassThrough(0), MatchingFailure())
+    timer.advance(1.0)
+    queue: Final = DynamicQueue(backend, timer)
+    request: Final = WaitRequest(CAPACITY, "probe", 0)
+    admitted: Final = await queue.admit(request, 30.0)
+    assert isinstance(admitted, Admitted)
+    held: Final = contextlib.AsyncExitStack()
+    router: Final = DynamicQueueRouter(DynamicQueueSettings(enabled=True), redis=lambda: None, timer=timer)
+    admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, router)
+    core: Final = _RecordsWhetherTheFailureLanded(backend)
+    attempt: Final = _stream_attempt(admission, router.request(0, "r"), core)
+
+    _ = attempt.settle_admission(_provider_error(429))
+    recovering: Final = asyncio.create_task(
+        attempt.fallback(RuntimeError("cut")) if recovery == "fallback" else attempt.retry(RuntimeError("cut"))
+    )
+    try:
+        await timer.parked(count=2)
+        timer.advance(0.5)
+        _ = await _finished(recovering)
+    finally:
+        await _reap(recovering)
+
+    assert core.landed_before_recovery == [True]
+
+
+async def test_a_queue_rejection_in_a_stream_recovery_ends_the_stream_with_that_rejection() -> None:
+    rejection: Final = DynamicQueueFullError("m")
+
+    class _RefusingCore(_RecoveringCore):
+        async def recover_stream(self, *args: object) -> object:
+            raise rejection
+
+    attempt: Final = _stream_attempt(None, None, _RefusingCore())
+
+    with pytest.raises(DynamicQueueFullError) as raised:
+        _raise_fallback_failure(await _recovered_or_error(attempt))
+
+    assert raised.value is rejection
+
+
+async def _recovered_or_error(attempt: StreamAttempt) -> Exception:
+    try:
+        _ = await attempt.fallback(RuntimeError("cut"))
+    except Exception as error:  # noqa: BLE001  # the error the wrapper hands to its fallback failure
+        return error
+    raise AssertionError("the recovery was refused")

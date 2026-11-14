@@ -665,5 +665,4 @@ class LocalQueueBackend:
         self._step(capacity, lambda state, now: (_abandon(state, now, self._settings, waiter_id), None))
 
     async def busy(self, capacity: str) -> bool:
-        """Whether the capacity is congested or still admitting the waiters it recovered with."""
         return self._step(capacity, _busy)

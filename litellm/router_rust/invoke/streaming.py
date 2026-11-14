@@ -43,6 +43,7 @@ from collections.abc import (
     Sequence,
 )
 from collections.abc import Set as AbstractSet
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Final,
@@ -126,14 +127,11 @@ class StreamAttempt:
     # The background recording of the stream's failure, which a same-group retry waits for so it
     # picks with the failed deployment already cooled down.
     failure_recording: "asyncio.Task[None] | None" = None
-    # The dynamic queue's turn the attempt holds until its stream ends, and the request's queue state,
-    # which a recovery of the stream waits with in whichever task consumes it.
     admission: Admission | None = None
     request_queue: RequestQueue | None = None
-    # Set once a reader starts the stream; until then only the unread watch can give the queue turn back.
-    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
-    # The background report of the stream's outcome to the dynamic queue, once it ended.
+    reads: int = 0
     settling: "asyncio.Task[None] | None" = None
+    watching: "asyncio.Task[None] | None" = None
 
     @property
     def model_group(self) -> str:
@@ -173,6 +171,7 @@ class StreamAttempt:
 
     async def fallback(self, trigger: BaseException, request: Mapping[str, object] | None = None) -> object:
         """The fallback walk for this stream's failure; raises when no fallback answers."""
+        await self.admission_settled()
         with bound_request_queue(self.request_queue):
             return await self.core.recover_stream("fallback", self.op, request or self.request, self.origin(), trigger)
 
@@ -181,6 +180,7 @@ class StreamAttempt:
 
     async def retry(self, trigger: BaseException) -> "tuple[object, int, int] | BaseException":
         """A same-group retry: the retried response with the retry count and budget, or the newest failure."""
+        await self.admission_settled()
         with bound_request_queue(self.request_queue):
             return await self.core.retry_stream(self.op, self.request, self.origin(), trigger)
 
@@ -245,13 +245,15 @@ class StreamAttempt:
     def settle_admission(
         self, error: BaseException | None = None, *, succeeded: bool = False
     ) -> "asyncio.Task[None] | None":
-        """Reports the stream's outcome to the dynamic queue once, in the background so it never holds up or replaces
-        what the client already read: a success only when the stream completed, the failure it raised, or nothing
-        when it was closed early."""
+        """Reports the stream's outcome once, in the background, so it never holds up or replaces what the client
+        already read."""
         admission: Final = self.admission
         if admission is None:
             return None
         self.admission = None
+        watching: Final = self.watching
+        if watching is not None and watching is not asyncio.current_task():
+            _ = watching.cancel()
         from litellm.router_rust.core import retry_after_seconds
 
         outcome: Final = (
@@ -264,19 +266,34 @@ class StreamAttempt:
         self.settling = _record_in_background(admission.finish(outcome))
         return self.settling
 
-    def watch_unread(self) -> "asyncio.Task[None] | None":
-        """A stream its caller never starts reading, or closes unread, never runs its generator's cleanup: its queue
-        turn is given back without credit once a probe lease's worth of time passes unread."""
+    async def admission_settled(self) -> None:
+        """A recovery admits only after this stream's failure reached the queue, so it never picks the capacity the
+        failure is about to congest."""
+        settling: Final = self.settling
+        if settling is not None and not settling.done():
+            _ = await asyncio.wait({settling})
+
+    def note_read(self) -> None:
+        self.reads += 1
+
+    def _reads_while_held(self, admission: Admission) -> int | None:
+        return self.reads if self.admission is admission else None
+
+    def watch_idle(self) -> "asyncio.Task[None] | None":
+        """A stream nobody reads, or one dropped without closing, never runs its own cleanup: its turn goes back,
+        without credit, once it sits an idle bound unread. The provider stream is left alone."""
         admission: Final = self.admission
         if admission is None:
             return None
 
         async def watch() -> None:
-            await admission.release_unless_started(self.started)
-            if not self.started.is_set():
-                self.admission = None
+            if await admission.went_idle(partial(self._reads_while_held, admission)):
+                settling: Final = self.settle_admission()
+                if settling is not None:
+                    _ = await asyncio.wait({settling})
 
-        return _record_in_background(watch())
+        self.watching = _record_in_background(watch())
+        return self.watching
 
     async def failure_recorded(self) -> None:
         """Wait for the stream's failure to be recorded, if one is being recorded."""
@@ -356,11 +373,11 @@ async def _areported(
     answers."""
     last: object = None  # rebind-ok: the newest item
     started = False  # rebind-ok: whether an item came
-    attempt.started.set()
     try:
         async for item in items:
             last = item
             started = True
+            attempt.note_read()
             if observe is not None:
                 observe(item)
             yield item
@@ -1093,7 +1110,7 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
     wrapped_response: Final = _AsyncChatStream(stream_with_fallbacks(), model_response)
     # weak, so the generator closing over it does not keep the wrapper alive
     wrapper_ref: Final[weakref.ref[FallbackAwareStreamWrapper]] = weakref.ref(wrapped_response)
-    _ = attempt.watch_unread()
+    _ = attempt.watch_idle()
     return wrapped_response
 
 
@@ -1953,7 +1970,7 @@ def _reported_text_completion_stream(attempt: StreamAttempt, response: object) -
     response.completion_stream = _areported(  # rebind-ok: the stream's own iterator, wrapped
         attempt, chunks, _chat_total_tokens, fails_before_first_item=False
     )
-    _ = attempt.watch_unread()
+    _ = attempt.watch_idle()
     return response
 
 

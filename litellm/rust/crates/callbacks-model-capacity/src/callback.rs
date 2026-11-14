@@ -13,7 +13,7 @@ use crate::{
     capacity::{Engine, Frame, PreCall, Request, SaturationFallback, Settlement},
     error::CapacityError,
     model::{KeyFacts, KeyGaps, LoggedGroup, UsageTokens},
-    refusal::reraise,
+    refusal::{reraise, unverifiable},
     seam::{CapacityHost, V3Limiter},
     state::SharedStash,
 };
@@ -102,9 +102,12 @@ fn failed(error: CapacityError) -> CallbackError {
 }
 
 fn raise(error: CapacityError) -> HookOutput {
-    match error.raised() {
-        Some(raised) => Ok(Some(Verdict::Abort(reraise(raised.token, &raised.message)))),
-        None => Err(failed(error)),
+    match error {
+        CapacityError::Raised(raised) => {
+            Ok(Some(Verdict::Abort(reraise(raised.token, &raised.message))))
+        }
+        CapacityError::Unverifiable => Ok(Some(Verdict::Abort(unverifiable()))),
+        error => Err(failed(error)),
     }
 }
 
@@ -197,6 +200,7 @@ impl ModelCapacity {
             settings: &settings,
             stash: &stash,
             fallback,
+            redis: None,
         };
         match self.engine.pre_call(&request, &model, &group).await {
             PreCall::Allow => Ok(None),
@@ -210,7 +214,7 @@ impl ModelCapacity {
             return Ok(None);
         };
         let headers = Engine::post_call_headers(&key);
-        let _ = self.engine.limiter.post_call_success(&headers).await;
+        let _ = self.engine.host.post_call_success(&headers).await;
         Ok(None)
     }
 
@@ -367,6 +371,7 @@ impl ModelCapacity {
             settings: &settings,
             stash,
             fallback: SaturationFallback::default(),
+            redis: None,
         };
         self.engine
             .fallback_target_allowed(&request, model, commit)
@@ -387,6 +392,7 @@ impl ModelCapacity {
             settings: &settings,
             stash: &stash,
             fallback: SaturationFallback::default(),
+            redis: None,
         };
         self.engine.enforce_frame(&request, model, connection).await
     }

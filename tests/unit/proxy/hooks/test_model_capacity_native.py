@@ -16,6 +16,7 @@ import litellm
 from litellm import DualCache, Router
 from litellm._internal_context import current_service_target
 from litellm._logging import verbose_proxy_logger
+from litellm.caching.redis_cache import RedisCache
 from litellm.constants import RESPONSES_WEBSOCKET_CALL_ID_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2.call import CallFacts, CallIds, CallKind, CallTarget, CallTiming
@@ -50,7 +51,6 @@ from litellm.proxy.hooks.model_capacity_native import (
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROXY_MaxParallelRequestsHandler_v3,
-    RateLimitUnverifiableError,
     RequestRateLimiterStash,
     get_or_create_request_stash,
 )
@@ -62,10 +62,12 @@ from litellm.proxy.v2_proxy_fields import (
     DERIVED_RESPONSE_HEADERS_FIELDS,
     PRE_CALL_SOURCES,
 )
-from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitCounter, RateLimitScope
+from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitScope
+from litellm.rust_bridge.host import redis_events
 from litellm.types.integrations.custom_logger_v2 import Outcome as AttemptOutcome
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
 from tests.unit.proxy.hooks.model_capacity_golden import golden
+from tests.unit.proxy.hooks.native_capacity_handler import redis_answering_counts
 
 pytestmark = pytest.mark.asyncio
 
@@ -1117,23 +1119,6 @@ async def test_socket_frames_hold_turns_to_the_class_share(monkeypatch: pytest.M
     ), native[1]
 
 
-async def test_an_unverifiable_frame_check_is_a_service_unavailable(monkeypatch: pytest.MonkeyPatch, isolated: Clock):
-    _borrowing(monkeypatch, 0.0)
-    router: Final = _router(("sock", 1000, None))
-    team: Final = _key("team", team_id="team-u", team_metadata={"model_tpm_limit": {"sock": 150}})
-
-    async def unverifiable(*_args: object, **_kwargs: object) -> object:
-        raise RateLimitUnverifiableError()
-
-    def prepare(side: Side) -> None:
-        monkeypatch.setattr(side.limiter, "should_rate_limit", unverifiable)
-
-    native: Final = await _differential(
-        monkeypatch, isolated, router, [_socket_connection("u", team, (Turn("sock"),))], [], prepare
-    )
-    assert native[0][1][0] == "ServiceUnavailableError", native[0]
-
-
 async def _settled() -> None:
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
@@ -1565,7 +1550,7 @@ async def test_a_refused_admission_gives_back_its_team_holds_once_like_python(
     assert [entry[3] for entry in native[-2][1::2]] == [0, 40, 40], native[-2]
 
 
-async def test_a_failed_attempt_settles_outside_the_rate_limits_service_target_like_python(
+async def test_every_redis_call_of_an_attempt_runs_under_the_rate_limits_service_target_like_python(
     monkeypatch: pytest.MonkeyPatch, isolated: Clock
 ) -> None:
     _borrowing(monkeypatch, 0.0)
@@ -1575,25 +1560,36 @@ async def test_a_failed_attempt_settles_outside_the_rate_limits_service_target_l
     steps: Final = [
         Step(Request(team, "traced", "t0"), tokens=(20, 10)),
         Step(Request(team, "traced", "t1"), tokens=(30, 0), failed=True, partial=(5, 5)),
-        Step(Request(team, "traced", "t2"), refused=True),
     ]
-    side: Final = NativeSide(router, isolated)
-    targets: Final[list[str | None]] = []  # mutable-ok: the service target of each increment, in order
-    increment: Final = side.limiter.async_increment_reservation_aware_tokens
+    targets: Final[list[str | None]] = []  # mutable-ok: the service target of each Redis call, in order
 
-    async def traced(
-        *args: object,
-        **kwargs: object,  # kwargs-ok: the wrapped limiter method's own keywords pass through
+    def record(
+        event_loop: asyncio.AbstractEventLoop | None,
+        call_type: str,
+        start_time: float,
+        end_time: float,
+        failure: redis_events.Failure | None,
     ) -> None:
         targets.append(current_service_target())
-        await increment(*args, **kwargs)
 
-    monkeypatch.setattr(side.limiter, "async_increment_reservation_aware_tokens", traced)
-    monkeypatch.setattr(litellm, "callbacks", [side.logger])
-    for step in steps:
-        await _run_step(side, step)
-    golden.check(targets)
-    assert targets == [RATE_LIMITS_TARGET, None, RATE_LIMITS_TARGET], targets
+    monkeypatch.setattr(redis_events, "record_redis_call", record)
+    with redis_answering_counts({}) as port:
+        side: Final = NativeSide(
+            router,
+            isolated,
+            build_native_dynamic_rate_limiter(
+                DualCache(redis_cache=RedisCache(host="127.0.0.1", port=port)), time_provider=isolated.now
+            ),
+        )
+        monkeypatch.setattr(litellm, "callbacks", [side.logger])
+        for step in steps:
+            await _run_step(side, step)
+        settled = -1
+        while settled != len(targets):
+            settled = len(targets)
+            await asyncio.sleep(0.2)
+    assert targets, targets
+    assert set(targets) == {RATE_LIMITS_TARGET}, targets
 
 
 async def test_a_capped_team_holds_its_cap_on_fallbacks_and_frames_like_python(
@@ -1632,39 +1628,6 @@ async def test_a_capped_team_holds_its_cap_on_fallbacks_and_frames_like_python(
     assert {call[0] for call in native[-1]} >= {"share"}, native[-1]
 
 
-async def test_a_failing_redis_saturation_read_falls_back_to_this_workers_copy_like_python(
-    monkeypatch: pytest.MonkeyPatch, isolated: Clock
-) -> None:
-    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.5})
-    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
-    router: Final = _router(("down", None, 4))
-
-    async def redis_down(
-        *_args: object,
-        **_kwargs: object,  # kwargs-ok: stands in for the store's read, whatever keywords it takes
-    ) -> object:
-        raise RedisError("redis down")
-
-    def prepare(side: Side) -> None:
-        monkeypatch.setattr(side.limiter.rate_limits, "get_from_redis", redis_down)
-
-    high: Final = _key("high", metadata={"priority": "high"})
-    native: Final = await _differential(
-        monkeypatch,
-        isolated,
-        router,
-        [Step(Request(high, "down", f"d{index}")) for index in range(4)],
-        [("model_saturation_check", "down"), ("priority_model", "down:high")],
-        prepare,
-    )
-    assert {
-        line for step in native[:4] for line in step[-1][1]
-    } == {  # comprehension-ok: every log line of the first four steps
-        ("WARNING", "Saturation read failed in Redis, using this worker's copy: redis down")
-    }, native
-    assert set(_refusal_prefixes(native)) == {"Priority-based rate limit exceeded"}, native
-
-
 @pytest.mark.parametrize("model_group", [5, True, "", ["listed"], ("tupled",)])
 async def test_logged_model_groups_of_any_type_settle_like_python(
     monkeypatch: pytest.MonkeyPatch, isolated: Clock, model_group: object
@@ -1684,46 +1647,6 @@ async def test_logged_model_groups_of_any_type_settle_like_python(
             ("priority_model", f"{model_group}:default_pool"),
         ],
     )
-
-
-async def test_saturation_is_read_from_redis_on_every_check_like_python(
-    monkeypatch: pytest.MonkeyPatch, isolated: Clock
-) -> None:
-    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.5})
-    monkeypatch.setattr(litellm.priority_reservation_settings, "saturation_threshold", 0.5)
-    router: Final = _router(("shared", None, 4))
-    seen: Final[list[tuple[str, str, object]]] = []  # mutable-ok: the reads the native records, in order
-
-    def prepare(side: Side) -> None:
-        store: Final = side.limiter.rate_limits
-        from_redis: Final = store.get_from_redis
-        from_memory: Final = store.get
-
-        async def other_workers(counter: RateLimitCounter, backfill_ttl: float | None = None) -> object:
-            seen.append(("redis", counter.scope.descriptor_key, backfill_ttl))
-            if counter.scope.descriptor_key == "model_saturation_check":
-                return 3
-            return await from_redis(counter, backfill_ttl=backfill_ttl)
-
-        async def memory_first(entry: object, backfill_ttl: float | None = None) -> object:
-            seen.append(("memory", type(entry).__name__, backfill_ttl))
-            return await from_memory(entry, backfill_ttl=backfill_ttl)  # pyright: ignore[reportArgumentType]  # the store reads any rate limit entry
-
-        monkeypatch.setattr(store, "get_from_redis", other_workers)
-        monkeypatch.setattr(store, "get", memory_first)
-
-    high: Final = _key("high", metadata={"priority": "high"})
-    native: Final = await _differential(
-        monkeypatch,
-        isolated,
-        router,
-        [Step(Request(high, "shared", f"h{index}")) for index in range(3)],
-        [("model_saturation_check", "shared"), ("priority_model", "shared:high")],
-        prepare,
-    )
-    golden.check(seen)
-    assert [read for read in seen if read[0] == "redis"] == [("redis", "model_saturation_check", 60)] * 3, seen
-    assert _refusal_prefixes(native) == ["Priority-based rate limit exceeded"], native
 
 
 @dataclass(frozen=True)

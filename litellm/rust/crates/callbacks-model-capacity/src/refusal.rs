@@ -4,6 +4,7 @@ use litellm_callbacks::{Abort, AbortError};
 use serde_json::{Value, json};
 
 use crate::{
+    error::CapacityError,
     model::{
         BorrowingLimits, GroupInfo, PRIORITY_CLASS_SHARE_AT_SATURATION,
         SATURATION_FALLBACK_DESCRIPTOR_KEY, Status, TEAM_MODEL_LIMIT_AT_SATURATION,
@@ -73,6 +74,19 @@ pub fn reraise(token: u64, message: &str) -> Abort {
                 .unwrap_or_default(),
         }),
         ..Abort::new(500, message)
+    }
+}
+
+pub fn unverifiable() -> Abort {
+    Abort {
+        error: Some(AbortError {
+            kind: RERAISE.into(),
+            fields: json!({"unverifiable": true})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        }),
+        ..Abort::new(503, CapacityError::Unverifiable.to_string())
     }
 }
 

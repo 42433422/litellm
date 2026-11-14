@@ -241,6 +241,8 @@ mod tests {
             window_size: 60,
             rate_limit_type: TokenRateLimitType::Total,
             licensed: true,
+            fail_closed: false,
+            force_grouping: false,
         }
     }
 

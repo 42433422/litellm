@@ -24,6 +24,10 @@ pub enum CapacityError {
     Config(String),
     #[error("{0}")]
     Type(String),
+    #[error("the rate limit could not be verified against Redis")]
+    Unverifiable,
+    #[error("{0}")]
+    Store(String),
     #[error("the host answered {method} with an unexpected shape: {detail}")]
     Shape {
         method: &'static str,
@@ -40,8 +44,10 @@ impl CapacityError {
     }
 
     pub fn is_http(&self) -> bool {
-        self.raised()
-            .is_some_and(|raised| raised.kind == RaisedKind::Http)
+        matches!(self, Self::Unverifiable)
+            || self
+                .raised()
+                .is_some_and(|raised| raised.kind == RaisedKind::Http)
     }
 
     pub fn is_type_error(&self) -> bool {

@@ -631,7 +631,14 @@ class NativeModelCapacityState:
 
 @final
 class NativeModelCapacity:
-    def __new__(cls, delegate: object) -> NativeModelCapacity: ...
+    def __new__(
+        cls,
+        delegate: object,
+        rate_limits: NativeRateLimits,
+        window_size: int,
+        tpm_reservation_enabled: bool,
+        now: Callable[[], float] | None = None,
+    ) -> NativeModelCapacity: ...
     def callback(self) -> RustHandle: ...
     def request_state(self) -> NativeModelCapacityState: ...
     def handle(

@@ -4,9 +4,11 @@ use futures_util::future::BoxFuture;
 use litellm_callbacks::{CallFacts, Callback, ErasedCallback, FieldValues, HookInput};
 use litellm_callbacks_model_capacity::{
     CapacityError, Delegate, Delegated, Frame, KeyFacts, KeyInputs, ModelCapacity, SharedStash,
+    StoreLimiter,
 };
+use litellm_callbacks_parallel_request_limiter::{Engine, Settings};
 use litellm_callbacks_python::RustCallback;
-use litellm_host_python::{Pythonized, from_py, json_from_py, run_async_value, to_py};
+use litellm_host_python::{Pythonized, from_py, json_from_py, to_py};
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
@@ -14,6 +16,11 @@ use pyo3::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+
+use crate::{
+    parallel_request_limiter::{limiter_async, python_clock, system_now},
+    redis::store::{rate_limits::NativeRateLimits, relabel},
+};
 
 struct PyDelegate(Py<PyAny>);
 
@@ -55,10 +62,31 @@ fn named<T: DeserializeOwned>(name: &str) -> PyResult<T> {
 #[pymethods]
 impl NativeModelCapacity {
     #[new]
-    fn new(delegate: Py<PyAny>) -> Self {
-        let delegated = Arc::new(Delegated(PyDelegate(delegate)));
+    #[pyo3(signature = (delegate, rate_limits, window_size, tpm_reservation_enabled, now = None))]
+    fn new(
+        delegate: Py<PyAny>,
+        rate_limits: PyRef<'_, NativeRateLimits>,
+        window_size: i64,
+        tpm_reservation_enabled: bool,
+        now: Option<Py<PyAny>>,
+    ) -> Self {
+        let clock: litellm_callbacks_parallel_request_limiter::Now = match now {
+            Some(now) => python_clock(now),
+            None => Arc::new(system_now),
+        };
+        let engine = Engine::new(
+            Arc::clone(&rate_limits.0),
+            Settings {
+                window_size,
+                tpm_reservation_enabled,
+            },
+            clock,
+        )
+        .with_relabel(Arc::new(relabel));
+        let limiter = Arc::new(StoreLimiter::new(engine, Some(Arc::new(relabel))));
+        let host = Arc::new(Delegated(PyDelegate(delegate)));
         Self {
-            inner: Arc::new(ModelCapacity::new(delegated.clone(), delegated)),
+            inner: Arc::new(ModelCapacity::new(limiter, host)),
         }
     }
 
@@ -95,7 +123,7 @@ impl NativeModelCapacity {
         };
         let stash = state.map(|state| Arc::clone(&state.0));
         let inner = Arc::clone(&self.inner);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let verdict = Callback::handle(&*inner, &input, stash.as_ref())
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
@@ -124,7 +152,7 @@ impl NativeModelCapacity {
         let key = key_facts(key)?;
         let inner = Arc::clone(&self.inner);
         let stash = Arc::clone(&state.0);
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let answer = match inner
                 .fallback_target_allowed(&stash, &key, &model, commit)
                 .await
@@ -147,7 +175,7 @@ impl NativeModelCapacity {
         let key = key_facts(key)?;
         let inner = Arc::clone(&self.inner);
         let connection = connection.map(|state| Arc::clone(&state.0));
-        run_async_value(py, async move {
+        limiter_async(py, async move {
             let answer = match inner.enforce_frame(connection.as_ref(), &key, &model).await {
                 Ok(Frame::Allow) => json!({"allowed": true}),
                 Ok(Frame::Refuse(refusal)) => json!({"refused": {
@@ -169,9 +197,10 @@ impl NativeModelCapacity {
 }
 
 fn failure(error: &CapacityError) -> Value {
-    match error.raised() {
-        Some(raised) => json!({"raised": raised.token}),
-        None if error.is_type_error() => json!({"type_error": error.to_string()}),
-        None => json!({"failed": error.to_string()}),
+    match error {
+        CapacityError::Raised(raised) => json!({"raised": raised.token}),
+        CapacityError::Unverifiable => json!({"unverifiable": true}),
+        error if error.is_type_error() => json!({"type_error": error.to_string()}),
+        error => json!({"failed": error.to_string()}),
     }
 }

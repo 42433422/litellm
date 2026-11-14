@@ -9,6 +9,8 @@ repository.workspace = true
 litellm-callbacks.workspace = true
 litellm-callbacks-parallel-request-limiter.workspace = true
 litellm-python-compat.workspace = true
+litellm-redis-client.workspace = true
+litellm-redis-store.workspace = true
 
 futures-util.workspace = true
 parking_lot.workspace = true

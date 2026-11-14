@@ -1,4 +1,5 @@
 use litellm_callbacks::{KeyIdentity, LoggedModelGroup, Scalar, Usage, UsageRecord};
+use litellm_callbacks_parallel_request_limiter::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
@@ -74,6 +75,8 @@ pub struct Status {
     pub limit_remaining: Option<Number>,
     pub rate_limit_type: String,
     pub descriptor_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_value: Option<String>,
 }
 
 impl Status {
@@ -84,7 +87,6 @@ impl Status {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LimiterResponse {
-    pub id: u64,
     pub overall_code: String,
     pub statuses: Vec<Status>,
     #[serde(default)]
@@ -149,9 +151,20 @@ pub struct Settings {
     pub rate_limit_type: TokenRateLimitType,
     #[serde(default)]
     pub licensed: bool,
+    #[serde(default)]
+    pub fail_closed: bool,
+    #[serde(default)]
+    pub force_grouping: bool,
 }
 
 impl Settings {
+    pub fn policy(&self) -> Policy {
+        Policy {
+            fail_closed: self.fail_closed,
+            force_grouping: self.force_grouping,
+        }
+    }
+
     pub fn reserves<'a>(
         &self,
         priority: Option<&'a Priority>,

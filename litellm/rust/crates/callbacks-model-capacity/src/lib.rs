@@ -7,6 +7,7 @@ mod pyfmt;
 mod refusal;
 mod seam;
 mod state;
+mod store;
 
 pub use callback::{ModelCapacity, NAME};
 pub use capacity::Frame;
@@ -15,6 +16,8 @@ pub use model::{KeyFacts, KeyGaps, KeyInputs};
 pub use refusal::Refusal;
 pub use refusal::{RATE_LIMIT_ERROR, RERAISE};
 pub use seam::{
-    CapacityHost, Delegate, Delegated, Estimate, SeamFuture, ShareGauge, Throttle, Trace, V3Limiter,
+    CapacityHost, Delegate, Delegated, Estimate, Published, SeamFuture, ShareGauge, Throttle,
+    V3Limiter,
 };
 pub use state::SharedStash;
+pub use store::{Relabel, StoreLimiter};

@@ -2,11 +2,13 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+use litellm_callbacks_parallel_request_limiter::Ctx;
+
 use crate::{
     error::{CapacityError, Raised},
     model::{
         BorrowingLimits, Counter, Descriptor, GroupInfo, Increment, LimiterResponse, ReservationOp,
-        Settings,
+        Settings, Status,
     },
 };
 
@@ -20,45 +22,33 @@ pub enum Estimate {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Trace {
-    Untraced,
-    Attempt,
-    Key,
-}
-
 pub trait V3Limiter: Send + Sync {
     fn read_counter<'a>(
         &'a self,
         counter: &'a Counter,
         backfill_ttl: &'a Value,
     ) -> SeamFuture<'a, Option<Value>>;
-    fn read_local_counter<'a>(&'a self, counter: &'a Counter) -> SeamFuture<'a, Option<Value>>;
+    fn read_local_counter(&self, counter: &Counter) -> Result<Option<Value>, CapacityError>;
     fn check_and_increment<'a>(
         &'a self,
         descriptors: &'a [Descriptor],
         increments: &'a [Increment],
+        ctx: Ctx<'a>,
     ) -> SeamFuture<'a, LimiterResponse>;
     fn should_rate_limit<'a>(
         &'a self,
         descriptors: &'a [Descriptor],
         read_only: bool,
         skip_parallel_check: bool,
+        ctx: Ctx<'a>,
     ) -> SeamFuture<'a, LimiterResponse>;
-    fn apply<'a>(&'a self, operations: &'a [ReservationOp], trace: Trace) -> SeamFuture<'a, ()>;
-    fn borrowing_limits<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<BorrowingLimits>>;
-    fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String>;
-    fn estimate_tokens<'a>(
-        &'a self,
-        tpm_share: i64,
-        model: &'a str,
-        call_type: Option<&'a str>,
-    ) -> SeamFuture<'a, Estimate>;
-    fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()>;
-    fn publish<'a>(&'a self, responses: &'a [u64]) -> SeamFuture<'a, ()>;
-    fn stash_call_type(&self) -> SeamFuture<'_, Option<String>>;
-    fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()>;
+    fn apply<'a>(&'a self, operations: &'a [ReservationOp]) -> SeamFuture<'a, ()>;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Published {
+    pub overall_code: String,
+    pub statuses: Vec<Status>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -96,6 +86,18 @@ pub trait CapacityHost: Send + Sync {
     fn set_share<'a>(&'a self, gauge: &'a ShareGauge) -> SeamFuture<'a, ()>;
     fn unlicensed_priority(&self) -> SeamFuture<'_, ()>;
     fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()>;
+    fn borrowing_limits<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<BorrowingLimits>>;
+    fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String>;
+    fn estimate_tokens<'a>(
+        &'a self,
+        tpm_share: i64,
+        model: &'a str,
+        call_type: Option<&'a str>,
+    ) -> SeamFuture<'a, Estimate>;
+    fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()>;
+    fn publish<'a>(&'a self, published: &'a Published) -> SeamFuture<'a, ()>;
+    fn stash_call_type(&self) -> SeamFuture<'_, Option<String>>;
+    fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,89 +142,6 @@ impl<D: Delegate> Delegated<D> {
     }
 }
 
-impl<D: Delegate> V3Limiter for Delegated<D> {
-    fn read_counter<'a>(
-        &'a self,
-        counter: &'a Counter,
-        backfill_ttl: &'a Value,
-    ) -> SeamFuture<'a, Option<Value>> {
-        self.invoke(
-            "read_counter",
-            json!({"counter": counter, "backfill_ttl": backfill_ttl}),
-        )
-    }
-
-    fn read_local_counter<'a>(&'a self, counter: &'a Counter) -> SeamFuture<'a, Option<Value>> {
-        self.invoke("read_local_counter", json!({"counter": counter}))
-    }
-
-    fn check_and_increment<'a>(
-        &'a self,
-        descriptors: &'a [Descriptor],
-        increments: &'a [Increment],
-    ) -> SeamFuture<'a, LimiterResponse> {
-        self.invoke(
-            "check_and_increment",
-            json!({"descriptors": descriptors, "increments": increments}),
-        )
-    }
-
-    fn should_rate_limit<'a>(
-        &'a self,
-        descriptors: &'a [Descriptor],
-        read_only: bool,
-        skip_parallel_check: bool,
-    ) -> SeamFuture<'a, LimiterResponse> {
-        self.invoke(
-            "should_rate_limit",
-            json!({"descriptors": descriptors, "read_only": read_only, "skip_parallel_check": skip_parallel_check}),
-        )
-    }
-
-    fn apply<'a>(&'a self, operations: &'a [ReservationOp], trace: Trace) -> SeamFuture<'a, ()> {
-        self.invoke("apply", json!({"operations": operations, "trace": trace}))
-    }
-
-    fn borrowing_limits<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<BorrowingLimits>> {
-        self.invoke("borrowing_limits", json!({"model": model}))
-    }
-
-    fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String> {
-        self.invoke("model_group", json!({"model": model}))
-    }
-
-    fn estimate_tokens<'a>(
-        &'a self,
-        tpm_share: i64,
-        model: &'a str,
-        call_type: Option<&'a str>,
-    ) -> SeamFuture<'a, Estimate> {
-        self.invoke(
-            "estimate_tokens",
-            json!({"tpm_share": tpm_share, "model": model, "call_type": call_type}),
-        )
-    }
-
-    fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()> {
-        self.invoke(
-            "cap_output",
-            json!({"tpm_share": tpm_share, "call_type": call_type}),
-        )
-    }
-
-    fn publish<'a>(&'a self, responses: &'a [u64]) -> SeamFuture<'a, ()> {
-        self.invoke("publish", json!({"responses": responses}))
-    }
-
-    fn stash_call_type(&self) -> SeamFuture<'_, Option<String>> {
-        self.invoke("stash_call_type", json!({}))
-    }
-
-    fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {
-        self.invoke("post_call_success", json!({"headers": headers}))
-    }
-}
-
 impl<D: Delegate> CapacityHost for Delegated<D> {
     fn settings(&self) -> SeamFuture<'_, Settings> {
         self.invoke("settings", json!({}))
@@ -263,5 +182,44 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
 
     fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()> {
         self.invoke("log", json!({"level": level, "message": message}))
+    }
+
+    fn borrowing_limits<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<BorrowingLimits>> {
+        self.invoke("borrowing_limits", json!({"model": model}))
+    }
+
+    fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String> {
+        self.invoke("model_group", json!({"model": model}))
+    }
+
+    fn estimate_tokens<'a>(
+        &'a self,
+        tpm_share: i64,
+        model: &'a str,
+        call_type: Option<&'a str>,
+    ) -> SeamFuture<'a, Estimate> {
+        self.invoke(
+            "estimate_tokens",
+            json!({"tpm_share": tpm_share, "model": model, "call_type": call_type}),
+        )
+    }
+
+    fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()> {
+        self.invoke(
+            "cap_output",
+            json!({"tpm_share": tpm_share, "call_type": call_type}),
+        )
+    }
+
+    fn publish<'a>(&'a self, published: &'a Published) -> SeamFuture<'a, ()> {
+        self.invoke("publish", json!(published))
+    }
+
+    fn stash_call_type(&self) -> SeamFuture<'_, Option<String>> {
+        self.invoke("stash_call_type", json!({}))
+    }
+
+    fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {
+        self.invoke("post_call_success", json!({"headers": headers}))
     }
 }

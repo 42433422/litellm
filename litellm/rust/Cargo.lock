@@ -3720,6 +3720,8 @@ dependencies = [
  "litellm-callbacks",
  "litellm-callbacks-parallel-request-limiter",
  "litellm-python-compat",
+ "litellm-redis-client",
+ "litellm-redis-store",
  "parking_lot",
  "rstest",
  "serde",

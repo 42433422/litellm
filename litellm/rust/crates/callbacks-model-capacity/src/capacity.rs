@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use litellm_callbacks_parallel_request_limiter::Ctx;
+use litellm_redis_store::RequestRedis;
 use serde_json::Value;
 
 use crate::{
@@ -16,7 +18,7 @@ use crate::{
     },
     pyfmt,
     refusal::{Context, Refusal},
-    seam::{CapacityHost, Estimate, Throttle, Trace, V3Limiter},
+    seam::{CapacityHost, Estimate, Published, Throttle, V3Limiter},
     state::{Hold, SharedStash},
 };
 
@@ -103,9 +105,17 @@ pub struct Request<'a> {
     pub settings: &'a Settings,
     pub stash: &'a SharedStash,
     pub fallback: SaturationFallback,
+    pub redis: Option<&'a RequestRedis>,
 }
 
 impl Request<'_> {
+    pub fn ctx(&self) -> Ctx<'_> {
+        Ctx {
+            policy: self.settings.policy(),
+            request: self.redis,
+        }
+    }
+
     pub fn priority(&self) -> Option<&Priority> {
         self.key.priority.as_ref()
     }
@@ -346,7 +356,7 @@ impl Engine {
                     error.python_message()
                 );
                 let _ = self.host.log("warning", &message).await;
-                self.limiter.read_local_counter(counter).await?
+                self.limiter.read_local_counter(counter)?
             }
         };
         Ok(value.filter(|value| !value.is_null() && !value.is_object()))
@@ -454,7 +464,7 @@ impl Engine {
         request: &Request<'_>,
         model: &str,
     ) -> Result<Option<BorrowingShare>, CapacityError> {
-        let Some(limits) = self.limiter.borrowing_limits(model).await? else {
+        let Some(limits) = self.host.borrowing_limits(model).await? else {
             return Ok(None);
         };
         if limits.tpm.is_none() && limits.rpm.is_none() {
@@ -496,7 +506,7 @@ impl Engine {
         };
         Ok(
             match self
-                .limiter
+                .host
                 .estimate_tokens(tpm_share, model, call_type)
                 .await?
             {
@@ -603,7 +613,7 @@ impl Engine {
         }
         let atomic = self
             .limiter
-            .check_and_increment(&enforced, &increments)
+            .check_and_increment(&enforced, &increments, request.ctx())
             .await?;
         if atomic.over_limit() {
             let priority = request.priority_value();
@@ -652,21 +662,20 @@ impl Engine {
             && team_reservation != 0
             && settings.rate_limit_type != crate::model::TokenRateLimitType::Input
         {
-            self.limiter
-                .cap_output(tpm_share, request.call_type)
-                .await?;
+            self.host.cap_output(tpm_share, request.call_type).await?;
         }
-        if !priority_descriptors.is_empty() && share.is_some() && !enforce_priority {
-            self.limiter.publish(&[atomic.id]).await?;
-        } else if !priority_descriptors.is_empty() && !enforce_priority {
+        let mut published = Published {
+            overall_code: atomic.overall_code,
+            statuses: atomic.statuses,
+        };
+        if !priority_descriptors.is_empty() && share.is_none() && !enforce_priority {
             let tracking = self
                 .limiter
-                .should_rate_limit(&priority_descriptors, false, false)
+                .should_rate_limit(&priority_descriptors, false, false, request.ctx())
                 .await?;
-            self.limiter.publish(&[atomic.id, tracking.id]).await?;
-        } else {
-            self.limiter.publish(&[atomic.id]).await?;
+            published.statuses.extend(tracking.statuses);
         }
+        self.host.publish(&published).await?;
         Ok(())
     }
 
@@ -797,7 +806,11 @@ impl Engine {
             return Ok(Frame::Allow);
         }
         let windows = socket_turn_tpm_windows(&descriptors);
-        let response = match self.limiter.should_rate_limit(&windows, true, true).await {
+        let response = match self
+            .limiter
+            .should_rate_limit(&windows, true, true, request.ctx())
+            .await
+        {
             Ok(response) => response,
             Err(error) => return Ok(Frame::Unverifiable(error)),
         };
@@ -843,7 +856,7 @@ impl Engine {
             .cloned();
         let cap = team_share.ceiling.clone();
         let reservation = if enforced.is_some() || cap.is_some() {
-            let call_type = self.limiter.stash_call_type().await?;
+            let call_type = self.host.stash_call_type().await?;
             self.token_reservation(&team_share.share, model, call_type.as_deref())
                 .await?
         } else {
@@ -853,7 +866,10 @@ impl Engine {
             enforced.iter().chain(cap.iter()).cloned().collect();
         if !commit {
             for descriptor in &team_descriptors {
-                if !self.share_has_room(descriptor, reservation).await? {
+                if !self
+                    .share_has_room(descriptor, reservation, request.ctx())
+                    .await?
+                {
                     return Ok(false);
                 }
             }
@@ -871,7 +887,7 @@ impl Engine {
         descriptors.extend(team_descriptors);
         let response = self
             .limiter
-            .check_and_increment(&descriptors, &increments)
+            .check_and_increment(&descriptors, &increments, request.ctx())
             .await?;
         if response.over_limit() {
             return Ok(false);
@@ -898,10 +914,11 @@ impl Engine {
         &self,
         descriptor: &Descriptor,
         tokens: i64,
+        ctx: Ctx<'_>,
     ) -> Result<bool, CapacityError> {
         let checked = self
             .limiter
-            .should_rate_limit(std::slice::from_ref(descriptor), true, false)
+            .should_rate_limit(std::slice::from_ref(descriptor), true, false, ctx)
             .await?;
         Ok(checked.statuses.iter().all(|status| {
             !status.over_limit()
@@ -967,7 +984,7 @@ impl Engine {
         };
         let Some(model_group) = group.filter(|group| group.truthy) else {
             if !team_tokens.is_empty() {
-                self.limiter.apply(&team_tokens, Trace::Attempt).await?;
+                self.limiter.apply(&team_tokens).await?;
             }
             return Ok(());
         };
@@ -1009,7 +1026,7 @@ impl Engine {
         }
         operations.extend(team_tokens);
         if !operations.is_empty() {
-            self.limiter.apply(&operations, Trace::Attempt).await?;
+            self.limiter.apply(&operations).await?;
             self.record_team_share(
                 settings,
                 stash,
@@ -1063,7 +1080,7 @@ impl Engine {
             (refund, failed_hold)
         };
         if !refund.is_empty() {
-            self.limiter.apply(&refund, Trace::Untraced).await?;
+            self.limiter.apply(&refund).await?;
         }
         Ok(failed_hold)
     }
@@ -1082,7 +1099,7 @@ impl Engine {
         if refund.is_empty() {
             return Ok(());
         }
-        self.limiter.apply(&refund, Trace::Key).await
+        self.limiter.apply(&refund).await
     }
 
     pub async fn record_team_share(
@@ -1141,7 +1158,7 @@ impl Engine {
             (Some(share), _) => Some(share),
             (None, Some(hold)) => tightest(&[hold.share.as_ref()]),
             (None, None) => {
-                let group = self.limiter.model_group(model_group).await?;
+                let group = self.host.model_group(model_group).await?;
                 let on_model = format!("{team}:{group}");
                 tightest(&[idle_share.as_ref().filter(|share| share.value == on_model)])
             }
@@ -1259,3 +1276,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "capacity_seam_tests.rs"]
+mod seam_tests;

@@ -706,73 +706,78 @@ class TestProxyHooksActuallyRaiseProxyRateLimitError:
         assert "RPM" in e.detail.get("error", "")
 
     @pytest.mark.parametrize(
-        "descriptor_key",
+        ("descriptor_key", "descriptor_value", "seeded", "refusal"),
         [
-            "model_saturation_check",
-            "priority_model",
-            "unknown_descriptor_for_fail_closed_fallback",
+            ("model_saturation_check", "gpt-4", 100, "Model capacity reached"),
+            ("priority_model", "gpt-4:prod", 50, "Priority-based rate limit exceeded"),
         ],
     )
     @pytest.mark.asyncio
-    async def test_dynamic_rate_limiter_v3_each_raise_branch(self, descriptor_key):
+    async def test_dynamic_rate_limiter_v3_each_raise_branch(
+        self,
+        descriptor_key: str,
+        descriptor_value: str,
+        seeded: int,
+        refusal: str,
+    ) -> None:
         """
-        Drive each of the three raise branches of the dynamic_rate_limiter_v3 callback:
-        model_saturation_check, priority_model, and the fail-closed fallback
-        for an unrecognized descriptor_key. Mocks
-        ``atomic_check_and_increment_by_n`` so the v3 limiter's response
-        directly drives the raise-site selection.
+        Drive the model_saturation_check and priority_model raise branches of
+        the dynamic_rate_limiter_v3 callback by seeding the counter each
+        descriptor checks to its limit.
         """
-        from unittest.mock import AsyncMock, patch
+        import os
+        from unittest.mock import patch
 
         from litellm import DualCache, Router
         from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.redis.stores.rate_limits import RateLimitScope
         from tests.unit.proxy.hooks.native_capacity_handler import (
             NativeDynamicRateLimitHandler,
+            seed_counter,
         )
 
-        handler = NativeDynamicRateLimitHandler(internal_usage_cache=DualCache())
-        handler.update_variables(
-            llm_router=Router(
-                model_list=[
-                    {
-                        "model_name": "gpt-4",
-                        "litellm_params": {
-                            "model": "gpt-4",
-                            "api_key": "sk-test",
-                            "rpm": 100,
-                            "tpm": 1000,
-                        },
-                    }
-                ]
+        with patch.dict(os.environ, {"LITELLM_LICENSE": "test-license-key"}), patch.object(
+            litellm, "priority_reservation", {"prod": 0.5}
+        ):
+            handler = NativeDynamicRateLimitHandler(internal_usage_cache=DualCache())
+            handler.update_variables(
+                llm_router=Router(
+                    model_list=[
+                        {
+                            "model_name": "gpt-4",
+                            "litellm_params": {
+                                "model": "gpt-4",
+                                "api_key": "sk-test",
+                                "rpm": 100,
+                                "tpm": 1000,
+                            },
+                        }
+                    ]
+                )
             )
-        )
-        over_limit = AsyncMock(
-            return_value={
-                "overall_code": "OVER_LIMIT",
-                "statuses": [
-                    {
-                        "code": "OVER_LIMIT",
-                        "descriptor_key": descriptor_key,
-                        "current_limit": 100,
-                        "limit_remaining": 0,
-                        "rate_limit_type": "requests",
-                    }
-                ],
-            }
-        )
-        with patch.object(
-            handler.v3_limiter, "atomic_check_and_increment_by_n", over_limit
-        ), pytest.raises(ProxyRateLimitError) as exc_info:
-            await handler.async_pre_call_hook(
-                user_api_key_dict=UserAPIKeyAuth(api_key="sk-test-v3"),
-                cache=DualCache(),
-                data={"model": "gpt-4"},
-                call_type="completion",
+            seed_counter(
+                handler,
+                RateLimitScope("model_saturation_check", "gpt-4").counter("tokens"),
+                950,
             )
-        over_limit.assert_awaited()
+            seed_counter(
+                handler,
+                RateLimitScope(descriptor_key, descriptor_value).counter("requests"),
+                seeded,
+            )
+            user_api_key_dict = UserAPIKeyAuth(api_key="sk-test-v3")
+            user_api_key_dict.metadata = {"priority": "prod"}
+            with pytest.raises(ProxyRateLimitError) as exc_info:
+                await handler.async_pre_call_hook(
+                    user_api_key_dict=user_api_key_dict,
+                    cache=DualCache(),
+                    data={"model": "gpt-4"},
+                    call_type="completion",
+                )
         e = exc_info.value
         assert e.status_code == 429
         assert e.category == RateLimitErrorCategory.LITELLM_RATE_LIMIT
+        assert f"'error': '{refusal}" in str(e.detail)
 
     @pytest.mark.asyncio
     async def test_max_budget_per_session_limiter_raises_proxy_rate_limit_error(

@@ -22,7 +22,8 @@ pub use arithmetic::{
 pub use batch::{BatchFacts, TPD_SUFFIX, TPD_WINDOW_SECONDS};
 pub use descriptor::{Declared, Descriptor, Limits, PROJECT_ITPM, PROJECT_OTPM, PTU_TEAM};
 pub use engine::{
-    Ctx, Engine, Now, Op, Policy, SLOT_TTL_SECONDS, Settings, SlotAcquisition, Unverifiable,
+    Ctx, Engine, GuardedOp, Now, Op, Policy, SLOT_TTL_SECONDS, Settings, SlotAcquisition,
+    Unverifiable,
 };
 pub use enqueued::{
     ENQUEUED_TTL_SECONDS, EnqueuedOutcome, EnqueuedReservation, EnqueuedScope, EnqueuedTokens,

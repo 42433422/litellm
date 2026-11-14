@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final
 from weakref import WeakKeyDictionary
 
 from fastapi import HTTPException
@@ -44,14 +44,13 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitErro
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RATE_LIMIT_UNVERIFIABLE_MESSAGE,
     PROXY_MaxParallelRequestsHandler_v3,
-    RateLimitDescriptor,
-    RateLimitDescriptorRateLimitObject,
     RateLimitedModel,
     RateLimitResponse,
     RateLimitUnverifiableError,
     RequestRateLimiterStash,
-    ReservationOperation,
-    WindowGuardedIncrement,
+    _fail_closed_rate_limit_enforcement_from_general_settings,  # pyright: ignore[reportPrivateUsage]  # the inner limiter's default policy, read live per call
+    _force_redis_hash_tag_grouping_from_litellm_settings,  # pyright: ignore[reportPrivateUsage]  # the inner limiter's default policy, read live per call
+    _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage]  # the registered limiter whose store capacity shares
     borrowing_team_model_limits,
     callback_kwargs_mapping,
     claim_request_stash_for_data,
@@ -63,7 +62,8 @@ from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.proxy.request_auth_context import REQUEST_AUTH
 from litellm.proxy.utils import InternalUsageCache
-from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, CounterIncrement, RateLimitCounter, RateLimitScope
+from litellm.redis.stores.connection import connect
+from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitStore
 from litellm.types.integrations.custom_logger_v2 import KeyIdentity
 from litellm.types.integrations.custom_logger_v2 import Outcome as AttemptOutcome
 from litellm.types.utils import PriorityReservationSettings
@@ -218,105 +218,9 @@ PROJECTIONS: Final[Mapping[Field, Callable[[object], object]]] = {
 }
 
 
-class _Counter(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    key: str
-    value: str
-    kind: Literal["requests", "tokens"]
-
-    def counter(self) -> RateLimitCounter:
-        return RateLimitScope(self.key, self.value).counter(self.kind)
-
-
-class _RateLimit(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    requests_per_unit: int | None
-    tokens_per_unit: int | None
-    window_size: int | None
-
-    def rate_limit(self) -> RateLimitDescriptorRateLimitObject:
-        return RateLimitDescriptorRateLimitObject(
-            requests_per_unit=self.requests_per_unit,
-            tokens_per_unit=self.tokens_per_unit,
-            window_size=self.window_size,
-        )
-
-
-class _Descriptor(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    key: str
-    value: str
-    rate_limit: _RateLimit | None
-
-    def descriptor(self) -> RateLimitDescriptor:
-        return RateLimitDescriptor(
-            key=self.key, value=self.value, rate_limit=None if self.rate_limit is None else self.rate_limit.rate_limit()
-        )
-
-
-class _Operation(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    op: Literal["increment", "guarded"]
-    counter: _Counter
-    amount: int
-    ttl: int | None
-    expected_window_start: str | None = None
-    backend: Literal["redis", "local"] | None = None
-
-    def operation(self) -> ReservationOperation:
-        increment: Final = CounterIncrement(counter=self.counter.counter(), amount=self.amount, ttl=self.ttl)
-        if self.op == "increment" or self.expected_window_start is None or self.backend is None:
-            return increment
-        return WindowGuardedIncrement(
-            increment=increment, expected_window_start=self.expected_window_start, reservation_backend=self.backend
-        )
-
-
 _ARGS: Final = TypeAdapter(dict[str, object])
-_DESCRIPTORS: Final = TypeAdapter(tuple[_Descriptor, ...])
-_INCREMENTS: Final = TypeAdapter(list[dict[Literal["requests", "tokens"], int]])
-_OPERATIONS: Final = TypeAdapter(tuple[_Operation, ...])
 _PAIRS: Final = TypeAdapter(tuple[tuple[str, object], ...])
-_TOKEN_LIST: Final = TypeAdapter(tuple[int, ...])
-
-
-def _descriptors(raw: object) -> tuple[RateLimitDescriptor, ...]:
-    return tuple(descriptor.descriptor() for descriptor in _DESCRIPTORS.validate_python(raw))
-
-
-def _wire_response(live: LiveRequest, response: RateLimitResponse) -> Mapping[str, object]:
-    token: Final = next(_TOKENS)
-    live.responses[token] = response  # rebind-ok: the reply is kept by id so publish can stash the same object
-    return {
-        "id": token,
-        "overall_code": response["overall_code"],
-        "statuses": [
-            {
-                "code": status["code"],
-                "current_limit": status["current_limit"],
-                "limit_remaining": status["limit_remaining"],
-                "rate_limit_type": status["rate_limit_type"],
-                "descriptor_key": status["descriptor_key"],
-            }
-            for status in response["statuses"]
-        ],
-        "reservation_windows": [
-            {
-                "counter": {
-                    "key": window[0].scope.descriptor_key,
-                    "value": window[0].scope.descriptor_value,
-                    "kind": window[0].kind,
-                },
-                "start": window[1],
-                "backend": window[2],
-            }
-            for window in response.get("reservation_windows", frozenset())
-        ],
-    }
+_PUBLISHED: Final = TypeAdapter(RateLimitResponse)
 
 
 def _registry_unavailable(error: Exception) -> bool:
@@ -392,6 +296,8 @@ class CapacityDelegate:
             "saturation_check_cache_ttl": settings.saturation_check_cache_ttl,
             "window_size": self.v3_limiter.window_size,
             "rate_limit_type": self.v3_limiter.get_rate_limit_type(),
+            "fail_closed": _fail_closed_rate_limit_enforcement_from_general_settings(),
+            "force_grouping": _force_redis_hash_tag_grouping_from_litellm_settings(),
         }
 
     @_seam
@@ -405,64 +311,6 @@ class CapacityDelegate:
             "input_cost_per_token": group.input_cost_per_token,
             "output_cost_per_token": group.output_cost_per_token,
         }
-
-    @_seam
-    async def read_counter(self, args: Mapping[str, object]) -> object:
-        counter: Final = _Counter.model_validate(args["counter"]).counter()
-        value: Final = await self.v3_limiter.rate_limits.get_from_redis(counter, backfill_ttl=args["backfill_ttl"])  # pyright: ignore[reportArgumentType]  # the settings value as the handler passes it
-        return None if isinstance(value, dict) else value
-
-    @_seam
-    async def read_local_counter(self, args: Mapping[str, object]) -> object:
-        counter: Final = _Counter.model_validate(args["counter"]).counter()
-        value: Final = self.v3_limiter.rate_limits.local((counter,))[0]
-        return None if isinstance(value, dict) else value
-
-    def _span(self) -> object:
-        auth: Final = _live().auth
-        return None if auth is None else auth.parent_otel_span
-
-    @_seam
-    async def check_and_increment(self, args: Mapping[str, object]) -> object:
-        response: Final = await self.v3_limiter.atomic_check_and_increment_by_n(
-            descriptors=list(_descriptors(args["descriptors"])),
-            increments=_INCREMENTS.validate_python(args["increments"]),
-            parent_otel_span=self._span(),  # pyright: ignore[reportArgumentType]  # the key's span as the handler passes it
-        )
-        return _wire_response(_live(), response)
-
-    @_seam
-    async def should_rate_limit(self, args: Mapping[str, object]) -> object:
-        response: Final = await self.v3_limiter.should_rate_limit(
-            _descriptors(args["descriptors"]),
-            parent_otel_span=self._span(),  # pyright: ignore[reportArgumentType]  # the key's span as the handler passes it
-            read_only=args["read_only"] is True,
-            skip_parallel_check=args["skip_parallel_check"] is True,
-        )
-        return _wire_response(_live(), response)
-
-    @_seam
-    async def apply(self, args: Mapping[str, object]) -> object:
-        from litellm.litellm_core_utils.core_helpers import get_parent_otel_span_from_kwargs
-
-        operations: Final = tuple(
-            operation.operation() for operation in _OPERATIONS.validate_python(args["operations"])
-        )
-        live: Final = _LIVE.get()
-        trace: Final = args["trace"] if args["trace"] in _TRACES else "untraced"
-        if trace == "attempt" and live is not None and live.kwargs is not None:
-            await self.v3_limiter.async_increment_reservation_aware_tokens(
-                pipeline_operations=operations,
-                parent_otel_span=get_parent_otel_span_from_kwargs(dict(live.kwargs)),
-            )
-            return None
-        if trace == "key" and live is not None and live.auth is not None:
-            await self.v3_limiter.async_increment_reservation_aware_tokens(
-                pipeline_operations=operations, parent_otel_span=live.auth.parent_otel_span
-            )
-            return None
-        await self.v3_limiter.async_increment_reservation_aware_tokens(pipeline_operations=operations)
-        return None
 
     @_seam
     async def borrowing_limits(self, args: Mapping[str, object]) -> object:
@@ -524,15 +372,9 @@ class CapacityDelegate:
 
     @_seam
     async def publish(self, args: Mapping[str, object]) -> object:
-        live: Final = _live()
-        responses: Final = tuple(live.responses[token] for token in _TOKEN_LIST.validate_python(args["responses"]))
-        get_or_create_request_stash().rate_limit_response = (
-            responses[0]
-            if len(responses) == 1
-            else RateLimitResponse(
-                overall_code=responses[0]["overall_code"],
-                statuses=responses[0]["statuses"] + responses[1]["statuses"],
-            )
+        published: Final = _PUBLISHED.validate_python(args)
+        get_or_create_request_stash().rate_limit_response = RateLimitResponse(
+            overall_code=published["overall_code"], statuses=published["statuses"]
         )
         return None
 
@@ -620,6 +462,23 @@ class CapacityDelegate:
         return None
 
 
+def shared_rate_limit_store(internal_usage_cache: DualCache) -> RateLimitStore:
+    registered: Final = next(
+        (
+            callback.rate_limits
+            for callback in litellm.callbacks
+            if isinstance(callback, _PROXY_MaxParallelRequestsHandler_v3)
+            and callback.internal_usage_cache.dual_cache is internal_usage_cache
+        ),
+        None,
+    )
+    if registered is not None:
+        return registered
+    return RateLimitStore(
+        connect(internal_usage_cache.redis_cache).rate_limits(internal_usage_cache.default_in_memory_ttl)
+    )
+
+
 def _rate_limit_error(wire: WireAbort) -> Exception:
     return _proxy_rate_limit_error((None if wire.error is None else as_str_mapping(wire.error.fields)) or {})
 
@@ -641,7 +500,10 @@ def _proxy_rate_limit_error(fields: Mapping[str, object]) -> ProxyRateLimitError
 
 def _reraise(wire: WireAbort) -> Exception:
     live: Final = _LIVE.get()
-    token: Final = ((None if wire.error is None else as_str_mapping(wire.error.fields)) or {}).get("token")
+    fields: Final = (None if wire.error is None else as_str_mapping(wire.error.fields)) or {}
+    if fields.get("unverifiable") is True:
+        return RateLimitUnverifiableError()
+    token: Final = fields.get("token")
     raised: Final = None if live is None or not isinstance(token, int) else live.raised.pop(token, None)
     if isinstance(raised, Exception):
         return raised
@@ -649,6 +511,8 @@ def _reraise(wire: WireAbort) -> Exception:
 
 
 def _native_answer(answer: Mapping[str, object], live: LiveRequest) -> Mapping[str, object]:
+    if answer.get("unverifiable") is True:
+        raise RateLimitUnverifiableError()
     raised_token: Final = answer.get("raised")
     if isinstance(raised_token, int) and raised_token in live.raised:
         raise live.raised[raised_token]
@@ -700,28 +564,51 @@ def _targeted(hook: Hook, view: object) -> bool:
 class NativeDynamicRateLimiter(RustLogger):
     delegate: CapacityDelegate
     capacity: "NativeModelCapacity"
+    rate_limits: RateLimitStore
+    window_size: int
 
     def __new__(
-        cls, internal_usage_cache: DualCache, time_provider: Callable[[], datetime] | None = None
+        cls,
+        internal_usage_cache: DualCache,
+        time_provider: Callable[[], datetime] | None = None,
+        *,
+        rate_limits: RateLimitStore | None = None,
     ) -> "NativeDynamicRateLimiter":
         from litellm.rust_bridge._native import NativeModelCapacity
 
         register_abort_error(RATE_LIMIT_KIND, _rate_limit_error)
         register_abort_error(RERAISE_KIND, _reraise)
+        store: Final = rate_limits or shared_rate_limit_store(internal_usage_cache)
         v3_limiter: Final = PROXY_MaxParallelRequestsHandler_v3(
-            InternalUsageCache(dual_cache=internal_usage_cache), time_provider=time_provider
+            InternalUsageCache(dual_cache=internal_usage_cache),
+            time_provider=time_provider,
+            rate_limit_store=store,
         )
         delegate: Final = CapacityDelegate(internal_usage_cache, v3_limiter)
-        capacity: Final = NativeModelCapacity(delegate)
+        capacity: Final = NativeModelCapacity(
+            delegate,
+            store._handle,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the engine shares the native store and its memory tier
+            v3_limiter.window_size,
+            v3_limiter.tpm_reservation_enabled,
+            None if time_provider is None else (lambda: time_provider().timestamp()),
+        )
         native: Final = _StashedNative(capacity, capacity.callback())
         manifest: Final = WireManifest.model_validate_json(native.manifest())
         logger: Final = object.__new__(type(manifest.selection.name, (cls,), _namespace(native, manifest)))
         RustLogger.__init__(logger, native, PROJECTIONS)
         logger.delegate = delegate
         logger.capacity = capacity
+        logger.rate_limits = store
+        logger.window_size = v3_limiter.window_size
         return logger
 
-    def __init__(self, internal_usage_cache: DualCache, time_provider: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        internal_usage_cache: DualCache,
+        time_provider: Callable[[], datetime] | None = None,
+        *,
+        rate_limits: RateLimitStore | None = None,
+    ) -> None:
         pass
 
     @property
@@ -823,22 +710,22 @@ class NativeDynamicRateLimiter(RustLogger):
                 answer: Final = await self.capacity.enforce_frame(state, key_inputs(user_api_key_dict), requested_model)
         finally:
             _LIVE.reset(token)
-        raised_token: Final = answer.get("raised")
-        if answer.get("unverifiable") is True and isinstance(raised_token, int):
-            unverifiable: Final = live.raised.get(raised_token)
-            if isinstance(unverifiable, RateLimitUnverifiableError):
-                raise ServiceUnavailableError(
-                    message=RATE_LIMIT_UNVERIFIABLE_MESSAGE, llm_provider="litellm_proxy", model=requested_model
-                ) from unverifiable
+        if answer.get("unverifiable") is True:
+            raise ServiceUnavailableError(
+                message=RATE_LIMIT_UNVERIFIABLE_MESSAGE, llm_provider="litellm_proxy", model=requested_model
+            ) from RateLimitUnverifiableError()
         refused: Final = as_str_mapping(_native_answer(answer, live).get("refused"))
         if refused is not None:
             raise _proxy_rate_limit_error(refused)
 
 
 def build_native_dynamic_rate_limiter(
-    internal_usage_cache: DualCache, time_provider: Callable[[], datetime] | None = None
+    internal_usage_cache: DualCache,
+    time_provider: Callable[[], datetime] | None = None,
+    *,
+    rate_limits: RateLimitStore | None = None,
 ) -> NativeDynamicRateLimiter:
-    return NativeDynamicRateLimiter(internal_usage_cache, time_provider)
+    return NativeDynamicRateLimiter(internal_usage_cache, time_provider, rate_limits=rate_limits)
 
 
 @dataclass(slots=True)
@@ -867,4 +754,5 @@ __all__ = [
     "build_native_dynamic_rate_limiter",
     "native_dynamic_rate_limiter",
     "registered_native_dynamic_rate_limiter",
+    "shared_rate_limit_store",
 ]

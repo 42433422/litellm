@@ -68,8 +68,14 @@ from litellm.litellm_core_utils.core_helpers import as_str_mapping, without
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR, get_hidden_params, set_hidden_params
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.router_rust.surface.health import failure_already_logged, logged_call
-from litellm.router_utils.dynamic_queue import Succeeded
-from litellm.router_utils.dynamic_queue_router import Admission, RequestQueue, bound_request_queue
+from litellm.router_utils.dynamic_queue import CoordinationUnavailable, MatchingFailure, Succeeded
+from litellm.router_utils.dynamic_queue_router import (
+    Admission,
+    DynamicQueueCoordinationError,
+    RequestQueue,
+    StreamReads,
+    bound_request_queue,
+)
 from litellm.types.utils import ModelResponseStream, Usage
 
 if TYPE_CHECKING:
@@ -130,7 +136,9 @@ class StreamAttempt:
     admission: Admission | None = None
     request_queue: RequestQueue | None = None
     reads: int = 0
-    settling: "asyncio.Task[None] | None" = None
+    reading: bool = False
+    settling: "asyncio.Task[None | CoordinationUnavailable] | None" = None
+    congesting: bool = False
     watching: "asyncio.Task[None] | None" = None
 
     @property
@@ -244,7 +252,7 @@ class StreamAttempt:
 
     def settle_admission(
         self, error: BaseException | None = None, *, succeeded: bool = False
-    ) -> "asyncio.Task[None] | None":
+    ) -> "asyncio.Task[None | CoordinationUnavailable] | None":
         """Reports the stream's outcome once, in the background, so it never holds up or replaces what the client
         already read."""
         admission: Final = self.admission
@@ -263,21 +271,37 @@ class StreamAttempt:
             if error is None
             else admission.router.outcome_of(_provider_error(error), retry_after_seconds(_provider_error(error)))
         )
-        self.settling = _record_in_background(admission.finish(outcome))
-        return self.settling
+        self.congesting = isinstance(outcome, MatchingFailure)
+        settling: Final = asyncio.get_running_loop().create_task(admission.finish(outcome))
+        _RECORDINGS.add(settling)
+        settling.add_done_callback(_RECORDINGS.discard)
+        self.settling = settling
+        return settling
 
     async def admission_settled(self) -> None:
         """A recovery admits only after this stream's failure reached the queue, so it never picks the capacity the
         failure is about to congest."""
         settling: Final = self.settling
-        if settling is not None and not settling.done():
-            _ = await asyncio.wait({settling})
+        if settling is None:
+            return
+        _ = await asyncio.wait({settling})
+        unpublished: Final = (
+            settling.cancelled()
+            or settling.exception() is not None
+            or isinstance(settling.result(), CoordinationUnavailable)
+        )
+        if unpublished and self.congesting:
+            raise DynamicQueueCoordinationError(self.group)
+
+    def read_began(self) -> None:
+        self.reading = True
 
     def note_read(self) -> None:
         self.reads += 1
+        self.reading = False
 
-    def _reads_while_held(self, admission: Admission) -> int | None:
-        return self.reads if self.admission is admission else None
+    def _reads_while_held(self, admission: Admission) -> StreamReads | None:
+        return StreamReads(self.reads, self.reading) if self.admission is admission else None
 
     def watch_idle(self) -> "asyncio.Task[None] | None":
         """A stream nobody reads, or one dropped without closing, never runs its own cleanup: its turn goes back,
@@ -322,7 +346,7 @@ class StreamAttempt:
 # --- reporting a stream's outcome ---------------------------------------------------------------
 
 # The background recordings still running, held so none is collected before it finishes.
-_RECORDINGS: Final[set["asyncio.Task[None]"]] = set()  # mutable-ok: tasks leave it when they finish
+_RECORDINGS: Final[set["asyncio.Task[object]"]] = set()  # mutable-ok: tasks leave it when they finish
 
 
 def _provider_error(error: BaseException) -> BaseException:
@@ -373,6 +397,7 @@ async def _areported(
     answers."""
     last: object = None  # rebind-ok: the newest item
     started = False  # rebind-ok: whether an item came
+    attempt.read_began()
     try:
         async for item in items:
             last = item
@@ -381,6 +406,7 @@ async def _areported(
             if observe is not None:
                 observe(item)
             yield item
+            attempt.read_began()
         attempt.settle_admission(succeeded=True)
     except Exception as error:
         attempt.settle_admission(error)

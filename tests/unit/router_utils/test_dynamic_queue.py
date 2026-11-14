@@ -575,14 +575,14 @@ class StallsAfterEnqueue:
     def settings(self) -> QueueSettings:
         return self.inner.settings
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        _ = await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        _ = await self.inner.admit(request, budget_ms, ready_in_ms)
         self.enqueued.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
-        return await self.inner.poll(capacity, waiter_id)
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        return await self.inner.poll(capacity, waiter_id, ready_in_ms)
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
         return await self.inner.renew(capacity, waiter_id, token)
@@ -659,8 +659,8 @@ class HoldsReleases(StallsAfterEnqueue):
         self.held = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
     async def report(
         self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
@@ -726,10 +726,10 @@ class AnswersOnRelease(StallsAfterEnqueue):
         super().__init__(inner)
         self.release = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
         self.enqueued.set()
         await self.release.wait()
-        return await self.inner.admit(request, budget_ms)
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
 
 async def test_a_probe_granted_after_the_queue_budget_ran_out_is_given_back_as_a_timeout() -> None:
@@ -776,8 +776,8 @@ class NeverReleases(StallsAfterEnqueue):
         super().__init__(inner)
         self.releasing = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
     async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
         self.releasing.set()
@@ -891,10 +891,10 @@ class NeverAnswersPolls(StallsAfterEnqueue):
         super().__init__(inner)
         self.polled = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
         self.polled.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -984,8 +984,8 @@ class RecordsLostLeases(StallsAfterEnqueue):
         super().__init__(inner)
         self.lost = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
         renewed: Final = await self.inner.renew(capacity, waiter_id, token)
@@ -1016,3 +1016,97 @@ async def test_a_probe_that_lost_its_lease_stops_renewing_and_never_holds_the_ne
     assert renewing_after_loss == 0
     assert isinstance(next_probe, Probe)
     assert isinstance(await inner.poll(CAPACITY, "third"), Waiting)
+
+
+async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_once_both_are_ready() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.at = 1.0
+    assert isinstance(await backend.admit(_request("p1", priority=1), FAR, ready_in_ms=4_000), Waiting)
+    timer.at = 2.0
+    assert isinstance(await backend.admit(_request("p0", priority=0), FAR, ready_in_ms=3_000), Waiting)
+
+    timer.at = 4.5
+    cooling: Final = {
+        "p1": await backend.poll(CAPACITY, "p1", ready_in_ms=500),
+        "p0": await backend.poll(CAPACITY, "p0", ready_in_ms=500),
+    }
+    timer.at = 5.0
+    p1_turn: Final = await backend.poll(CAPACITY, "p1", ready_in_ms=0)
+    p0_turn: Final = await backend.poll(CAPACITY, "p0", ready_in_ms=0)
+
+    assert cooling == {"p1": Waiting(), "p0": Waiting()}
+    assert p1_turn == Waiting()
+    assert isinstance(p0_turn, Probe)
+
+
+async def test_a_ready_waiter_is_granted_ahead_of_a_higher_priority_one_its_deployment_still_cools() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.at = 1.0
+    _ = await backend.admit(_request("cooling-p0", priority=0), FAR, ready_in_ms=10_000)
+
+    ready_p5: Final = await backend.admit(_request("ready-p5", priority=5), FAR)
+
+    assert isinstance(ready_p5, Probe)
+
+
+async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place_without_a_new_generation() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0), ("later", 1))
+    timer.at = 1.0
+    assert await backend.poll(CAPACITY, "later", ready_in_ms=5_000) == Waiting()
+
+    refreshed: Final = await backend.poll(CAPACITY, "owner", ready_in_ms=2_000)
+    timer.at = 3.0
+    owner_turn: Final = await backend.poll(CAPACITY, "owner")
+
+    assert refreshed == Waiting()
+    assert isinstance(owner_turn, Probe) and owner_turn.generation == 1
+
+
+async def test_a_matching_failure_between_the_readiness_read_and_the_claim_is_never_dispatched() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0))
+    timer.at = 1.0
+
+    await _congest(backend)
+    after_failure: Final = await backend.poll(CAPACITY, "owner", ready_in_ms=0)
+
+    assert after_failure == Waiting()
+
+
+async def test_a_recovery_snapshot_admits_its_first_ready_member_and_keeps_a_cooling_ones_place() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _recovered(timer, backend, ("first", 1), ("second", 2))
+
+    first_cooling: Final = await backend.poll(CAPACITY, "first", ready_in_ms=2_000)
+    second: Final = await backend.poll(CAPACITY, "second")
+    timer.at = 3.0
+    first: Final = await backend.poll(CAPACITY, "first")
+
+    assert first_cooling == Waiting(ahead=0)
+    assert isinstance(second, Released)
+    assert isinstance(first, Released)
+
+
+async def test_a_controller_wait_stays_queued_until_its_readiness_ends() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, recheck_ms=250)
+    await _congest(backend)
+    queue: Final = DynamicQueue(backend, timer)
+
+    async def cooling_until_five() -> float:
+        return max(5.0 - timer.now(), 0.0)
+
+    admitted: Final = await _run(timer, queue.admit(_request("waiter"), 30.0, cooling_until_five), 0.25)
+
+    assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
+    assert timer.at == 5.0

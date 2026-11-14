@@ -9,12 +9,15 @@ import pytest
 
 import litellm
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
+from litellm.exceptions import MidStreamFallbackError
 from litellm.router_rust.invoke.streaming import (
     StreamAttempt,
     _areported,
     _chat_total_tokens,
+    _FirstChunk,
     _raise_fallback_failure,
     open_attempt_stream,
+    wrap_chat_stream,
 )
 from litellm.router_utils.dynamic_queue import (
     AdmitReply,
@@ -32,12 +35,15 @@ from litellm.router_utils.dynamic_queue import (
 )
 from litellm.router_utils.dynamic_queue_router import (
     Admission,
+    DynamicQueueCoordinationError,
     DynamicQueueFullError,
     DynamicQueueRouter,
     DynamicQueueSettings,
     RequestQueue,
     current_request_queue,
 )
+from litellm.text_completions.streaming_iterator import TextCompletionStreamWrapper
+from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _finished, _reap
 
 CAPACITY: Final = "deployment:d1"
@@ -383,11 +389,11 @@ class _ReportsOnTheTimer:
     def settings(self) -> QueueSettings:
         return self.inner.settings
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
-        return await self.inner.poll(capacity, waiter_id)
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        return await self.inner.poll(capacity, waiter_id, ready_in_ms)
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
         return await self.inner.renew(capacity, waiter_id, token)
@@ -470,3 +476,173 @@ async def _recovered_or_error(attempt: StreamAttempt) -> Exception:
     except Exception as error:  # noqa: BLE001  # the error the wrapper hands to its fallback failure
         return error
     raise AssertionError("the recovery was refused")
+
+
+def _chunk(text: str) -> ModelResponseStream:
+    return ModelResponseStream(
+        model="gpt-x", choices=[StreamingChoices(index=0, delta=Delta(role="assistant", content=text))]
+    )
+
+
+class _SlowUpstream:
+    """A provider stream whose second chunk arrives only when the test releases it."""
+
+    def __init__(self) -> None:
+        self.asked_for_more = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def chunks(self, first_too: bool) -> AsyncIterator[object]:
+        if first_too:
+            yield _chunk("first")
+        self.asked_for_more.set()
+        await self.release.wait()
+        yield _chunk("second")
+
+
+async def _chat_wrapper_over(attempt: StreamAttempt, rest: AsyncIterator[object]) -> AsyncIterator[object]:
+    model_response: Final = await litellm.acompletion(
+        model="openai/gpt-x", messages=[{"role": "user", "content": "hi"}], mock_response="unused", stream=True
+    )
+    return wrap_chat_stream(attempt, model_response, _FirstChunk(chunk=_chunk("first"), rest=rest))  # pyright: ignore[reportArgumentType]  # the mock call answers a stream
+
+
+async def test_a_chat_stream_waiting_on_a_slow_provider_read_keeps_its_turn_past_the_idle_bound() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("acompletion", probe)
+    upstream: Final = _SlowUpstream()
+    stream: Final = await _chat_wrapper_over(attempt, upstream.chunks(first_too=False))
+    read: Final[list[object]] = []
+
+    async def consume() -> None:
+        async for chunk in stream:
+            read.append(chunk)
+
+    reader: Final = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(upstream.asked_for_more.wait(), 10)
+        await timer.parked(count=2)
+        timer.advance(_idle_bound_s(router))
+        await timer.parked(count=2)
+        timer.advance(_idle_bound_s(router))
+        await timer.parked(count=2)
+        held: Final = not await _next_probe_granted_at_once(timer, router)
+        upstream.release.set()
+        await _finished(reader)
+    finally:
+        await _reap(reader)
+    await _settled(attempt)
+
+    assert held is True
+    assert len(read) == 2
+    assert await _busy(router) is False
+
+
+async def test_a_text_stream_paused_between_chunks_gives_its_turn_back_and_keeps_streaming() -> None:
+    timer: Final = ManualTimer()
+    router, probe = await _probe(timer)
+    attempt: Final = _outer_attempt("atext_completion", probe)
+    upstream: Final = _SlowUpstream()
+    stream: Final = await open_attempt_stream(
+        attempt, TextCompletionStreamWrapper(completion_stream=upstream.chunks(first_too=True), model="gpt-x")
+    )
+    await timer.parked(count=2)
+    _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
+
+    timer.advance(_idle_bound_s(router))
+    await timer.parked(count=2)
+    timer.advance(_idle_bound_s(router))
+    await _watched(attempt)
+    released: Final = await _next_probe_granted_at_once(timer, router)
+    upstream.release.set()
+    rest: Final = [chunk async for chunk in stream]  # pyright: ignore[reportGeneralTypeIssues]  # see above
+
+    assert upstream.asked_for_more.is_set()
+    assert released is True
+    assert len(rest) == 1
+
+
+class _CannotPublish(_ReportsOnTheTimer):
+    async def report(
+        self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
+    ) -> None | CoordinationUnavailable:
+        return CoordinationUnavailable(reason="redis_unavailable")
+
+
+@pytest.mark.parametrize(
+    ("failure", "recovers"),
+    [
+        (_provider_error(429), False),
+        (litellm.RateLimitError(message="deployment at capacity", llm_provider="", model="m"), True),
+    ],
+    ids=["congesting_failure", "failure_that_congests_nothing"],
+)
+async def test_a_stream_failure_the_queue_never_learned_of_ends_its_recovery_as_unavailable(
+    failure: Exception, recovers: bool
+) -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _CannotPublish(timer)
+    await backend.inner.report(CAPACITY, "congests", PassThrough(0), MatchingFailure())
+    timer.advance(1.0)
+    queue: Final = DynamicQueue(backend, timer)
+    request: Final = WaitRequest(CAPACITY, "probe", 0)
+    admitted: Final = await queue.admit(request, 30.0)
+    assert isinstance(admitted, Admitted)
+    held: Final = contextlib.AsyncExitStack()
+    router: Final = DynamicQueueRouter(DynamicQueueSettings(enabled=True), redis=lambda: None, timer=timer)
+    admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, router)
+    core: Final = _RecoveringCore()
+    attempt: Final = _stream_attempt(admission, router.request(0, "r"), core)
+
+    _ = attempt.settle_admission(failure)
+    if recovers:
+        assert await attempt.fallback(RuntimeError("cut")) == "recovered"
+    else:
+        with pytest.raises(DynamicQueueCoordinationError):
+            _ = await attempt.fallback(RuntimeError("cut"))
+
+    assert len(core.recovered_with) == (1 if recovers else 0)
+
+
+async def test_the_real_chat_stream_failing_before_content_ends_with_its_recoverys_queue_rejection() -> None:
+    rejection: Final = DynamicQueueFullError("gpt-x")
+
+    class _RefusingOuterCore(_OuterStreamCore):
+        async def recover_stream(self, *args: object) -> object:
+            raise rejection
+
+    async def cut_before_content() -> AsyncIterator[object]:
+        raise MidStreamFallbackError(
+            message="upstream cut",
+            model="gpt-x",
+            llm_provider="openai",
+            original_exception=_provider_error(500),
+            generated_content="",
+            is_pre_first_chunk=False,
+        )
+        yield _chunk("never")
+
+    attempt: Final = StreamAttempt(
+        core=_RefusingOuterCore(),  # pyright: ignore[reportArgumentType]  # serves only the stream's recovery
+        op="acompletion",
+        request={"stream": True},
+        kwargs={"stream": True},
+        group="group",
+        order=None,
+        depth=0,
+        level=0,
+        deployment_id="d1",
+        attempted_retries=0,
+    )
+    model_response: Final = await litellm.acompletion(
+        model="openai/gpt-x", messages=[{"role": "user", "content": "hi"}], mock_response="unused", stream=True
+    )
+    role_only: Final = ModelResponseStream(
+        model="gpt-x", choices=[StreamingChoices(index=0, delta=Delta(role="assistant"))]
+    )
+    stream: Final = wrap_chat_stream(attempt, model_response, _FirstChunk(chunk=role_only, rest=cut_before_content()))  # pyright: ignore[reportArgumentType]  # the mock call answers a stream
+
+    with pytest.raises(DynamicQueueFullError) as raised:
+        _ = [chunk async for chunk in stream]
+
+    assert raised.value is rejection

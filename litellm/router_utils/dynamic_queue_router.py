@@ -31,7 +31,6 @@ from litellm.router_utils.dynamic_queue import (
     OtherFailure,
     Outcome,
     PassThrough,
-    Probe,
     QueueBackend,
     QueueFull,
     QueueSettings,
@@ -155,26 +154,33 @@ class Admission:
     held: contextlib.AsyncExitStack
     router: "DynamicQueueRouter"
 
-    async def finish(self, outcome: Outcome | None) -> None:
-        if outcome is not None:
-            _ = await self.attempt.report(outcome)
+    async def finish(self, outcome: Outcome | None) -> None | CoordinationUnavailable:
+        """What reporting the outcome came to: a CoordinationUnavailable means the queue never learned it."""
+        reported: Final = None if outcome is None else await self.attempt.report(outcome)
         await self.held.aclose()
+        return reported
 
-    async def went_idle(self, reads: Callable[[], int | None]) -> bool:
-        """Whether a stream went a whole idle bound without a read while it still held its turn; ``reads`` is None
-        once the stream settled its turn itself."""
+    async def went_idle(self, reads: Callable[[], "StreamReads | None"]) -> bool:
+        """Whether a stream sat a whole idle bound with no read in progress and none finished while it still held its
+        turn; ``reads`` is None once the stream settled its turn itself."""
         idle_s: Final = self.router.queue_settings.lease_ms * 3 / 1000
         while await self._read_during(idle_s, reads):
             pass
         return reads() is not None
 
-    async def _read_during(self, idle_s: float, reads: Callable[[], int | None]) -> bool:
+    async def _read_during(self, idle_s: float, reads: Callable[[], "StreamReads | None"]) -> bool:
         before: Final = reads()
         if before is None:
             return False
         await self.router.timer.sleep(idle_s)
         after: Final = reads()
-        return after is not None and after != before
+        return after is not None and (after.in_progress or after.done != before.done)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamReads:
+    done: int
+    in_progress: bool
 
 
 class _Backend(QueueBackend, Protocol):
@@ -199,51 +205,22 @@ class RequestQueue:
         return self._remaining_s if left is None else min(self._remaining_s, left)
 
     async def admit(self, capacity: str, model: str, cooldown_left_s: Callable[[], Awaitable[float]]) -> Admission:
-        """Raises the public error of a refused wait. A probe also waits out its deployment's remaining cooldown."""
+        """Raises the public error of a refused wait. ``cooldown_left_s`` keeps the wait queued, in priority order,
+        until the deployment's own cooldown ends."""
         queue: Final = self.router.queue()
         if isinstance(queue, CoordinationUnavailable):
             raise rejection_error(queue, model)
         self._waits += 1
         request: Final = WaitRequest(capacity, f"{self._request_id}:{self._waits}", self._priority)
         budget: Final = self._budget_s()
-        admitted: Final = await queue.admit(request, budget)
+        admitted: Final = await queue.admit(request, budget, cooldown_left_s)
         if not isinstance(admitted, Admitted):
             raise rejection_error(admitted, model)
         if not isinstance(admitted.grant, PassThrough):
             self._remaining_s = max(self._remaining_s - (budget - admitted.remaining_s), 0.0)
         held: Final = contextlib.AsyncExitStack()
         attempt: Final = await held.enter_async_context(queue.attempt(request, admitted))
-        admission: Final = Admission(attempt, held, self.router)
-        if not isinstance(admitted.grant, Probe):
-            return admission
-        try:
-            await self._wait_out_cooldown(cooldown_left_s, model)
-        except BaseException:
-            await admission.finish(None)
-            raise
-        return admission
-
-    async def _wait_out_cooldown(self, cooldown_left_s: Callable[[], Awaitable[float]], model: str) -> None:
-        timer: Final = self.router.timer
-        started: Final = timer.now()
-
-        async def read() -> float:
-            return await cooldown_left_s()
-
-        try:
-            cooldown_s: Final = await _within(timer, self.router.queue_settings.operation_timeout_ms / 1000, read())
-        except Exception:  # noqa: BLE001  # an unreadable cooldown is unavailable coordination, never a free pass
-            raise rejection_error(CoordinationUnavailable(reason=OPERATION_TIMED_OUT), model) from None
-        if cooldown_s is None:
-            raise rejection_error(CoordinationUnavailable(reason=OPERATION_TIMED_OUT), model)
-        if cooldown_s > self._budget_s():
-            raise rejection_error(QueueTimeout(), model)
-        if cooldown_s > 0:
-            await timer.sleep(cooldown_s)
-        spent_s: Final = timer.now() - started
-        self._remaining_s = max(self._remaining_s - spent_s, 0.0)
-        if spent_s > 0 and self._budget_s() <= 0:
-            raise rejection_error(QueueTimeout(), model)
+        return Admission(attempt, held, self.router)
 
 
 _CURRENT: Final[ContextVar[RequestQueue | None]] = ContextVar("dynamic_queue_request", default=None)
@@ -389,6 +366,7 @@ __all__ = [
     "QueueRejectedError",
     "Records",
     "RequestQueue",
+    "StreamReads",
     "bound_request_queue",
     "capacity_of",
     "congested_ids",

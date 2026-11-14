@@ -243,9 +243,10 @@ from litellm.router_strategy.least_busy import (
     release_started_attempt,
 )
 from litellm.router_utils.cooldown_handlers import get_cooldown_deployment_info, mark_deployment_selection_failure
-from litellm.router_utils.dynamic_queue import CoordinationUnavailable, Succeeded
+from litellm.router_utils.dynamic_queue import CoordinationUnavailable, MatchingFailure, Succeeded
 from litellm.router_utils.dynamic_queue_router import (
     Admission,
+    DynamicQueueCoordinationError,
     DynamicQueueSettings,
     QueueRejectedError,
     capacity_of,
@@ -5336,6 +5337,19 @@ class _Driver:
             return None
         return await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
 
+    async def _settle_failed_admission(
+        self, admission: Admission | None, error: Exception, model: str
+    ) -> DynamicQueueCoordinationError | None:
+        """The terminal coordination error when a congesting failure never reached the queue, so no later attempt
+        finds the capacity healthy."""
+        if admission is None or isinstance(error, QueueRejectedError):
+            return None
+        outcome: Final = admission.router.outcome_of(error, retry_after_seconds(error))
+        reported: Final = await admission.finish(outcome)
+        if isinstance(reported, CoordinationUnavailable) and isinstance(outcome, MatchingFailure):
+            return DynamicQueueCoordinationError(model)
+        return None
+
     async def _cooldown_left_s(self, deployment_id: object) -> float:
         if not isinstance(deployment_id, str):
             return 0.0
@@ -5384,7 +5398,7 @@ class _Driver:
                         if self._plan.kind == "chat":
                             _log_refused_pick(self._request, refused)
                         if admission is not None:
-                            await admission.finish(None)
+                            _ = await admission.finish(None)
                         return await self._refused(step, deployment, call, refused)
                 first_to_log: Final = not failure_already_logged(call.kwargs, "async_failure")
                 logs_failure = first_to_log  # rebind-ok: whether a failure here is this attempt's to log
@@ -5416,7 +5430,7 @@ class _Driver:
                 self._core._endpoints.counters.succeeded(self._plan, call)  # pyright: ignore[reportPrivateUsage]  # see above
         except asyncio.CancelledError:
             if admission is not None:
-                await admission.finish(None)
+                _ = await admission.finish(None)
             if call is not None:
                 await released(
                     self._release(call, attempt, refund_io_tokens=not attempt.answered),
@@ -5428,12 +5442,16 @@ class _Driver:
         except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
             if call is not None:
                 await released(self._release(call, attempt, refund_io_tokens=True))
+            unpublished: Final = await self._settle_failed_admission(
+                admission, error, "" if call is None else call.model_name
+            )
+            if unpublished is not None:
+                self._queue_rejection = unpublished
+                return {**self._failed(step, deployment, call, unpublished), "recorded": True}
             failed: Final = self._failed(step, deployment, call, error)
             if isinstance(error, QueueRejectedError):
                 self._queue_rejection = error
                 return {**failed, "recorded": True}
-            if admission is not None:
-                await admission.finish(admission.router.outcome_of(error, retry_after_seconds(error)))
             if reading_stream is None or not logs_failure:
                 return {
                     **failed,
@@ -5443,7 +5461,7 @@ class _Driver:
             reading_stream.report_first_chunk_failure(error)
             return {**failed, "recorded": True}
         if admission is not None and not stream.reports_outcome:
-            await admission.finish(Succeeded())
+            _ = await admission.finish(Succeeded())
         served: Final = self._succeeded(call, response, call.host_op, stream)
         # The session re-pin the Python core's success callback runs; a wrapped stream runs it when it ends.
         if not served.get("deferred") and self._core.outcome_callbacks(call.kwargs, sync=False).get("success", True):

@@ -63,9 +63,9 @@ async def _no_cooldown() -> float:
     return 0.0
 
 
-def _cooldown(seconds: float) -> "Callable[[], Coroutine[object, object, float]]":
+def _cooling_until(timer: ManualTimer, ends_at: float) -> "Callable[[], Coroutine[object, object, float]]":
     async def left() -> float:
-        return seconds
+        return max(ends_at - timer.now(), 0.0)
 
     return left
 
@@ -197,37 +197,39 @@ def test_a_congesting_failure_holds_the_next_probe_for_its_providers_retry_after
 
 
 @pytest.mark.parametrize(
-    ("cooldown_left_s", "probe_runs_at"),
-    [(0.0, 1.0), (4.0, 5.0)],
+    ("cooldown_ends_at", "probe_runs_at"),
+    [(0.0, 1.0), (5.0, 5.0)],
     ids=["deployment_without_cooldown", "deployment_still_cooling_down"],
 )
-async def test_a_probe_waits_out_what_is_left_of_its_deployments_own_cooldown(
-    cooldown_left_s: float, probe_runs_at: float
+async def test_a_wait_stays_queued_until_its_deployments_own_cooldown_ends(
+    cooldown_ends_at: float, probe_runs_at: float
 ) -> None:
     timer: Final = ManualTimer()
     router: Final = _router(timer)
     await _congest(router, "cap", retry_after_ms=0)
+    cooling: Final = _cooling_until(timer, cooldown_ends_at)
 
-    probe: Final = await _waited(timer, router.request(0, "r").admit("cap", "m", _cooldown(cooldown_left_s)), 0.25)
+    probe: Final = await _waited(timer, router.request(0, "r").admit("cap", "m", cooling), 0.25)
     assert isinstance(probe, Admission)
     await probe.finish(None)
 
     assert timer.at == probe_runs_at
 
 
-async def test_a_probe_whose_cooldown_outlasts_the_queue_time_left_times_out_and_hands_the_probe_on() -> None:
+async def test_a_wait_whose_cooldown_outlasts_the_queue_time_times_out_without_holding_the_probe() -> None:
     timer: Final = ManualTimer()
     router: Final = _router(timer, DynamicQueueSettings(enabled=True, coordination="local", queue_timeout=3.0))
     await _congest(router, "cap", retry_after_ms=0)
+    cooling: Final = _cooling_until(timer, 60.0)
 
-    refused: Final = await _waited(timer, router.request(0, "r").admit("cap", "m", _cooldown(60.0)), 0.25)
+    refused: Final = await _waited(timer, router.request(0, "r").admit("cap", "m", cooling), 0.25)
     handed_on: Final = await _waited(timer, router.request(0, "next").admit("cap", "m", _no_cooldown), 0.25)
 
     assert isinstance(handed_on, Admission)
     await handed_on.finish(None)
 
     assert isinstance(refused, DynamicQueueTimeoutError)
-    assert timer.at == 1.0
+    assert timer.at == 3.0
 
 
 async def test_attempts_a_healthy_capacity_admits_cost_none_of_the_requests_queue_time() -> None:
@@ -438,7 +440,7 @@ def _never_answers(started: asyncio.Event) -> "Callable[[], Coroutine[object, ob
     return left
 
 
-async def test_a_cooldown_lookup_that_never_answers_refuses_the_probe_after_the_operation_timeout() -> None:
+async def test_a_cooldown_lookup_that_never_answers_refuses_the_wait_after_the_operation_timeout() -> None:
     timer: Final = ManualTimer()
     router: Final = _router(timer)
     await _congest(router, "cap", retry_after_ms=0)
@@ -447,7 +449,7 @@ async def test_a_cooldown_lookup_that_never_answers_refuses_the_probe_after_the_
     probe: Final = asyncio.create_task(router.request(0, "r").admit("cap", "m", _never_answers(looking)))
     try:
         await asyncio.wait_for(looking.wait(), 10)
-        await timer.parked(count=2)
+        await timer.parked(count=1)
         timer.advance(router.queue_settings.operation_timeout_ms / 1000)
         refused: Final = await asyncio.wait_for(asyncio.gather(probe, return_exceptions=True), 10)
     finally:
@@ -467,15 +469,15 @@ def _slow_cooldown_lookup(timer: ManualTimer, seconds: float) -> "Callable[[], C
     return left
 
 
-async def test_a_probe_whose_cooldown_lookup_used_up_the_queue_time_is_not_dispatched_late() -> None:
+async def test_a_cooldown_lookup_slower_than_the_queue_time_left_times_out_and_dispatches_nothing() -> None:
     timer: Final = ManualTimer()
     router: Final = _router(timer, DynamicQueueSettings(enabled=True, coordination="local", queue_timeout=0.5))
     await _congest(router, "cap", retry_after_ms=0)
     timer.advance(1.0)
     probe: Final = asyncio.create_task(router.request(0, "r").admit("cap", "m", _slow_cooldown_lookup(timer, 0.75)))
     try:
-        await timer.parked(count=3)
-        timer.advance(0.75)
+        await timer.parked(count=2)
+        timer.advance(0.5)
         refused: Final = await asyncio.wait_for(asyncio.gather(probe, return_exceptions=True), 10)
     finally:
         await _reap(probe)
@@ -484,7 +486,7 @@ async def test_a_probe_whose_cooldown_lookup_used_up_the_queue_time_is_not_dispa
     await handed_on.finish(None)
 
     assert isinstance(refused[0], DynamicQueueTimeoutError)
-    assert timer.at == 1.75
+    assert timer.at == 1.5
 
 
 @pytest.mark.parametrize(("caller_key", "scheduled"), [(None, False), ("caller-own-key", True)])

@@ -449,3 +449,65 @@ async def test_a_shared_capacity_is_shared_within_one_redis_namespace_and_never_
 
     assert isinstance(await same_router.admit(WaitRequest(shared, "same-namespace", 0), FAR), Waiting)
     assert isinstance(await other_router.admit(WaitRequest(shared, "other-namespace", 0), FAR), PassThrough)
+
+
+@pytest.mark.asyncio
+async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_on_another_worker(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    clock.ms = 1_000
+    assert isinstance(await first.admit(WaitRequest(capacity, "p1", 1), FAR, ready_in_ms=4_000), Waiting)
+    clock.ms = 2_000
+    assert isinstance(await second.admit(WaitRequest(capacity, "p0", 0), FAR, ready_in_ms=3_000), Waiting)
+
+    clock.ms = 4_500
+    cooling: Final = (
+        await first.poll(capacity, "p1", ready_in_ms=500),
+        await second.poll(capacity, "p0", ready_in_ms=500),
+    )
+    clock.ms = 5_000
+    p1_turn: Final = await first.poll(capacity, "p1", ready_in_ms=0)
+    p0_turn: Final = await second.poll(capacity, "p0", ready_in_ms=0)
+
+    assert cooling == (Waiting(), Waiting())
+    assert p1_turn == Waiting()
+    assert isinstance(p0_turn, Probe)
+
+
+@pytest.mark.asyncio
+async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("owner", 0, first), ("later", 1, second)])
+    clock.ms = 1_000
+    assert await second.poll(capacity, "later", ready_in_ms=5_000) == Waiting()
+
+    refreshed: Final = await first.poll(capacity, "owner", ready_in_ms=2_000)
+    clock.ms = 3_000
+    owner_turn: Final = await first.poll(capacity, "owner")
+
+    assert refreshed == Waiting()
+    assert isinstance(owner_turn, Probe) and owner_turn.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_snapshot_admits_its_first_ready_member_across_workers(capacity: str) -> None:
+    clock: Final = SharedClock()
+    first, second = _pair(clock, required_successes=1, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("prober", -5, first), ("cooling", 1, first), ("ready", 2, second)])
+    clock.ms = 1_000
+    probe: Final = await first.poll(capacity, "prober")
+    assert isinstance(probe, Probe)
+    assert await first.report(capacity, "prober", probe, Succeeded()) is None
+
+    cooling_early: Final = await first.poll(capacity, "cooling", ready_in_ms=2_000)
+    ready: Final = await second.poll(capacity, "ready")
+    clock.ms = 3_000
+    cooling_late: Final = await first.poll(capacity, "cooling")
+
+    assert cooling_early == Waiting(ahead=0)
+    assert isinstance(ready, Released)
+    assert isinstance(cooling_late, Released)

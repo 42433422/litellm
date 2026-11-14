@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Final
 
 import pytest
+from redis import Redis
 
 from litellm.caching.redis_cache import RedisCache
 from litellm.router_utils.dynamic_queue import (
@@ -20,7 +21,7 @@ from litellm.router_utils.dynamic_queue import (
     Waiting,
     WaitRequest,
 )
-from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend
+from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, _keys
 
 FAR: Final = 1_000_000
 
@@ -325,3 +326,27 @@ async def test_expired_waiters_beyond_the_sweep_limit_are_never_granted_or_reviv
     assert isinstance(unswept, Gone)
     assert isinstance(granted, Probe)
     assert all(isinstance(reply, Gone) for reply in stale_after)
+
+
+def _state_ttl_ms(capacity: str) -> int:
+    with Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])) as redis:
+        ttl: Final = redis.pttl(_keys(capacity)[0])
+    assert isinstance(ttl, int)
+    return ttl
+
+
+@pytest.mark.asyncio
+async def test_congestion_outlives_a_retry_after_longer_than_the_idle_ttl_and_then_expires(capacity: str) -> None:
+    clock: Final = SharedClock()
+    worker: Final = _worker(clock, required_successes=1, state_ttl_ms=60_000)
+    await _congest(worker, capacity, retry_after_ms=900_000)
+
+    congested_ttl: Final = _state_ttl_ms(capacity)
+    clock.ms = 900_000
+    probe: Final = await worker.admit(WaitRequest(capacity, "prober", 0), FAR)
+    assert isinstance(probe, Probe)
+    assert await worker.report(capacity, "prober", probe, Succeeded()) is None
+    recovered_ttl: Final = _state_ttl_ms(capacity)
+
+    assert 900_000 < congested_ttl <= 960_000
+    assert 0 < recovered_ttl <= 60_000

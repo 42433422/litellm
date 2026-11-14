@@ -11,10 +11,13 @@ gone the capacity is healthy again. Another matching failure folds unclaimed wai
 import asyncio
 import bisect
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType, TracebackType
 from typing import Final, Protocol, TypeAlias, TypeVar
+
+
+OPERATION_TIMED_OUT: Final = "operation_timed_out"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +29,7 @@ class QueueSettings:
     liveness_ms: int = 5_000
     recheck_ms: int = 250
     claim_step_ms: int = 10
+    operation_timeout_ms: int = 1_000
     max_waiting: int = 1_000
     state_ttl_ms: int = 600_000
     sweep_limit: int = 64
@@ -111,6 +115,9 @@ class Admitted:
     remaining_s: float
 
 
+_R = TypeVar("_R")
+
+
 class QueueBackend(Protocol):
     @property
     def settings(self) -> QueueSettings: ...
@@ -142,17 +149,52 @@ class MonotonicTimer:
         await asyncio.sleep(seconds)
 
 
-async def _await_owned(*work: "asyncio.Task[object]", interrupted: bool = False) -> None:
-    """Waits for cleanup the caller owns to finish however often the caller is cancelled meanwhile, then raises the
-    cancellation, so the cleanup is never cut short and the cancellation is never swallowed."""
-    if not work:
-        return
+async def _reap(*tasks: "asyncio.Task[object]") -> None:
+    unfinished: Final = tuple(task for task in tasks if not task.done())
+    for task in unfinished:
+        _ = task.cancel()
+    if unfinished:
+        _ = await asyncio.wait(unfinished)
+
+
+async def _race(timer: Timer, seconds: float, work: "asyncio.Task[object]") -> bool:
+    """Whether ``work`` finished within ``seconds``; unfinished work, or work of a cancelled caller, is cancelled."""
+    guard: Final = asyncio.create_task(timer.sleep(seconds))
     try:
-        _ = await asyncio.wait(work)
+        _ = await asyncio.wait((work, guard), return_when=asyncio.FIRST_COMPLETED)
+        return work.done()
+    finally:
+        await _reap(guard, work)
+
+
+async def _until_done(
+    work: "tuple[asyncio.Task[object], ...]", guard: "asyncio.Task[None]", interrupted: bool = False
+) -> bool:
+    try:
+        _ = await asyncio.wait((*work, guard), return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        return await _await_owned(*work, interrupted=True)
+        return await _until_done(work, guard, interrupted=True)
+    if guard.done() or all(task.done() for task in work):
+        return interrupted
+    return await _until_done(work, guard, interrupted)
+
+
+async def _clean_up(timer: Timer, seconds: float, *work: "asyncio.Task[object]") -> bool:
+    """Lets cleanup the caller owns run for up to ``seconds`` however often the caller is cancelled meanwhile, then
+    cancels what is left and raises any cancellation it held back. Returns whether all of it finished in time."""
+    if not work:
+        return True
+    guard: Final = asyncio.create_task(timer.sleep(seconds))
+    interrupted: Final = await _until_done(work, guard)
+    finished: Final = all(task.done() for task in work)
+    await _reap(guard, *work)
     if interrupted:
         raise asyncio.CancelledError
+    return finished
+
+
+def _operation_s(backend: QueueBackend) -> float:
+    return backend.settings.operation_timeout_ms / 1000
 
 
 class Attempt:
@@ -177,11 +219,11 @@ class Attempt:
     ) -> None:
         renewal: Final = self._stop_renewal()
         if self._settled or not isinstance(self._grant, Probe):
-            await _await_owned(*renewal)
+            _ = await _clean_up(self._timer, _operation_s(self._backend), *renewal)
             return
         self._settled = True
         release: Final = asyncio.create_task(self._backend.abandon(self._request.capacity, self._request.waiter_id))
-        await _await_owned(release, *renewal)
+        _ = await _clean_up(self._timer, _operation_s(self._backend), release, *renewal)
 
     async def report(self, outcome: Outcome) -> None | CoordinationUnavailable:
         if self._settled:
@@ -191,7 +233,8 @@ class Attempt:
         sent: Final = asyncio.create_task(
             self._backend.report(self._request.capacity, self._request.waiter_id, self._grant, outcome)
         )
-        await _await_owned(sent, *renewal)
+        if not await _clean_up(self._timer, _operation_s(self._backend), sent, *renewal):
+            return CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         return sent.result()
 
     async def _renew(self, token: int) -> None:
@@ -218,7 +261,8 @@ class DynamicQueue:
 
     async def admit(self, request: WaitRequest, budget_s: float) -> Admitted | Rejection:
         """Wait for ``request``'s turn on its capacity for at most ``budget_s``, the queue time the request has left.
-        ``Admitted.remaining_s`` is what a later wait of the same request may still spend."""
+        ``Admitted.remaining_s`` is what a later wait of the same request may still spend. A healthy capacity admits
+        even with no budget left; a congested one never grants past the budget."""
         deadline: Final = self._timer.now() + max(budget_s, 0.0)
         try:
             settled: Final = await self._settle(request, deadline)
@@ -240,31 +284,50 @@ class DynamicQueue:
             return settings.recheck_ms / 1000
         return min(settings.recheck_ms, settings.claim_step_ms * (waiting.ahead + 1)) / 1000
 
+    async def _within(self, call: Coroutine[object, object, _R], seconds: float) -> _R | None:
+        work: Final = asyncio.create_task(call)
+        return work.result() if await _race(self._timer, seconds, work) else None
+
+    def _in_time(self, grant: Grant | QueueFull | CoordinationUnavailable, deadline: float) -> Grant | Rejection:
+        late: Final = isinstance(grant, (Probe, Released)) and self._timer.now() >= deadline
+        return QueueTimeout() if late else grant
+
     async def _settle(self, request: WaitRequest, deadline: float) -> Grant | Rejection:
         budget_ms: Final = max(int((deadline - self._timer.now()) * 1000), 0)
-        first: Final = await self._backend.admit(request, budget_ms)
+        first: Final = await self._within(self._backend.admit(request, budget_ms), _operation_s(self._backend))
+        if first is None:
+            return CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         if isinstance(first, Gone):
             return QueueTimeout()
-        if not isinstance(first, Waiting):
-            return first
-        return await self._wait(request, deadline, first)
+        if isinstance(first, Waiting):
+            return await self._wait(request, deadline, first)
+        return self._in_time(first, deadline)
 
     async def _wait(self, request: WaitRequest, deadline: float, waiting: Waiting) -> Grant | Rejection:
+        operation_s: Final = _operation_s(self._backend)
         delay: float = self._delay(waiting)  # rebind-ok: each poll's reply sets how soon to recheck
         while True:
             remaining: Final = deadline - self._timer.now()
             if remaining <= 0:
                 return QueueTimeout()
             await self._timer.sleep(min(delay, remaining))
-            polled: Final = await self._backend.poll(request.capacity, request.waiter_id)
+            left: Final = deadline - self._timer.now()
+            if left <= 0:
+                return QueueTimeout()
+            polled: Final = await self._within(
+                self._backend.poll(request.capacity, request.waiter_id), min(operation_s, left)
+            )
+            if polled is None:
+                return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
             if isinstance(polled, Gone):
                 return QueueTimeout()
             if not isinstance(polled, Waiting):
-                return polled
+                return self._in_time(polled, deadline)
             delay = self._delay(polled)
 
     async def _abandon(self, request: WaitRequest) -> None:
-        await _await_owned(asyncio.create_task(self._backend.abandon(request.capacity, request.waiter_id)))
+        release: Final = asyncio.create_task(self._backend.abandon(request.capacity, request.waiter_id))
+        _ = await _clean_up(self._timer, _operation_s(self._backend), release)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,9 +362,6 @@ class _Capacity:
     @property
     def healthy(self) -> bool:
         return not self.congested and not self.snapshot
-
-
-_R = TypeVar("_R")
 
 
 def _order(waiter: _Waiter) -> tuple[int, int]:

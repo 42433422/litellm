@@ -3,7 +3,8 @@
 Each operation is one Lua script call over five keys sharing a hash tag, so it is atomic and lands on one Redis
 Cluster slot. Time is Redis ``TIME``, the one clock every worker agrees on. Waiters sort by member text, so the order
 is exact for any integer priority and FIFO by an atomic sequence within one, with no floating-point score. A waiter's
-own expiry is checked before it is granted, claimed or kept alive, so the bounded sweep only reclaims space.
+own expiry is checked before it is granted, claimed or kept alive, so the bounded sweep only reclaims space. Every
+write keeps the keys alive ``state_ttl_ms`` past the latest of the next probe time, the lease and any waiter's expiry.
 """
 
 import logging
@@ -183,8 +184,13 @@ local function recover()
 end
 
 local function touch()
+  local horizon = math.max(num('next_probe'), num('lease_until'), now)
+  local latest = redis.call('ZRANGE', expiry, -1, -1, 'WITHSCORES')[2]
+  if latest then
+    horizon = math.max(horizon, tonumber(latest))
+  end
   for _, key in ipairs(KEYS) do
-    redis.call('PEXPIRE', key, ttl_ms)
+    redis.call('PEXPIRE', key, horizon - now + ttl_ms)
   end
 end
 

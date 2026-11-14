@@ -1,10 +1,11 @@
 import asyncio
-from collections.abc import Sequence
-from typing import Final
+from collections.abc import Coroutine, Sequence
+from typing import Final, TypeVar
 
 import pytest
 
 from litellm.router_utils.dynamic_queue import (
+    OPERATION_TIMED_OUT,
     AdmitReply,
     Admitted,
     CoordinationUnavailable,
@@ -13,8 +14,8 @@ from litellm.router_utils.dynamic_queue import (
     Grant,
     LocalQueueBackend,
     MatchingFailure,
-    Outcome,
     OtherFailure,
+    Outcome,
     PassThrough,
     PollReply,
     Probe,
@@ -30,14 +31,18 @@ from litellm.router_utils.dynamic_queue import (
 
 CAPACITY: Final = "deployment-a"
 FAR: Final = 1_000_000
+SAFEGUARD_S: Final = 10.0
+MAX_STEPS: Final = 1_000
+_T = TypeVar("_T")
 
 
 class ManualTimer:
-    """Time moves only when the test advances it, and a test can wait until a task is parked on a sleep."""
+    """Time moves only when the test advances it. A test can wait until a given task, or any task, is parked on one of
+    its sleeps; sleeps that other tasks run as operation guards never count as that task being parked."""
 
     def __init__(self) -> None:
         self.at = 0.0
-        self._sleepers: list[tuple[float, asyncio.Future[None]]] = []
+        self._sleepers: list[tuple[float, asyncio.Future[None], asyncio.Task[object] | None]] = []
         self._changed = asyncio.Condition()
 
     def now(self) -> float:
@@ -45,30 +50,61 @@ class ManualTimer:
 
     async def sleep(self, seconds: float) -> None:
         wake: Final = asyncio.get_running_loop().create_future()
-        self._sleepers.append((self.at + seconds, wake))
+        self._sleepers.append((self.at + seconds, wake, asyncio.current_task()))
         async with self._changed:
             self._changed.notify_all()
         await wake
 
     def pending(self) -> int:
-        return sum(1 for _, wake in self._sleepers if not wake.done())
+        return sum(1 for _, wake, _ in self._sleepers if not wake.done())
 
-    async def _sleeping(self, count: int) -> None:
+    def _is_parked(self, task: "asyncio.Task[object] | None", count: int) -> bool:
+        if task is None:
+            return self.pending() >= count
+        return task.done() or any(owner is task and not wake.done() for _, wake, owner in self._sleepers)
+
+    async def _until_parked(self, task: "asyncio.Task[object] | None", count: int) -> None:
         async with self._changed:
-            await self._changed.wait_for(lambda: self.pending() >= count)
+            await self._changed.wait_for(lambda: self._is_parked(task, count))
 
-    async def parked(self, task: "asyncio.Task[Admitted | Rejection] | None" = None, count: int = 1) -> None:
-        sleeping: Final = asyncio.create_task(self._sleeping(count))
-        waited: Final = {sleeping} if task is None else {sleeping, task}
-        await asyncio.wait(waited, return_when=asyncio.FIRST_COMPLETED)
-        sleeping.cancel()
+    async def parked(self, task: "asyncio.Task[object] | None" = None, count: int = 1) -> None:
+        watcher: Final = asyncio.create_task(self._until_parked(task, count))
+        try:
+            done, _ = await asyncio.wait(
+                {watcher} if task is None else {watcher, task}, timeout=SAFEGUARD_S, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert done, "deadlock safeguard: nothing parked on the timer"
+        finally:
+            await _reap(watcher)
 
     def advance(self, seconds: float) -> None:
         self.at += seconds
-        for due, wake in self._sleepers:
+        for due, wake, _ in self._sleepers:
             if due <= self.at and not wake.done():
                 wake.set_result(None)
-        self._sleepers = [(due, wake) for due, wake in self._sleepers if not wake.done()]
+        self._sleepers = [sleeper for sleeper in self._sleepers if not sleeper[1].done()]
+
+
+async def _reap(*tasks: "asyncio.Task[object]") -> None:
+    """Cancels and awaits every task a test spawned, failing instead of hanging if one ignores the cancellation."""
+    for task in tasks:
+        _ = task.cancel()
+    if not tasks:
+        return
+    _, stuck = await asyncio.wait(tasks, timeout=SAFEGUARD_S)
+    assert not stuck, "deadlock safeguard: a task ignored its cancellation"
+    for task in tasks:
+        _ = None if task.cancelled() else task.exception()
+
+
+async def _finished(task: "asyncio.Task[_T]") -> _T:
+    done, _ = await asyncio.wait({task}, timeout=SAFEGUARD_S)
+    assert done, "deadlock safeguard: the task never finished"
+    return task.result()
+
+
+async def _signalled(event: asyncio.Event) -> None:
+    await asyncio.wait_for(event.wait(), SAFEGUARD_S)
 
 
 def _backend(timer: ManualTimer, **overrides: int) -> LocalQueueBackend:
@@ -100,12 +136,20 @@ async def _probed(backend: LocalQueueBackend, waiter_ids: Sequence[str]) -> tupl
     return probes[0]
 
 
-async def _run(timer: ManualTimer, task: "asyncio.Task[Admitted | Rejection]", step: float) -> Admitted | Rejection:
-    while True:
-        await timer.parked(task)
-        if task.done():
-            return task.result()
-        timer.advance(step)
+async def _run(
+    timer: ManualTimer, call: Coroutine[object, object, Admitted | Rejection], step: float
+) -> Admitted | Rejection:
+    """Advances time ``step`` at a time whenever the call is parked on a recheck, until it settles."""
+    task: Final = asyncio.create_task(call)
+    try:
+        for _ in range(MAX_STEPS):
+            await timer.parked(task)
+            if task.done():
+                return task.result()
+            timer.advance(step)
+        raise AssertionError("deadlock safeguard: the call never settled")
+    finally:
+        await _reap(task)
 
 
 async def test_a_healthy_capacity_admits_every_attempt_without_holding_a_queue_place() -> None:
@@ -384,7 +428,7 @@ async def test_a_waiter_times_out_on_its_budget_and_gives_its_place_back() -> No
     await _congest(backend, retry_after_ms=FAR)
     queue: Final = DynamicQueue(backend, timer)
 
-    result: Final = await _run(timer, asyncio.create_task(queue.admit(_request("a"), 1.0)), 0.25)
+    result: Final = await _run(timer, queue.admit(_request("a"), 1.0), 0.25)
 
     assert isinstance(result, QueueTimeout)
     assert timer.at == 1.0
@@ -397,7 +441,7 @@ async def test_an_admitted_waiter_keeps_the_rest_of_its_budget_for_a_later_wait(
     await _congest(backend)
     queue: Final = DynamicQueue(backend, timer)
 
-    result: Final = await _run(timer, asyncio.create_task(queue.admit(_request("a"), 2.5)), 0.25)
+    result: Final = await _run(timer, queue.admit(_request("a"), 2.5), 0.25)
 
     assert isinstance(result, Admitted) and isinstance(result.grant, Probe)
     assert result.remaining_s == 1.5
@@ -417,11 +461,13 @@ async def test_cancelling_a_waiter_removes_it_from_the_queue() -> None:
     backend: Final = _backend(timer, max_waiting=1)
     await _congest(backend, retry_after_ms=FAR)
     waiter: Final = asyncio.create_task(DynamicQueue(backend, timer).admit(_request("a"), 30.0))
-    await timer.parked(waiter)
-
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
+    try:
+        await timer.parked(waiter)
+        _ = waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await _finished(waiter)
+    finally:
+        await _reap(waiter)
 
     assert isinstance(await backend.admit(_request("b"), FAR), Waiting)
 
@@ -464,11 +510,13 @@ async def test_cancelling_while_the_enqueue_reply_is_in_flight_still_removes_the
     await _congest(inner, retry_after_ms=FAR)
     stalling: Final = StallsAfterEnqueue(inner)
     waiter: Final = asyncio.create_task(DynamicQueue(stalling, timer).admit(_request("a"), 30.0))
-    await stalling.enqueued.wait()
-
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
+    try:
+        await _signalled(stalling.enqueued)
+        _ = waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await _finished(waiter)
+    finally:
+        await _reap(waiter)
 
     assert isinstance(await inner.admit(_request("b"), FAR), Waiting)
 
@@ -476,7 +524,7 @@ async def test_cancelling_while_the_enqueue_reply_is_in_flight_still_removes_the
 async def _probe_attempt(timer: ManualTimer, backend: LocalQueueBackend) -> tuple[DynamicQueue, Admitted]:
     await _congest(backend)
     queue: Final = DynamicQueue(backend, timer)
-    admitted: Final = await _run(timer, asyncio.create_task(queue.admit(_request("prober"), 100.0)), 0.25)
+    admitted: Final = await _run(timer, queue.admit(_request("prober"), 100.0), 0.25)
     assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
     return queue, admitted
 
@@ -539,8 +587,7 @@ async def _held_probe(timer: ManualTimer) -> tuple[LocalQueueBackend, HoldsRelea
     inner: Final = _backend(timer, required_successes=1)
     await _congest(inner)
     holding: Final = HoldsReleases(inner)
-    waiting: Final = asyncio.create_task(DynamicQueue(holding, timer).admit(_request("p"), 9.0))
-    admitted: Final = await _run(timer, waiting, 1.0)
+    admitted: Final = await _run(timer, DynamicQueue(holding, timer).admit(_request("p"), 9.0), 1.0)
     assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
     await _enqueue(inner, ("behind", 0))
     return inner, holding, admitted
@@ -562,16 +609,127 @@ async def test_cancelling_a_probe_while_its_release_is_in_flight_finishes_the_re
             _ = await attempt.report(Succeeded())
 
     running: Final = asyncio.create_task(probe())
-    if not reports:
-        await timer.parked()
-        running.cancel()
-    await holding.held.wait()
-    running.cancel()
-    running.cancel()
-    holding.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    try:
+        if not reports:
+            await timer.parked()
+            _ = running.cancel()
+        await _signalled(holding.held)
+        _ = running.cancel()
+        _ = running.cancel()
+        holding.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _finished(running)
+    finally:
+        await _reap(running)
 
     after: Final = await inner.poll(CAPACITY, "behind")
     assert isinstance(after, Released if reports else Probe)
+    assert timer.pending() == 0
+
+
+class AnswersOnRelease(StallsAfterEnqueue):
+    """Answers admission only when the test says so, like a slow Redis round trip."""
+
+    def __init__(self, inner: LocalQueueBackend) -> None:
+        super().__init__(inner)
+        self.release = asyncio.Event()
+
+    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+        self.enqueued.set()
+        await self.release.wait()
+        return await self.inner.admit(request, budget_ms)
+
+
+async def test_a_probe_granted_after_the_queue_budget_ran_out_is_given_back_as_a_timeout() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer)
+    await _congest(inner)
+    timer.at = 1.0
+    slow: Final = AnswersOnRelease(inner)
+    late: Final = asyncio.create_task(DynamicQueue(slow, timer).admit(_request("late"), 0.5))
+    try:
+        await _signalled(slow.enqueued)
+        timer.advance(0.6)
+        slow.release.set()
+        result: Final = await _finished(late)
+    finally:
+        await _reap(late)
+
+    assert isinstance(result, QueueTimeout)
+    assert isinstance(await inner.admit(_request("next"), FAR), Probe)
+
+
+async def test_an_unanswered_admission_is_given_up_after_the_operation_timeout() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer, max_waiting=1, operation_timeout_ms=1_000)
+    await _congest(inner, retry_after_ms=FAR)
+    stalling: Final = StallsAfterEnqueue(inner)
+    waiter: Final = asyncio.create_task(DynamicQueue(stalling, timer).admit(_request("a"), 30.0))
+    try:
+        await _signalled(stalling.enqueued)
+        await timer.parked()
+        timer.advance(1.0)
+        result: Final = await _finished(waiter)
+    finally:
+        await _reap(waiter)
+
+    assert result == CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+    assert isinstance(await inner.admit(_request("b"), FAR), Waiting)
+
+
+class NeverReleases(StallsAfterEnqueue):
+    """Admits normally but never answers a release, like Redis going silent mid-cleanup."""
+
+    def __init__(self, inner: LocalQueueBackend) -> None:
+        super().__init__(inner)
+        self.releasing = asyncio.Event()
+
+    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms)
+
+    async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
+        self.releasing.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_cancelling_a_waiter_gives_up_an_unanswered_release_after_the_operation_timeout() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer)
+    await _congest(inner, retry_after_ms=FAR)
+    silent: Final = NeverReleases(inner)
+    waiter: Final = asyncio.create_task(DynamicQueue(silent, timer).admit(_request("a"), 30.0))
+    try:
+        await timer.parked(waiter)
+        _ = waiter.cancel()
+        await _signalled(silent.releasing)
+        await timer.parked()
+        timer.advance(1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await _finished(waiter)
+    finally:
+        await _reap(waiter)
+
+    assert timer.pending() == 0
+
+
+async def test_a_report_redis_never_answers_comes_back_as_unavailable_after_the_operation_timeout() -> None:
+    timer: Final = ManualTimer()
+    _, holding, admitted = await _held_probe(timer)
+    attempt: Final = DynamicQueue(holding, timer).attempt(_request("p"), admitted)
+
+    async def probe() -> None | CoordinationUnavailable:
+        async with attempt:
+            return await attempt.report(Succeeded())
+
+    reporting: Final = asyncio.create_task(probe())
+    try:
+        await _signalled(holding.held)
+        await timer.parked()
+        timer.advance(1.0)
+        result: Final = await _finished(reporting)
+    finally:
+        await _reap(reporting)
+
+    assert result == CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
     assert timer.pending() == 0

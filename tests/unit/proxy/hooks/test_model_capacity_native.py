@@ -62,12 +62,13 @@ from litellm.proxy.v2_proxy_fields import (
     DERIVED_RESPONSE_HEADERS_FIELDS,
     PRE_CALL_SOURCES,
 )
-from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitScope
+from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitScope, RateLimitStore
 from litellm.rust_bridge.host import redis_events
 from litellm.types.integrations.custom_logger_v2 import Outcome as AttemptOutcome
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
 from tests.unit.proxy.hooks.model_capacity_golden import golden
 from tests.unit.proxy.hooks.native_capacity_handler import redis_answering_counts
+from tests.unit.redis.stores.fake_rate_limits import FakeRateLimits
 
 pytestmark = pytest.mark.asyncio
 
@@ -2145,3 +2146,8 @@ async def test_the_constructed_limiter_needs_its_router_like_main(isolated: Cloc
     router: Final = _router(("capped", None, 1))
     limiter.update_variables(llm_router=router)
     assert limiter.delegate.llm_router is router
+
+
+async def test_a_store_without_the_native_rate_limits_is_refused_at_construction() -> None:
+    with pytest.raises(TypeError, match="FakeRateLimits"):
+        build_native_dynamic_rate_limiter(DualCache(), rate_limits=RateLimitStore(FakeRateLimits()))

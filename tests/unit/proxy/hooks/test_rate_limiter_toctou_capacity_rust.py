@@ -1,4 +1,5 @@
 import asyncio
+from typing import List
 
 import pytest
 
@@ -113,4 +114,54 @@ async def test_dynamic_rate_limiter_v3_concurrent_bypasses_model_capacity(monkey
         f"concurrent requests passed Phase 1 + Phase 3 despite model RPM={MODEL_RPM}. "
         f"Atomic check-and-increment would block once counter > RPM "
         f"(at most {MAX_SEQUENTIAL_SUCCESSES} sequential successes)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_dynamic_rate_limiter_v3_uses_atomic_check_and_increment(monkeypatch: pytest.MonkeyPatch):
+    """
+    Regression test: dynamic limiter's enforced descriptors flow through
+    the atomic check-and-increment script, not the legacy read_only=True
+    check followed by a separate read_only=False increment.
+
+    When priority is enforced (saturation >= threshold), priority_model is
+    bundled into the atomic call alongside model_saturation_check. When not
+    enforced, priority counter is incremented for tracking only.
+    """
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"high": 0.9, "low": 0.1})
+
+    dual_cache = DualCache()
+    handler = DynamicRateLimitHandler(internal_usage_cache=dual_cache)
+
+    model = "atomic-dyn-model"
+    llm_router = Router(
+        model_list=[
+            {
+                "model_name": model,
+                "litellm_params": {
+                    "model": "gpt-3.5-turbo",
+                    "api_key": "test-key",
+                    "api_base": "test-base",
+                    "tpm": 1000,
+                },
+            }
+        ]
+    )
+    handler.update_variables(llm_router=llm_router)
+    redis = handler.saturation_redis()
+
+    user = UserAPIKeyAuth(api_key=hash_token("dyn-atomic-key"))
+    user.metadata = {"priority": "high"}
+
+    await pre_call_at_saturation(handler, user, model, saturation=0.0)
+
+    atomic_descriptors_observed: List[List[str]] = redis.atomic_descriptor_keys()
+    assert atomic_descriptors_observed, (
+        "Dynamic limiter must route enforced descriptors through "
+        "the atomic check-and-increment script (no legacy read_only=True / "
+        "separate-increment pattern)."
+    )
+    assert "model_saturation_check" in atomic_descriptors_observed[0], (
+        f"Expected model_saturation_check in atomic descriptor set. Got: {atomic_descriptors_observed}"
     )

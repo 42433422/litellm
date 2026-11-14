@@ -6,7 +6,7 @@ use litellm_callbacks_parallel_request_limiter::{
 };
 use litellm_redis_client::{CallTag, current_tag, tagged};
 use litellm_redis_store::{
-    Number as StoreNumber, Send as RedisSend,
+    Error as StoreError, Number as StoreNumber, Send as RedisSend,
     rate_limits::{
         Counter as StoreCounter, Entry, Increment as StoreIncrement, Kind, Local, Scope,
     },
@@ -62,8 +62,13 @@ fn local_value(local: Option<Local>) -> Option<Value> {
     }
 }
 
-fn store_error(error: impl std::fmt::Display) -> CapacityError {
-    CapacityError::Store(error.to_string())
+fn store_error(error: StoreError) -> CapacityError {
+    let kind: &'static str = error.kind().into();
+    CapacityError::Store(format!(
+        "({}, {})",
+        pyfmt::str_repr(kind),
+        pyfmt::str_repr(&litellm_error::Report::new(&error).to_string())
+    ))
 }
 
 fn backfill(ttl: &Value) -> Result<Option<Duration>, CapacityError> {
@@ -203,7 +208,9 @@ impl StoreLimiter {
         }
         let pending = store
             .read_counters(RedisSend::Now, &[store_counter(counter)])
-            .ok_or_else(|| store_error("Redis is not configured"))?;
+            .ok_or_else(|| {
+                CapacityError::Store("the rate limiter has no Redis to run its scripts on".into())
+            })?;
         let reply = self
             .labelled("batch_counter_read_script", pending)
             .await

@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 litellm-callbacks.workspace = true
 litellm-callbacks-parallel-request-limiter.workspace = true
+litellm-error.workspace = true
 litellm-python-compat.workspace = true
 litellm-redis-client.workspace = true
 litellm-redis-store.workspace = true

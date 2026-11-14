@@ -682,7 +682,7 @@ class FakeRedis:
 
 
 @contextmanager
-def _listening() -> Generator[tuple[socket.socket, int], None, None]:
+def listening() -> Generator[tuple[socket.socket, int], None, None]:
     listener: Final = socket.create_server(("127.0.0.1", 0))
     try:
         yield listener, listener.getsockname()[1]
@@ -695,7 +695,7 @@ def fake_redis(
     error: str = "the fake Redis answers only saturation reads", *, emulate: bool = False, read_error: str | None = None
 ) -> Generator[FakeRedis, None, None]:
     servers: Final = ExitStack()
-    listener, port = servers.enter_context(_listening())
+    listener, port = servers.enter_context(listening())
     stopped: Final = threading.Event()
     redis: Final = FakeRedis(port=port, error=error, emulate=emulate, read_error=read_error)
 

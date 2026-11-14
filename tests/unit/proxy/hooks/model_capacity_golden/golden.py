@@ -67,6 +67,15 @@ def _load() -> Mapping[str, list[object]]:
     return loaded
 
 
+def record(recorded: Mapping[str, object]) -> None:
+    stored: Final = {**_load(), **recorded}
+    lines: Final = (
+        f"{json.dumps(node)}: {json.dumps(values, sort_keys=True, separators=(',', ':'))}"
+        for node, values in sorted(stored.items())
+    )
+    GOLDEN_FILE.write_text("{\n" + ",\n".join(lines) + "\n}\n")
+
+
 def begin(node: str) -> None:
     _CASE.set(_Case(node=node))
 

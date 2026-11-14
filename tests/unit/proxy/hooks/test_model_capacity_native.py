@@ -66,8 +66,14 @@ from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitScope,
 from litellm.rust_bridge.host import redis_events
 from litellm.types.integrations.custom_logger_v2 import Outcome as AttemptOutcome
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
-from tests.unit.proxy.hooks.model_capacity_golden import golden
-from tests.unit.proxy.hooks.native_capacity_handler import FakeRedis, counter_key, fake_redis, redis_answering_counts
+from tests.unit.proxy.hooks.model_capacity_golden import golden, scenarios
+from tests.unit.proxy.hooks.native_capacity_handler import (
+    FakeRedis,
+    NativeDynamicRateLimitHandler,
+    counter_key,
+    fake_redis,
+    redis_answering_counts,
+)
 from tests.unit.redis.stores.fake_rate_limits import FakeRateLimits
 
 pytestmark = pytest.mark.asyncio
@@ -2250,3 +2256,28 @@ async def test_the_constructed_limiter_needs_its_router_like_main(isolated: Cloc
 async def test_a_store_without_the_native_rate_limits_is_refused_at_construction() -> None:
     with pytest.raises(TypeError, match="FakeRateLimits"):
         build_native_dynamic_rate_limiter(DualCache(), rate_limits=RateLimitStore(FakeRateLimits()))
+
+
+def _native_handler(cache: DualCache) -> NativeDynamicRateLimitHandler:
+    return NativeDynamicRateLimitHandler(cache)
+
+
+async def _native_pre_call(handler: scenarios.CapacityHandler, auth: UserAPIKeyAuth, data: dict[str, object]) -> object:
+    assert isinstance(handler, NativeDynamicRateLimitHandler)
+    return await handler.async_pre_call_hook(auth, DualCache(), data, "acompletion")
+
+
+async def _recorded_scenario(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    golden.check(await scenarios.SCENARIOS[name](monkeypatch, _native_handler, _native_pre_call))
+
+
+async def test_a_request_batch_takes_the_round_trips_python_takes(monkeypatch: pytest.MonkeyPatch) -> None:
+    await _recorded_scenario(monkeypatch, "test_a_request_batch_takes_the_round_trips_python_takes")
+
+
+async def test_a_redis_outage_fails_open_like_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    await _recorded_scenario(monkeypatch, "test_a_redis_outage_fails_open_like_python")
+
+
+async def test_a_redis_outage_under_fail_closed_is_handled_like_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    await _recorded_scenario(monkeypatch, "test_a_redis_outage_under_fail_closed_is_handled_like_python")

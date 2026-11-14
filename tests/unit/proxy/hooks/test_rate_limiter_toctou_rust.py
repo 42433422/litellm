@@ -23,11 +23,14 @@ import pytest
 from litellm import DualCache
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.batch_rate_limiter import BatchFileUsage
-from litellm.proxy.hooks.parallel_request_limiter_v3 import (
-    PROXY_MaxParallelRequestsHandler_v3,
-)
 from litellm.proxy.utils import InternalUsageCache, hash_token
 from litellm.redis.stores.rate_limits import RateLimitScope
+from tests._support.rust_parallel_request_limiter import PROXY_MaxParallelRequestsHandler_v3
+
+
+@pytest.fixture(autouse=True)
+def _native_parallel_request_limiter(monkeypatch):
+    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
 
 
 def _make_phase1_barrier(num_concurrent: int, timeout: float = 0.1):

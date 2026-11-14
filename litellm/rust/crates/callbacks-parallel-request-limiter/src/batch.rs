@@ -28,6 +28,8 @@ pub struct BatchFacts {
     pub per_model_usage: BTreeMap<String, BTreeMap<String, i64>>,
     #[serde(default)]
     pub enqueued_scopes: Vec<EnqueuedScope>,
+    #[serde(default)]
+    pub counters_after_reservation: bool,
 }
 
 pub struct Refusal {
@@ -198,6 +200,7 @@ mod tests {
                 BTreeMap::from([("total_tokens".to_owned(), 70)]),
             )]),
             enqueued_scopes: Vec::new(),
+            counters_after_reservation: false,
         }
     }
 

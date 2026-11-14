@@ -15,6 +15,7 @@ from pydantic import TypeAdapter
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.redis_batch import active_request_redis_batches
+from litellm.constants import BATCH_TPD_DESCRIPTOR_SUFFIX
 from litellm.integrations.custom_logger_v2.call import CallContext
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
@@ -41,7 +42,10 @@ from litellm.proxy.hooks.batch_enqueued_tokens import (
     BatchEnqueuedTokenStore,
     batch_response_view,
     canonical_provider_batch_id,
+    project_has_model_batch_enqueued_token_limits,
+    project_limits_every_model,
     resolve_batch_enqueued_token_scopes,
+    resolve_project_model_batch_enqueued_token_scopes,
 )
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.rust_bridge.execution import drive
@@ -699,13 +703,19 @@ async def _prepared_batch(
 ) -> Mapping[str, object] | Abort | None:
     from starlette.exceptions import HTTPException
 
+    from litellm.proxy.hooks.batch_rate_limiter import (
+        _rows_were_rewritten_on_upload,  # pyright: ignore[reportPrivateUsage]  # the batch limiter's own upload check
+    )
+
     try:
         input_file_id: Final = data.get("input_file_id")
         if not input_file_id:
             return None
-        enqueued_scopes: Final = resolve_batch_enqueued_token_scopes(auth)
+        key_and_team_scopes: Final = resolve_batch_enqueued_token_scopes(auth)
         should_skip, descriptors = batch._should_skip_batch_input_file_processing(  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own skip decision over the untyped body
-            data=data, user_api_key_dict=auth, has_enqueued_scopes=bool(enqueued_scopes)
+            data=data,
+            user_api_key_dict=auth,
+            has_enqueued_scopes=bool(key_and_team_scopes) or project_has_model_batch_enqueued_token_limits(auth),
         )
         if should_skip:
             return None
@@ -719,21 +729,51 @@ async def _prepared_batch(
         )
         data["_batch_token_count"] = usage.total_tokens  # rebind-ok: the batch limiter reads the counts here
         data["_batch_request_count"] = usage.request_count  # rebind-ok: the batch limiter reads the counts here
-        if enqueued_scopes:
-            return {
-                "descriptors": [],
-                "increments": [],
-                "request_count": usage.request_count,
-                "total_tokens": usage.total_tokens,
-                "enqueued_scopes": [dataclasses.asdict(scope) for scope in enqueued_scopes],
-            }
-        charged: Final = (
-            descriptors
-            if descriptors is not None
-            else batch._create_batch_rate_limit_descriptors(user_api_key_dict=auth, data=data)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own descriptors over the untyped body
+        routing_model: Final = batch._get_batch_routing_model(data)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own routing model over the untyped body
+        row_tokens_by_model: Final[Mapping[str, int]] = MappingProxyType(
+            {model: model_usage.get("total_tokens", 0) for model, model_usage in usage.per_model_usage.items()}
+            if not (isinstance(input_file_id, str) and _rows_were_rewritten_on_upload(input_file_id))
+            else {}
         )
-        io_descriptors, io_increments = batch._create_project_io_descriptors_for_models(  # pyright: ignore[reportPrivateUsage]  # the batch limiter's own descriptors
-            user_api_key_dict=auth, per_model_usage=usage.per_model_usage
+        enqueued_scopes: Final = (
+            *key_and_team_scopes,
+            *resolve_project_model_batch_enqueued_token_scopes(
+                auth,
+                row_tokens_by_model=row_tokens_by_model,
+                routing_model=routing_model,
+                batch_tokens=usage.total_tokens,
+                model_group_of=batch._model_group_of,  # pyright: ignore[reportPrivateUsage]  # the batch limiter's own model grouping
+            ),
+        )
+        project_covers_batch: Final = (
+            bool(enqueued_scopes)
+            and not key_and_team_scopes
+            and routing_model is not None
+            and project_limits_every_model(
+                auth,
+                (routing_model, *row_tokens_by_model),
+                batch._model_group_of,  # pyright: ignore[reportPrivateUsage]  # the batch limiter's own model grouping
+            )
+        )
+        charged: Final = (
+            ()
+            if enqueued_scopes and key_and_team_scopes
+            else tuple(
+                descriptor
+                for descriptor in (
+                    descriptors
+                    if descriptors is not None
+                    else batch._create_batch_rate_limit_descriptors(user_api_key_dict=auth, data=data)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the batch limiter's own descriptors over the untyped body
+                )
+                if not project_covers_batch or descriptor["key"].endswith(BATCH_TPD_DESCRIPTOR_SUFFIX)
+            )
+        )
+        io_descriptors, io_increments = (
+            batch._create_project_io_descriptors_for_models(  # pyright: ignore[reportPrivateUsage]  # the batch limiter's own descriptors
+                user_api_key_dict=auth, per_model_usage=usage.per_model_usage
+            )
+            if not (enqueued_scopes and key_and_team_scopes) and not project_covers_batch
+            else ([], [])
         )
     except HTTPException as error:
         return Abort(status=error.status_code, message=str(error.detail), exception=error)
@@ -749,6 +789,10 @@ async def _prepared_batch(
         "total_tokens": usage.total_tokens,
         "output_tokens": usage.output_tokens,
         "per_model_usage": usage.per_model_usage,
+        "enqueued_scopes": [dataclasses.asdict(scope) for scope in enqueued_scopes],
+        "counters_after_reservation": bool(enqueued_scopes)
+        and not key_and_team_scopes
+        and (bool(charged) or not project_covers_batch),
     }
 
 

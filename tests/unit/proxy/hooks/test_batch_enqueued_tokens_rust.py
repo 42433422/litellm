@@ -15,6 +15,7 @@ import pytest
 
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
+from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.batch_enqueued_tokens import (
     BatchEnqueuedTokenOverLimit,
     BatchEnqueuedTokenReservation,
@@ -98,6 +99,50 @@ async def test_zero_token_reserve_charges_nothing(memory_store: BatchEnqueuedTok
     assert empty == BatchEnqueuedTokenReservation(tokens=0, scopes=(scope,))
     full = await store.reserve(tokens=100, scopes=(scope,))
     assert isinstance(full, BatchEnqueuedTokenReservation)
+
+
+@pytest.mark.asyncio
+async def test_in_memory_project_model_scope_is_charged_and_refunded_its_own_tokens(
+    memory_store: BatchEnqueuedTokenStore,
+):
+    store: Final = memory_store
+    key_scope: Final = _scope(limit=1000, key="api_key")
+    model_scope: Final = BatchEnqueuedTokenScope(
+        key="project_model", value=f"project-{uuid.uuid4().hex}:gpt-5.5", limit=40, tokens=30
+    )
+    reservation: Final = await store.reserve(tokens=100, scopes=(key_scope, model_scope))
+    assert isinstance(reservation, BatchEnqueuedTokenReservation)
+    blocked: Final = BatchEnqueuedTokenScope(key="project_model", value=model_scope.value, limit=40, tokens=20)
+    assert await store.reserve(tokens=1, scopes=(blocked,)) == BatchEnqueuedTokenOverLimit(scope=blocked, enqueued=30)
+
+    await store.refund(reservation)
+    full: Final = BatchEnqueuedTokenScope(key="project_model", value=model_scope.value, limit=40, tokens=40)
+    assert isinstance(await store.reserve(tokens=1, scopes=(full,)), BatchEnqueuedTokenReservation)
+    assert isinstance(await store.reserve(tokens=900, scopes=(key_scope,)), BatchEnqueuedTokenReservation)
+    assert isinstance(await store.reserve(tokens=101, scopes=(key_scope,)), BatchEnqueuedTokenOverLimit)
+
+
+@pytest.mark.asyncio
+async def test_in_memory_project_model_scope_is_charged_its_own_tokens_and_refunded_after_a_round_trip(
+    memory_store: BatchEnqueuedTokenStore,
+):
+    store: Final = memory_store
+    key_scope: Final = _scope(limit=1000, key="api_key")
+    model_scope: Final = BatchEnqueuedTokenScope(
+        key="project_model", value=f"project-{uuid.uuid4().hex}:gpt-5.5", limit=40, tokens=30
+    )
+    reservation: Final = await store.reserve(tokens=100, scopes=(model_scope, key_scope))
+    assert isinstance(reservation, BatchEnqueuedTokenReservation)
+
+    await store.save_reservation("batch_project_model", reservation)
+    popped: Final = await store.pop_reservation("batch_project_model")
+    assert popped == BatchEnqueuedTokenReservation(
+        tokens=100, scopes=(key_scope, model_scope), backend="memory", owner=reservation.owner
+    )
+    await store.refund(popped)
+    assert isinstance(await store.reserve(tokens=1000, scopes=(key_scope,)), BatchEnqueuedTokenReservation)
+    full: Final = BatchEnqueuedTokenScope(key="project_model", value=model_scope.value, limit=40, tokens=40)
+    assert isinstance(await store.reserve(tokens=1, scopes=(full,)), BatchEnqueuedTokenReservation)
 
 
 class _SingleKeyRedisFake:
@@ -197,3 +242,115 @@ class _OpenBreakerRedis:
             raise RedisCircuitBreakerOpenError("Redis circuit breaker is open")
 
         return refused
+
+
+def _counted_batch(monkeypatch: pytest.MonkeyPatch, row_model: str = "gpt-4o", total_tokens: int = 600) -> None:
+    from litellm.proxy.hooks.batch_rate_limiter import BatchFileUsage, PROXY_BatchRateLimiter
+
+    async def counted(*_: object, **__: object) -> BatchFileUsage:
+        return BatchFileUsage(
+            total_tokens=total_tokens,
+            request_count=6,
+            output_tokens=100,
+            per_model_usage={row_model: {"total_tokens": total_tokens, "output_tokens": 100}},
+        )
+
+    monkeypatch.setattr(PROXY_BatchRateLimiter, "count_input_file_usage", counted)
+
+
+def _project_batch_auth(cap: int, **limits: object) -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(
+        api_key=f"project-batch-{uuid.uuid4().hex}",
+        project_id=f"project-{uuid.uuid4().hex}",
+        project_metadata={"model_batch_enqueued_token_limit": {"gpt-4o": cap}},
+        **limits,  # pyright: ignore[reportArgumentType]  # pydantic fields by keyword
+    )
+
+
+async def _submit_batch(handler: PROXY_MaxParallelRequestsHandler_v3, auth: UserAPIKeyAuth) -> object:
+    return await handler.async_pre_call_hook(
+        auth,
+        DualCache(),
+        {"model": "gpt-4o", "input_file_id": "file-abc", "endpoint": "/v1/chat/completions"},
+        "acreate_batch",
+    )
+
+
+async def _project_enqueued(handler: PROXY_MaxParallelRequestsHandler_v3, auth: UserAPIKeyAuth) -> int:
+    probe: Final = BatchEnqueuedTokenScope(key="project_model", value=f"{auth.project_id}:gpt-4o", limit=1)
+    outcome: Final = await handler.batch_enqueued_token_store.reserve(tokens=10**15, scopes=(probe,))
+    assert isinstance(outcome, BatchEnqueuedTokenOverLimit)
+    return outcome.enqueued
+
+
+def _native_handler() -> PROXY_MaxParallelRequestsHandler_v3:
+    return PROXY_MaxParallelRequestsHandler_v3(
+        internal_usage_cache=InternalUsageCache(DualCache(default_in_memory_ttl=60))
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_project_cap_on_the_routing_model_refuses_the_batch_that_would_exceed_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from starlette.exceptions import HTTPException
+
+    _counted_batch(monkeypatch)
+    handler: Final = _native_handler()
+    auth: Final = _project_batch_auth(1000)
+
+    await _submit_batch(handler, auth)
+    with pytest.raises(HTTPException) as exc:
+        await _submit_batch(handler, auth)
+
+    assert exc.value.status_code == 429
+    assert f"project_model: {auth.project_id}:gpt-4o" in str(exc.value.detail)
+    assert "Batch requires 600 tokens but only 400 enqueued tokens remaining out of 1000" in str(exc.value.detail)
+    assert await _project_enqueued(handler, auth) == 600
+
+
+@pytest.mark.asyncio
+async def test_a_project_cap_covering_every_model_lifts_the_per_minute_limits(monkeypatch: pytest.MonkeyPatch):
+    _counted_batch(monkeypatch)
+    handler: Final = _native_handler()
+    auth: Final = _project_batch_auth(10_000, rpm_limit=1, tpm_limit=10)
+
+    await _submit_batch(handler, auth)
+    await _submit_batch(handler, auth)
+
+    assert await _project_enqueued(handler, auth) == 1200
+
+
+@pytest.mark.asyncio
+async def test_a_row_model_outside_the_project_cap_keeps_the_per_minute_limits_and_refunds_the_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from starlette.exceptions import HTTPException
+
+    _counted_batch(monkeypatch, row_model="gpt-4o-mini")
+    handler: Final = _native_handler()
+    auth: Final = _project_batch_auth(10_000, rpm_limit=1)
+
+    with pytest.raises(HTTPException) as exc:
+        await _submit_batch(handler, auth)
+
+    assert exc.value.status_code == 429
+    assert await _project_enqueued(handler, auth) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_project_cap_keeps_the_daily_token_cap_and_refunds_the_reservation_it_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from starlette.exceptions import HTTPException
+
+    _counted_batch(monkeypatch)
+    handler: Final = _native_handler()
+    auth: Final = _project_batch_auth(10_000, tpd_limit=1000)
+
+    await _submit_batch(handler, auth)
+    with pytest.raises(HTTPException) as exc:
+        await _submit_batch(handler, auth)
+
+    assert exc.value.status_code == 429
+    assert await _project_enqueued(handler, auth) == 600

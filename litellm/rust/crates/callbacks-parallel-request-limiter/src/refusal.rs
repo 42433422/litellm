@@ -129,8 +129,9 @@ pub fn batch_enqueued_limited(
     requested_model: Option<&str>,
 ) -> Abort {
     let remaining = (scope.limit - enqueued).max(0);
+    let required = scope.charge(total_tokens);
     let detail = format!(
-        "Batch enqueued token limit exceeded for {}: {}. Batch requires {total_tokens} tokens but only {remaining} enqueued tokens remaining out of {} enqueued token limit. Tokens free up as running batches complete or are cancelled.",
+        "Batch enqueued token limit exceeded for {}: {}. Batch requires {required} tokens but only {remaining} enqueued tokens remaining out of {} enqueued token limit. Tokens free up as running batches complete or are cancelled.",
         scope.key, scope.value, scope.limit,
     );
     let headers = BTreeMap::from([("rate_limit_type".to_owned(), "tokens".to_owned())]);

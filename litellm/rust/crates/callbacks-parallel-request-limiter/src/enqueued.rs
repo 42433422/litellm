@@ -21,7 +21,21 @@ pub struct EnqueuedScope {
     pub key: String,
     pub value: String,
     pub limit: i64,
+    #[serde(default)]
+    pub tokens: Option<i64>,
 }
+
+impl EnqueuedScope {
+    pub fn charge(&self, batch_tokens: i64) -> i64 {
+        self.tokens.unwrap_or(batch_tokens)
+    }
+
+    fn is_project_model(&self) -> bool {
+        self.key == PROJECT_MODEL_SCOPE
+    }
+}
+
+const PROJECT_MODEL_SCOPE: &str = "project_model";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +55,45 @@ pub struct EnqueuedReservation {
     pub owner: String,
     #[serde(default)]
     pub reserved_at_monotonic: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredReservation {
+    tokens: i64,
+    scopes: Vec<EnqueuedScope>,
+    #[serde(default)]
+    backend: ReservationBackend,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    project_scopes: Vec<EnqueuedScope>,
+}
+
+impl StoredReservation {
+    fn of(reservation: &EnqueuedReservation) -> Self {
+        let (project_scopes, scopes) = reservation
+            .scopes
+            .iter()
+            .cloned()
+            .partition(EnqueuedScope::is_project_model);
+        Self {
+            tokens: reservation.tokens,
+            scopes,
+            backend: reservation.backend,
+            owner: reservation.owner.clone(),
+            project_scopes,
+        }
+    }
+
+    fn restored(self, reserved_at: f64) -> EnqueuedReservation {
+        EnqueuedReservation {
+            tokens: self.tokens,
+            scopes: self.scopes.into_iter().chain(self.project_scopes).collect(),
+            backend: self.backend,
+            owner: self.owner,
+            reserved_at_monotonic: Some(reserved_at),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -118,7 +171,7 @@ impl EnqueuedTokens {
         for (index, scope) in scopes.iter().enumerate() {
             let reply = match self.store.enqueued_reserve(
                 &counter_key(scope),
-                tokens,
+                scope.charge(tokens),
                 ENQUEUED_TTL_SECONDS,
                 scope.limit,
             ) {
@@ -162,7 +215,10 @@ impl EnqueuedTokens {
 
     async fn refund_via_redis(&self, tokens: i64, scopes: &[EnqueuedScope]) -> Result<(), Failure> {
         for scope in scopes {
-            match self.store.enqueued_refund(&counter_key(scope), tokens) {
+            match self
+                .store
+                .enqueued_refund(&counter_key(scope), scope.charge(tokens))
+            {
                 Some(pending) => pending.await.map_err(Failure::from)?,
                 None => {
                     return Err(Failure::raised(
@@ -208,7 +264,7 @@ impl EnqueuedTokens {
             if let Some((scope, current)) = scopes
                 .iter()
                 .zip(&currents)
-                .find(|(scope, current)| **current + tokens > scope.limit)
+                .find(|(scope, current)| **current + scope.charge(tokens) > scope.limit)
             {
                 return EnqueuedOutcome::OverLimit {
                     scope: scope.clone(),
@@ -216,7 +272,7 @@ impl EnqueuedTokens {
                 };
             }
             for (scope, current) in scopes.iter().zip(&currents) {
-                self.set_local_counter(scope, current + tokens);
+                self.set_local_counter(scope, current + scope.charge(tokens));
             }
         }
         EnqueuedOutcome::Reservation(EnqueuedReservation {
@@ -257,7 +313,7 @@ impl EnqueuedTokens {
         }
         let _guard = self.store.enqueued_guard();
         for scope in &reservation.scopes {
-            let remaining = self.local_counter(scope) - reservation.tokens;
+            let remaining = self.local_counter(scope) - scope.charge(reservation.tokens);
             if remaining <= 0 {
                 if let Err(error) = self.store.delete_raw_local(&counter_key(scope)) {
                     tracing::warn!(%error, "enqueued-token memory delete failed");
@@ -272,7 +328,7 @@ impl EnqueuedTokens {
         let reserved_at = reservation
             .reserved_at_monotonic
             .unwrap_or_else(|| self.now());
-        let serialized = serialized(reservation, reserved_at);
+        let serialized = serialized(reservation);
         let elapsed = self.now() - reserved_at;
         let ttl_seconds = (ENQUEUED_TTL_SECONDS - elapsed.ceil() as i64).max(1);
         let key = record_key(batch_id);
@@ -318,16 +374,11 @@ impl EnqueuedTokens {
             None => self.pop_local(&key),
         }?;
         let parsed = match raw {
-            Local::Text(text) => serde_json::from_str::<EnqueuedReservation>(&text).ok(),
+            Local::Text(text) => serde_json::from_str::<StoredReservation>(&text).ok(),
             Local::Number(_) | Local::Slots(_) => None,
         };
         match parsed {
-            Some(mut reservation) => {
-                if reservation.reserved_at_monotonic.is_none() {
-                    reservation.reserved_at_monotonic = Some(self.now());
-                }
-                Some(reservation)
-            }
+            Some(stored) => Some(stored.restored(self.now())),
             None => {
                 tracing::warn!(
                     batch_id,
@@ -348,12 +399,8 @@ impl EnqueuedTokens {
     }
 }
 
-pub fn serialized(reservation: &EnqueuedReservation, reserved_at: f64) -> String {
-    serde_json::to_string(&EnqueuedReservation {
-        reserved_at_monotonic: Some(reserved_at),
-        ..reservation.clone()
-    })
-    .unwrap_or_default()
+pub fn serialized(reservation: &EnqueuedReservation) -> String {
+    serde_json::to_string(&StoredReservation::of(reservation)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -372,6 +419,16 @@ mod tests {
             key: key.into(),
             value: "v".into(),
             limit,
+            tokens: None,
+        }
+    }
+
+    fn project_scope(limit: i64, tokens: i64) -> EnqueuedScope {
+        EnqueuedScope {
+            key: "project_model".into(),
+            value: "project-1:gpt-5.5".into(),
+            limit,
+            tokens: Some(tokens),
         }
     }
 
@@ -406,9 +463,9 @@ mod tests {
             panic!("fits");
         };
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&serialized(&granted, 100.0)).unwrap(),
-            json!({"tokens": 10, "scopes": [{"key": "api_key", "value": "v", "limit": 100}],
-                   "backend": "memory", "owner": store.owner, "reserved_at_monotonic": 100.0})
+            serde_json::from_str::<serde_json::Value>(&serialized(&granted)).unwrap(),
+            json!({"tokens": 10, "scopes": [{"key": "api_key", "value": "v", "limit": 100, "tokens": null}],
+                   "backend": "memory", "owner": store.owner, "project_scopes": []})
         );
         store.save("b", &granted).await;
         assert_eq!(store.pop("b").await, Some(granted));
@@ -427,6 +484,49 @@ mod tests {
         granted.owner = "other".into();
         store.refund(&granted).await;
         assert_eq!(store.local_counter(&scope("api_key", 100)), 10);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_project_scope_is_charged_and_refunded_only_its_own_tokens() {
+        let store = tokens();
+        let scopes = vec![scope("api_key", 1000), project_scope(50, 30)];
+        let EnqueuedOutcome::Reservation(granted) = store.reserve(400, scopes.clone()).await else {
+            panic!("fits");
+        };
+        assert_eq!(store.local_counter(&scopes[0]), 400);
+        assert_eq!(store.local_counter(&scopes[1]), 30);
+        assert_eq!(
+            store.reserve(10, vec![project_scope(50, 21)]).await,
+            EnqueuedOutcome::OverLimit {
+                scope: project_scope(50, 21),
+                enqueued: 30,
+            }
+        );
+        store.refund(&granted).await;
+        assert_eq!(store.local_counter(&scopes[0]), 0);
+        assert_eq!(store.local_counter(&scopes[1]), 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_saved_record_keeps_project_scopes_apart_and_restores_them_last() {
+        let store = tokens();
+        let EnqueuedOutcome::Reservation(granted) = store
+            .reserve(40, vec![project_scope(100, 40), scope("team", 100)])
+            .await
+        else {
+            panic!("fits");
+        };
+        let stored: serde_json::Value = serde_json::from_str(&serialized(&granted)).unwrap();
+        assert_eq!(stored["scopes"], json!([{"key": "team", "value": "v", "limit": 100, "tokens": null}]));
+        assert_eq!(
+            stored["project_scopes"],
+            json!([{"key": "project_model", "value": "project-1:gpt-5.5", "limit": 100, "tokens": 40}])
+        );
+        store.save("b", &granted).await;
+        let popped = store.pop("b").await.unwrap();
+        assert_eq!(popped.scopes, vec![scope("team", 100), project_scope(100, 40)]);
     }
 
     #[rstest]

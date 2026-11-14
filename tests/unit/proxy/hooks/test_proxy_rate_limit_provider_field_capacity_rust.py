@@ -9,7 +9,7 @@ from tests.unit.proxy.hooks.native_capacity_handler import (
     NativeDynamicRateLimitHandler as PROXY_DynamicRateLimitHandlerV3,
 )
 from litellm.redis.stores.rate_limits import RateLimitScope
-from tests.unit.proxy.hooks.native_capacity_handler import seed_counter
+from tests.unit.proxy.hooks.native_capacity_handler import pre_call_at_saturation, seed_counter
 
 
 def _gpt_4o_mini(rpm: int) -> Router:
@@ -33,7 +33,7 @@ async def test_dynamic_rate_limiter_v3_model_capacity_path_populates_provider():
     user_api_key_dict.metadata = {}
 
     with pytest.raises(HTTPException) as exc_info:
-        await handler.async_pre_call_hook(user_api_key_dict, DualCache(), {"model": "gpt-4o-mini"}, "acompletion")
+        await pre_call_at_saturation(handler, user_api_key_dict, "gpt-4o-mini", saturation=1.0)
 
     exc = exc_info.value
     assert exc.status_code == 429

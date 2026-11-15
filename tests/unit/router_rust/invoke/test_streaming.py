@@ -293,6 +293,14 @@ def _idle_bound_s(router: DynamicQueueRouter) -> float:
     return router.queue_settings.lease_ms * 3 / 1000
 
 
+async def _advance_idle_bound(timer: ManualTimer, router: DynamicQueueRouter) -> None:
+    """Steps shorter than the lease renewal interval, so the probe's lease stays renewed as it would in real time."""
+    step: Final = 2.5
+    for _ in range(int(_idle_bound_s(router) / step)):
+        await timer.parked(count=2)
+        timer.advance(step)
+
+
 async def _watched(attempt: StreamAttempt) -> None:
     watching: Final = attempt.watching
     assert watching is not None
@@ -332,8 +340,7 @@ async def test_the_real_chat_stream_nobody_reads_gives_its_turn_back_after_an_id
     attempt: Final = _outer_attempt("acompletion", probe)
     _ = await _chat_stream(attempt)
 
-    await timer.parked(count=2)
-    timer.advance(_idle_bound_s(router))
+    await _advance_idle_bound(timer, router)
     await _watched(attempt)
 
     assert await _busy(router) is True
@@ -348,9 +355,8 @@ async def test_the_real_text_stream_its_reader_abandoned_gives_its_turn_back_and
     await timer.parked(count=2)
     _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
 
-    timer.advance(_idle_bound_s(router))
-    await timer.parked(count=2)
-    timer.advance(_idle_bound_s(router))
+    await _advance_idle_bound(timer, router)
+    await _advance_idle_bound(timer, router)
     await _watched(attempt)
     released: Final = await _next_probe_granted_at_once(timer, router)
     rest: Final = [chunk async for chunk in stream]  # pyright: ignore[reportGeneralTypeIssues]  # see above
@@ -367,7 +373,7 @@ async def test_the_real_text_stream_read_across_an_idle_bound_keeps_its_turn() -
 
     await timer.parked(count=2)
     _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
-    timer.advance(_idle_bound_s(router))
+    await _advance_idle_bound(timer, router)
     await timer.parked(count=2)
     held: Final = not await _next_probe_granted_at_once(timer, router)
     _ = [chunk async for chunk in stream]  # pyright: ignore[reportGeneralTypeIssues]  # see above
@@ -521,10 +527,8 @@ async def test_a_chat_stream_waiting_on_a_slow_provider_read_keeps_its_turn_past
     reader: Final = asyncio.create_task(consume())
     try:
         await asyncio.wait_for(upstream.asked_for_more.wait(), 10)
-        await timer.parked(count=2)
-        timer.advance(_idle_bound_s(router))
-        await timer.parked(count=2)
-        timer.advance(_idle_bound_s(router))
+        await _advance_idle_bound(timer, router)
+        await _advance_idle_bound(timer, router)
         await timer.parked(count=2)
         held: Final = not await _next_probe_granted_at_once(timer, router)
         upstream.release.set()
@@ -549,9 +553,8 @@ async def test_a_text_stream_paused_between_chunks_gives_its_turn_back_and_keeps
     await timer.parked(count=2)
     _ = await stream.__anext__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the returned stream
 
-    timer.advance(_idle_bound_s(router))
-    await timer.parked(count=2)
-    timer.advance(_idle_bound_s(router))
+    await _advance_idle_bound(timer, router)
+    await _advance_idle_bound(timer, router)
     await _watched(attempt)
     released: Final = await _next_probe_granted_at_once(timer, router)
     upstream.release.set()

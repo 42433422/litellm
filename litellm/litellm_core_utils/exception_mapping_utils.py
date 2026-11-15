@@ -3010,14 +3010,14 @@ def exception_type(
         if exception_mapping_worked:
             setattr(e, "litellm_response_headers", litellm_response_headers)
             _attach_debug_info(e, request_debug_info)
-            _attach_provider_origin_status(e, original_exception)
+            _attach_provider_origin_status(e, mappable_exception)
             raise e
         else:
             for error_type in litellm.LITELLM_EXCEPTION_TYPES:
                 if isinstance(e, error_type):
                     setattr(e, "litellm_response_headers", litellm_response_headers)
                     _attach_debug_info(e, request_debug_info)
-                    _attach_provider_origin_status(e, original_exception)
+                    _attach_provider_origin_status(e, mappable_exception)
                     raise e  # it's already mapped
             raised_exc: Final = APIConnectionError(
                 message=f"{original_exception}\n{redact_string(traceback.format_exc())}",

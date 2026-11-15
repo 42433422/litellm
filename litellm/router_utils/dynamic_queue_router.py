@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model
 from typing_extensions import Self, assert_never
 
 from litellm.exceptions import ServiceUnavailableError, Timeout
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.total_deadline import TotalDeadline, current_total_deadline
 from litellm.router_utils.dynamic_queue import (
     OPERATION_TIMED_OUT,
@@ -76,7 +77,7 @@ class DynamicQueueSettings(BaseModel):
         )
 
 
-_SETTINGS: Final = TypeAdapter(DynamicQueueSettings | None)
+_SETTINGS: Final[TypeAdapter[DynamicQueueSettings | None]] = TypeAdapter(DynamicQueueSettings | None)
 
 
 def parse_dynamic_queue(value: object, default_priority: int | None) -> DynamicQueueSettings | None:
@@ -308,8 +309,8 @@ class DynamicQueueRouter:
 
 
 def capacity_of(deployment: Mapping[str, object]) -> str | None:
-    model_info: Final = deployment.get("model_info")
-    if not isinstance(model_info, Mapping):
+    model_info: Final = as_str_mapping(deployment.get("model_info"))
+    if model_info is None:
         return None
     shared: Final = model_info.get(CAPACITY_ID_FIELD)
     if isinstance(shared, str) and shared:
@@ -319,11 +320,11 @@ def capacity_of(deployment: Mapping[str, object]) -> str | None:
 
 
 def _capacities(records: Sequence[Mapping[str, object]]) -> Mapping[str, str]:
-    pairs: Final = ((record.get("model_info"), capacity_of(record)) for record in records)
+    pairs: Final = ((as_str_mapping(record.get("model_info")), capacity_of(record)) for record in records)
     return {
         str(model_info.get("id")): capacity
         for model_info, capacity in pairs
-        if isinstance(model_info, Mapping) and capacity is not None
+        if model_info is not None and capacity is not None
     }
 
 

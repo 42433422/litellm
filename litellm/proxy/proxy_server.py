@@ -7871,7 +7871,8 @@ class ProxyConfig:
 
         if redis_usage_cache is not None and router.health().store.redis_cache is None:
             router.apply(ChangeSet(redis_cache=redis_usage_cache))
-        refuse_local_queue_across_workers(router_params.get("dynamic_queue"), os.getenv("NUM_WORKERS", "1"))
+        read_router_params: Final = as_str_mapping(_UNTYPED_VALUE.validate_python(router_params)) or {}
+        refuse_local_queue_across_workers(read_router_params.get("dynamic_queue"), os.getenv("NUM_WORKERS", "1"))
 
         # Guardrail settings
         guardrails_v2: list[dict] | None = None

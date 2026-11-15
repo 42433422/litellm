@@ -1066,10 +1066,16 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         stash.native_state = None  # rebind-ok: adopted from the native
         return True
 
+    def _limiter_post_call(self) -> "LimiterPostCall":
+        return LimiterPostCall(
+            rate_limits=self.rate_limits,
+            native=self.native_companion,
+            batch_enqueued_token_store=self.batch_enqueued_token_store,
+            memory_lock=self._check_and_increment_lock,
+        )
+
     def _native_state(self, stash: RequestRateLimiterStash | None) -> "NativeParallelRequestLimiterState | None":
-        if self.native_companion is None or stash is None:
-            return None
-        return stash.native_state
+        return limiter_native_state(self._limiter_post_call(), stash)
 
     def _get_batch_rate_limiter(self) -> CallTypeRateLimiter | None:
         """Get or lazy-load the batch rate limiter."""
@@ -1955,32 +1961,17 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         in_logging_callback: bool = False,
         round_ended_at: datetime | None = None,
     ) -> None:
-        if stash is None:
-            return
-        async with stash.parallel_slot_release_lock:
-            if _ended_before_slot_reuse(round_ended_at, stash.parallel_slot_reused_at):
-                return
-            acquisition: Final = stash.parallel_slot or await self._take_native_slot(stash)
-            if acquisition is None:
-                return
-            deferred: Final = in_logging_callback and await self._defer_parallel_slot_release(
-                acquisition, parent_otel_span
-            )
-            if not deferred:
-                await self._release_parallel_request_slots(acquisition, parent_otel_span)
-            stash.parallel_slot = None  # rebind-ok: marks this request's slot as released
+        await release_stashed_parallel_slot(
+            self._limiter_post_call(),
+            stash,
+            parent_otel_span,
+            in_logging_callback=in_logging_callback,
+            round_ended_at=round_ended_at,
+            release=self._release_parallel_request_slots,
+        )
 
     async def _take_native_slot(self, stash: RequestRateLimiterStash) -> ParallelSlotAcquisition | None:
-        native_state: Final = self._native_state(stash)
-        if self.native_companion is None or native_state is None:
-            return None
-        taken: Final = await self.native_companion.take_parallel_slot(native_state)
-        if taken is None:
-            return None
-        slot_id, gauges = taken
-        return ParallelSlotAcquisition(
-            slot_id=slot_id, gauges=tuple(RateLimitScope(key, value) for key, value in gauges)
-        )
+        return await take_native_slot(self._limiter_post_call(), stash)
 
     async def _release_parallel_request_slots(
         self,
@@ -1995,29 +1986,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         request's slot. The in-memory fallback decrements integer mirror
         values (floored at 0) because the mirror carries no per-slot ids.
         """
-        if self.native_companion is not None:
-            await self.native_companion.release_slots(
-                acquisition["slot_id"],
-                [(scope.descriptor_key, scope.descriptor_value) for scope in acquisition["gauges"]],
-            )
-            return
-        gauges: Final = acquisition["gauges"]
-        slot_id: Final = acquisition["slot_id"]
-        if not gauges or not slot_id:
-            return
-        if self.rate_limits.has_redis:
-            try:
-                remaining: Final = await self.rate_limits.parallel_release(gauges, slot_id, batch=Batch.NONE)
-                self._mirror_released_parallel_slots(gauges, remaining)
-                return
-            except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to the in-memory release, never a 500
-                log_redis_failure(
-                    verbose_proxy_logger,
-                    logging.WARNING,
-                    "parallel_release_script failed, falling back to in-memory release",
-                    e,
-                )
-        await self._release_parallel_request_slots_in_memory(gauges, slot_id)
+        await release_parallel_request_slots(self._limiter_post_call(), acquisition)
 
     async def _defer_parallel_slot_release(
         self, acquisition: ParallelSlotAcquisition, parent_otel_span: Span | None
@@ -2028,35 +1997,15 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         sees the capacity before the pipeline goes out. The count Redis returns from the pipeline is not
         mirrored: by then a newer acquire on this worker may have written a fresher count, and the next
         acquire refreshes the gauge anyway."""
-        gauges: Final = acquisition["gauges"]
-        slot_id: Final = acquisition["slot_id"]
-        if not self.rate_limits.has_request_batch or not gauges or not slot_id:
-            return False
-        await self._release_parallel_request_slots_in_memory(gauges, slot_id)
-        return self.rate_limits.parallel_release_post_call(gauges, slot_id)
+        return await defer_parallel_slot_release(self._limiter_post_call(), acquisition)
 
     def _mirror_released_parallel_slots(
         self, gauges: Sequence[RateLimitScope], remaining_by_gauge: Sequence[int]
     ) -> None:
-        for scope, remaining in zip(gauges, remaining_by_gauge):
-            self.rate_limits.set_local(scope.gauge, max(0, remaining), PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+        mirror_released_parallel_slots(self.rate_limits, gauges, remaining_by_gauge)
 
     async def _release_parallel_request_slots_in_memory(self, gauges: Sequence[RateLimitScope], slot_id: str) -> None:
-        async with self._check_and_increment_lock:
-            with self._memory_section():
-                for scope in gauges:
-                    raw_value = self.rate_limits.local((scope.gauge,))[0]
-                    if isinstance(raw_value, dict):
-                        if slot_id not in raw_value:
-                            continue
-                        new_value: dict[str, float] | int = {  # mutable-ok: the memory gauge keeps its slots as a dict
-                            key: ts for key, ts in raw_value.items() if key != slot_id
-                        }
-                    elif raw_value is None:
-                        continue
-                    else:
-                        new_value = max(0, int(raw_value) - 1)
-                    self.rate_limits.set_local(scope.gauge, new_value, PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+        await release_parallel_request_slots_in_memory(self._limiter_post_call(), gauges, slot_id)
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def atomic_check_and_increment_by_n(
@@ -5783,57 +5732,16 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         """
         Release completed-request slots and update rate limit headers in the response.
         """
-        try:
-            slot_stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(data))
-            await self._release_stashed_parallel_slot(slot_stash, user_api_key_dict.parent_otel_span)
-        except Exception as e:
-            verbose_proxy_logger.exception("Error releasing parallel request slot in post-call hook: %s", e)
-
-        try:
-            header_stash: Final = get_request_stash()
-            litellm_proxy_rate_limit_response: Final = (
-                header_stash.rate_limit_response if header_stash is not None else None
-            )
-
-            if litellm_proxy_rate_limit_response is not None and response_has_hidden_params(response):
-                additional_headers: Final = ensure_response_additional_headers(response)
-                additional_headers.update(
-                    self._merge_ratelimit_statuses_into_additional_headers(
-                        additional_headers={},
-                        statuses=litellm_proxy_rate_limit_response["statuses"],
-                    )
-                )
-
-        except Exception as e:
-            verbose_proxy_logger.exception("Error in rate limit post-call hook: %s", e)
-
-        try:
-            await self._handle_batch_enqueued_post_call(user_api_key_dict=user_api_key_dict, response=response)
-        except Exception as e:  # noqa: BLE001  # post-call batch accounting must never fail the response
-            verbose_proxy_logger.exception("Error in batch enqueued-token post-call hook: %s", e)
+        await limiter_post_call_success(
+            self._limiter_post_call(),
+            data,
+            user_api_key_dict,
+            response,
+            release=self._release_parallel_request_slots,
+        )
 
     async def _handle_batch_enqueued_post_call(self, user_api_key_dict: UserAPIKeyAuth, response: object) -> None:
-        stash: Final = get_request_stash()
-        if self._native_state(stash) is not None:
-            return
-        view: Final = batch_response_view(response)
-        if view is None:
-            return
-        span: Final = user_api_key_dict.parent_otel_span
-        if stash is not None and stash.batch_enqueued_reservation is not None:
-            await self.batch_enqueued_token_store.save_reservation(
-                batch_id=canonical_provider_batch_id(view.id),
-                reservation=stash.batch_enqueued_reservation,
-                litellm_parent_otel_span=span,
-            )
-            stash.batch_enqueued_reservation = None
-        if view.status.lower() in BATCH_ENQUEUED_REFUND_STATUSES:
-            popped: Final = await self.batch_enqueued_token_store.pop_reservation(
-                batch_id=canonical_provider_batch_id(view.id),
-                litellm_parent_otel_span=span,
-            )
-            if popped is not None:
-                await self.batch_enqueued_token_store.refund(reservation=popped, litellm_parent_otel_span=span)
+        await handle_batch_enqueued_post_call(self._limiter_post_call(), user_api_key_dict, response)
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def async_post_call_failure_hook(
@@ -6324,3 +6232,185 @@ def recovered_partial_usage_tokens(
         billable_input,
         completion_tokens,
     )
+
+
+@dataclass(frozen=True)
+class LimiterPostCall:
+    rate_limits: RateLimitStore
+    native: "NativeParallelRequestLimiter | None"
+    batch_enqueued_token_store: BatchEnqueuedTokenStore
+    memory_lock: asyncio.Lock
+
+
+SlotRelease = Callable[[ParallelSlotAcquisition, "Span | None"], Awaitable[None]]
+
+
+def limiter_native_state(
+    limiter: LimiterPostCall, stash: RequestRateLimiterStash | None
+) -> "NativeParallelRequestLimiterState | None":
+    if limiter.native is None or stash is None:
+        return None
+    return stash.native_state
+
+
+async def take_native_slot(limiter: LimiterPostCall, stash: RequestRateLimiterStash) -> ParallelSlotAcquisition | None:
+    native_state: Final = limiter_native_state(limiter, stash)
+    if limiter.native is None or native_state is None:
+        return None
+    taken: Final = await limiter.native.take_parallel_slot(native_state)
+    if taken is None:
+        return None
+    slot_id, gauges = taken
+    return ParallelSlotAcquisition(slot_id=slot_id, gauges=tuple(RateLimitScope(key, value) for key, value in gauges))
+
+
+def mirror_released_parallel_slots(
+    rate_limits: RateLimitStore, gauges: Sequence[RateLimitScope], remaining_by_gauge: Sequence[int]
+) -> None:
+    for scope, remaining in zip(gauges, remaining_by_gauge):
+        rate_limits.set_local(scope.gauge, max(0, remaining), PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+
+
+async def release_parallel_request_slots_in_memory(
+    limiter: LimiterPostCall, gauges: Sequence[RateLimitScope], slot_id: str
+) -> None:
+    async with limiter.memory_lock:
+        with _MemorySection(limiter.native):
+            for scope in gauges:
+                raw_value = limiter.rate_limits.local((scope.gauge,))[0]
+                if isinstance(raw_value, dict):
+                    if slot_id not in raw_value:
+                        continue
+                    new_value: dict[str, float] | int = {  # mutable-ok: the memory gauge keeps its slots as a dict
+                        key: ts for key, ts in raw_value.items() if key != slot_id
+                    }
+                elif raw_value is None:
+                    continue
+                else:
+                    new_value = max(0, int(raw_value) - 1)
+                limiter.rate_limits.set_local(scope.gauge, new_value, PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+
+
+async def release_parallel_request_slots(limiter: LimiterPostCall, acquisition: ParallelSlotAcquisition) -> None:
+    if limiter.native is not None:
+        await limiter.native.release_slots(
+            acquisition["slot_id"],
+            [(scope.descriptor_key, scope.descriptor_value) for scope in acquisition["gauges"]],
+        )
+        return
+    gauges: Final = acquisition["gauges"]
+    slot_id: Final = acquisition["slot_id"]
+    if not gauges or not slot_id:
+        return
+    if limiter.rate_limits.has_redis:
+        try:
+            remaining: Final = await limiter.rate_limits.parallel_release(gauges, slot_id, batch=Batch.NONE)
+            mirror_released_parallel_slots(limiter.rate_limits, gauges, remaining)
+            return
+        except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to the in-memory release, never a 500
+            log_redis_failure(
+                verbose_proxy_logger,
+                logging.WARNING,
+                "parallel_release_script failed, falling back to in-memory release",
+                e,
+            )
+    await release_parallel_request_slots_in_memory(limiter, gauges, slot_id)
+
+
+async def defer_parallel_slot_release(limiter: LimiterPostCall, acquisition: ParallelSlotAcquisition) -> bool:
+    gauges: Final = acquisition["gauges"]
+    slot_id: Final = acquisition["slot_id"]
+    if not limiter.rate_limits.has_request_batch or not gauges or not slot_id:
+        return False
+    await release_parallel_request_slots_in_memory(limiter, gauges, slot_id)
+    return limiter.rate_limits.parallel_release_post_call(gauges, slot_id)
+
+
+async def release_stashed_parallel_slot(
+    limiter: LimiterPostCall,
+    stash: RequestRateLimiterStash | None,
+    parent_otel_span: "Span | None",
+    *,
+    in_logging_callback: bool = False,
+    round_ended_at: datetime | None = None,
+    release: SlotRelease | None = None,
+) -> None:
+    if stash is None:
+        return
+    async with stash.parallel_slot_release_lock:
+        if _ended_before_slot_reuse(round_ended_at, stash.parallel_slot_reused_at):
+            return
+        acquisition: Final = stash.parallel_slot or await take_native_slot(limiter, stash)
+        if acquisition is None:
+            return
+        deferred: Final = in_logging_callback and await defer_parallel_slot_release(limiter, acquisition)
+        if not deferred:
+            if release is None:
+                await release_parallel_request_slots(limiter, acquisition)
+            else:
+                await release(acquisition, parent_otel_span)
+        stash.parallel_slot = None  # rebind-ok: marks this request's slot as released
+
+
+async def handle_batch_enqueued_post_call(
+    limiter: LimiterPostCall, user_api_key_dict: UserAPIKeyAuth, response: object
+) -> None:
+    stash: Final = get_request_stash()
+    if limiter_native_state(limiter, stash) is not None:
+        return
+    view: Final = batch_response_view(response)
+    if view is None:
+        return
+    span: Final = user_api_key_dict.parent_otel_span
+    if stash is not None and stash.batch_enqueued_reservation is not None:
+        await limiter.batch_enqueued_token_store.save_reservation(
+            batch_id=canonical_provider_batch_id(view.id),
+            reservation=stash.batch_enqueued_reservation,
+            litellm_parent_otel_span=span,
+        )
+        stash.batch_enqueued_reservation = None
+    if view.status.lower() in BATCH_ENQUEUED_REFUND_STATUSES:
+        popped: Final = await limiter.batch_enqueued_token_store.pop_reservation(
+            batch_id=canonical_provider_batch_id(view.id),
+            litellm_parent_otel_span=span,
+        )
+        if popped is not None:
+            await limiter.batch_enqueued_token_store.refund(reservation=popped, litellm_parent_otel_span=span)
+
+
+async def limiter_post_call_success(
+    limiter: LimiterPostCall,
+    data: Mapping[str, object],
+    user_api_key_dict: UserAPIKeyAuth,
+    response: object,
+    *,
+    release: SlotRelease | None = None,
+) -> None:
+    try:
+        slot_stash: Final = get_request_stash_for_call(_call_id_from_callback_kwargs(data))
+        await release_stashed_parallel_slot(limiter, slot_stash, user_api_key_dict.parent_otel_span, release=release)
+    except Exception as e:
+        verbose_proxy_logger.exception("Error releasing parallel request slot in post-call hook: %s", e)
+
+    try:
+        header_stash: Final = get_request_stash()
+        litellm_proxy_rate_limit_response: Final = (
+            header_stash.rate_limit_response if header_stash is not None else None
+        )
+
+        if litellm_proxy_rate_limit_response is not None and response_has_hidden_params(response):
+            additional_headers: Final = ensure_response_additional_headers(response)
+            additional_headers.update(
+                PROXY_MaxParallelRequestsHandler_v3._merge_ratelimit_statuses_into_additional_headers(
+                    additional_headers={},
+                    statuses=litellm_proxy_rate_limit_response["statuses"],
+                )
+            )
+
+    except Exception as e:
+        verbose_proxy_logger.exception("Error in rate limit post-call hook: %s", e)
+
+    try:
+        await handle_batch_enqueued_post_call(limiter, user_api_key_dict=user_api_key_dict, response=response)
+    except Exception as e:  # noqa: BLE001  # post-call batch accounting must never fail the response
+        verbose_proxy_logger.exception("Error in batch enqueued-token post-call hook: %s", e)

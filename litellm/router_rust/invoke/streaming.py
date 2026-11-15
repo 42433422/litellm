@@ -179,7 +179,7 @@ class StreamAttempt:
 
     async def fallback(self, trigger: BaseException, request: Mapping[str, object] | None = None) -> object:
         """The fallback walk for this stream's failure; raises when no fallback answers."""
-        await self.admission_settled()
+        _ = await self.admission_settled()
         with bound_request_queue(self.request_queue):
             return await self.core.recover_stream("fallback", self.op, request or self.request, self.origin(), trigger)
 
@@ -188,9 +188,9 @@ class StreamAttempt:
 
     async def retry(self, trigger: BaseException) -> "tuple[object, int, int] | BaseException":
         """A same-group retry: the retried response with the retry count and budget, or the newest failure."""
-        await self.admission_settled()
+        queued: Final = await self.admission_settled()
         with bound_request_queue(self.request_queue):
-            return await self.core.retry_stream(self.op, self.request, self.origin(), trigger)
+            return await self.core.retry_stream(self.op, self.request, self.origin(), trigger, queued_retry=queued)
 
     # -- the stream's outcome, reported once when it ends --------------------------------------
 
@@ -278,12 +278,12 @@ class StreamAttempt:
         self.settling = settling
         return settling
 
-    async def admission_settled(self) -> None:
+    async def admission_settled(self) -> bool:
         """A recovery admits only after this stream's failure reached the queue, so it never picks the capacity the
-        failure is about to congest."""
+        failure is about to congest. True when the failure congested the capacity, so the queue holds the retry."""
         settling: Final = self.settling
         if settling is None:
-            return
+            return False
         _ = await asyncio.wait({settling})
         unpublished: Final = (
             settling.cancelled()
@@ -292,6 +292,7 @@ class StreamAttempt:
         )
         if unpublished and self.congesting:
             raise DynamicQueueCoordinationError(self.group)
+        return self.congesting
 
     def read_began(self) -> None:
         self.reading = True

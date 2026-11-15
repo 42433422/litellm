@@ -10,6 +10,8 @@ import pytest
 import litellm
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.exceptions import MidStreamFallbackError
+from litellm.router import router_arguments
+from litellm.router_config import build_router_config
 from litellm.router_rust.invoke.streaming import (
     StreamAttempt,
     _areported,
@@ -45,8 +47,10 @@ from litellm.router_utils.dynamic_queue_router import (
 from litellm.text_completions.streaming_iterator import TextCompletionStreamWrapper
 from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _finished, _reap
+from tests.unit.router_utils.test_dynamic_queue_router import _RecordsBackoffs
 
 CAPACITY: Final = "deployment:d1"
+MESSAGES: Final = [{"role": "user", "content": "hi"}]
 
 
 async def _no_cooldown() -> float:
@@ -80,7 +84,7 @@ class _RecoveringCore:
         self.recovered_with.append(current_request_queue())
         return "recovered"
 
-    async def retry_stream(self, *args: object) -> object:
+    async def retry_stream(self, *args: object, **options: object) -> object:
         self.recovered_with.append(current_request_queue())
         return ("retried", 1, 1)
 
@@ -648,3 +652,41 @@ async def test_the_real_chat_stream_failing_before_content_ends_with_its_recover
         _ = [chunk async for chunk in stream]
 
     assert raised.value is rejection
+
+
+@pytest.mark.parametrize(("status", "backoffs"), [(429, 0), (503, 1)], ids=["congesting", "not_a_trigger"])
+async def test_a_stream_retry_after_a_failure_the_queue_took_waits_there_instead_of_the_retry_backoff(
+    status: int, backoffs: int
+) -> None:
+    host: Final = _RecordsBackoffs()
+    arguments: Final = router_arguments(
+        model_list=[{"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "d1"}}],
+        default_priority=0,
+        num_retries=1,
+    )
+    router: Final = litellm.Router.from_config(build_router_config(arguments), host)
+    queue: Final = DynamicQueueRouter(
+        DynamicQueueSettings(enabled=True, coordination="local", queue_timeout=0.01), redis=lambda: None
+    )
+    request_queue: Final = queue.request(priority=0, request_id="stream")
+    admission: Final = await request_queue.admit(CAPACITY, "group", _no_cooldown)
+    attempt: Final = StreamAttempt(
+        core=router._core,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the router's own Rust core
+        op="acompletion",
+        request={"model": "group", "messages": MESSAGES, "stream": True, "mock_response": "ok"},
+        kwargs={"stream": True},
+        group="group",
+        order=None,
+        depth=0,
+        level=0,
+        deployment_id="d1",
+        attempted_retries=0,
+        admission=admission,
+        request_queue=request_queue,
+    )
+    failure: Final = _provider_error(status)
+    _ = attempt.settle_admission(failure)
+
+    _ = await attempt.retry(failure)
+
+    assert len(host.backoffs) == backoffs

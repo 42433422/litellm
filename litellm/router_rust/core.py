@@ -3030,6 +3030,7 @@ class RustCore(
         *,
         fresh: bool = False,
         passthrough: "Callable[[Mapping[str, object], str], Awaitable[object]] | None" = None,
+        queued_retry: bool = False,
     ) -> "tuple[_Driver, Mapping[str, object]]":
         """Drive ``call`` to its ``done`` or ``failed`` step, answering every step on the host.
         ``cut_deployment`` is the attempt whose stream failed, for a recovery call, and
@@ -3039,6 +3040,7 @@ class RustCore(
         driver: Final = _Driver(
             self, plan, prepared, cut_deployment, stream_failure, fresh=fresh, passthrough=passthrough
         )
+        driver.hold_retry_in_queue(queued_retry)
         try:
             return await self._run_steps(driver, call)
         except BaseException:
@@ -3217,13 +3219,21 @@ class RustCore(
         return driver.finish(step)
 
     async def retry_stream(
-        self, op: str, request: Mapping[str, object], origin: Mapping[str, object], failure: BaseException
+        self,
+        op: str,
+        request: Mapping[str, object],
+        origin: Mapping[str, object],
+        failure: BaseException,
+        *,
+        queued_retry: bool = False,
     ) -> "tuple[object, int, int] | BaseException":
         """A same-group retry of a stream that failed before content: the retried response (without the
         router's headers) with the retry count and budget, or the newest failure (``failure`` itself
         when no retry ran)."""
         call: Final = self._recovery_call("retry", op, request, origin, failure)
-        driver, step = await self._run(plan_for(op), call, request, origin.get("deployment_id"))
+        driver, step = await self._run(
+            plan_for(op), call, request, origin.get("deployment_id"), queued_retry=queued_retry
+        )
         await await_all(driver.outcomes.take_pending())
         if step["kind"] == "failed":
             return driver.last_error if driver.last_error is not None else failure
@@ -5317,6 +5327,9 @@ class _Driver:
         self._last_response = answered
         self._served = (name, self._request)
         return {"ok": True, "total_tokens": total_tokens(answered)}
+
+    def hold_retry_in_queue(self, held: bool) -> None:
+        self._queued_retry = held
 
     def queue_holds_retry(self) -> bool:
         held: Final = self._queued_retry

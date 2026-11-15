@@ -49,16 +49,16 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RateLimitUnverifiableError,
     RequestRateLimiterStash,
     borrowing_team_model_limits,
-    bound_output_for_limit,
     callback_kwargs_mapping,
+    cap_output_for_limit,
     claim_request_stash_for_data,
-    estimate_request_tokens,
     get_or_create_request_stash,
     get_request_stash,
     limiter_post_call_success,
     native_rate_limit_store,
     rate_limit_window_size,
     request_stash_for_callback,
+    request_token_estimate,
     resolve_rate_limited_model,
     token_rate_limit_type,
     tpm_token_reservation_enabled,
@@ -407,9 +407,9 @@ class CapacityDelegate:
         as_dispatched: Final = dict(data, model=model)
         rate_limit_type: Final = token_rate_limit_type()
         if rate_limit_type != "input":
-            bound_output_for_limit(as_dispatched, tpm_share, call_type)
+            cap_output_for_limit(as_dispatched, tpm_share, call_type)
         try:
-            estimate: Final = await offload_token_count(estimate_request_tokens)(
+            estimate: Final = await offload_token_count(request_token_estimate)(
                 data=as_dispatched,
                 model=model,
                 min_configured_tpm_limit=tpm_share,
@@ -428,7 +428,7 @@ class CapacityDelegate:
         return {"kind": "tokens", "tokens": estimate}
 
     def cap_output(self, data: object, tpm_share: int, call_type: str | None) -> None:
-        bound_output_for_limit(data, tpm_share, call_type)
+        cap_output_for_limit(data, tpm_share, call_type)
 
     @_seam_now
     def stash_call_type(self, _args: Mapping[str, object]) -> object:

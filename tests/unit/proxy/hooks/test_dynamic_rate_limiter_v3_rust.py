@@ -1899,6 +1899,8 @@ async def _check(
     data: dict[str, object] | None = None,
     priority: str | None = None,
 ) -> None:
+    group: Final = handler.llm_router.registry().group(model)
+    assert group is not None
     await pre_call_at_saturation(handler, auth, model, saturation, data)
 
 

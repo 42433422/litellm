@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, cast  # noqa: TID251  # a future a host coroutine yields is untyped
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError

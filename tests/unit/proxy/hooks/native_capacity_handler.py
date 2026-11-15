@@ -1,3 +1,4 @@
+import asyncio
 import socket
 import threading
 import time
@@ -213,6 +214,12 @@ def _call(data: Mapping[str, object], call_type: str) -> CallFacts:
         kind=CallKind(call_type=call_type),
         target=CallTarget(model=str(data.get("model"))),
         timing=CallTiming(start=1.0),
+    )
+
+
+async def startup_pings() -> None:
+    await asyncio.gather(
+        *(task for task in asyncio.all_tasks() if task.get_coro().__qualname__ == RedisCache.ping.__qualname__)
     )
 
 

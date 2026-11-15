@@ -74,6 +74,7 @@ from tests.unit.proxy.hooks.native_capacity_handler import (
     counter_key,
     fake_redis,
     redis_answering_counts,
+    startup_pings,
 )
 from tests.unit.redis.stores.fake_rate_limits import FakeRateLimits
 
@@ -2341,6 +2342,7 @@ async def test_a_settlement_rides_the_requests_post_call_batch(monkeypatch: pyte
     with fake_redis(emulate=True) as redis:
         handler: Final = _native_handler(DualCache(redis_cache=RedisCache(host="127.0.0.1", port=redis.port)))
         handler.update_variables(llm_router=router)
+        await startup_pings()
         with request_redis_batch_scope():
             await _native_pre_call(handler, auth, {"model": "batched", "max_tokens": 10})
             before: Final = redis.trips

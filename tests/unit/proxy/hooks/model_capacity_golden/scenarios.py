@@ -20,7 +20,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 from litellm.redis.stores.rate_limits import RateLimitScope, RateLimitStore
 from litellm.rust_bridge.host import redis_events
 from litellm.types.utils import ModelResponse, PriorityReservationSettings, Usage
-from tests.unit.proxy.hooks.native_capacity_handler import counter_key, fake_redis, listening
+from tests.unit.proxy.hooks.native_capacity_handler import counter_key, fake_redis, listening, startup_pings
 
 
 class Limiter(Protocol):
@@ -131,6 +131,7 @@ async def batch_trips(monkeypatch: pytest.MonkeyPatch, build: Build, pre_call: P
     with fake_redis(emulate=True) as redis:
         handler: Final = build(DualCache(redis_cache=RedisCache(host="127.0.0.1", port=redis.port)))
         handler.update_variables(llm_router=_router())
+        await startup_pings()
         for _ in range(3):
             trips: int = redis.trips
             sent: int = len(redis.commands)

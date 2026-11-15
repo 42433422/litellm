@@ -139,7 +139,7 @@ async def _finish(suspended: _Suspended) -> object:
         error: BaseException | None = None
         try:
             if isinstance(out, asyncio.Future):
-                value = await cast("asyncio.Future[object]", out)
+                value = await cast("asyncio.Future[object]", out)  # cast-ok: the future a host coroutine yields
             else:
                 await asyncio.sleep(0)
         except BaseException as caught:  # noqa: BLE001  # the suspended call sees what its await raised, as under a task

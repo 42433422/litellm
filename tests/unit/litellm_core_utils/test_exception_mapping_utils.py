@@ -3501,19 +3501,25 @@ def test_openai_error_matched_by_its_message_keeps_the_upstream_body(
 
 
 @pytest.mark.parametrize(
-    ("provider", "provider_status", "public_status"),
-    [("anthropic", 529, 500), ("anthropic", 429, 429), ("openai", 529, 529), ("openai", 429, 429)],
+    ("provider", "provider_status", "mapped_error", "public_status"),
+    [
+        ("anthropic", 529, litellm.InternalServerError, 500),
+        ("anthropic", 429, litellm.RateLimitError, 429),
+        ("openai", 529, litellm.APIError, 529),
+        ("openai", 429, litellm.RateLimitError, 429),
+    ],
 )
 def test_a_mapped_provider_error_keeps_the_providers_own_status_beside_its_public_one(
-    provider, provider_status, public_status, quiet_exception_mapping
+    provider, provider_status, mapped_error, public_status, quiet_exception_mapping
 ):
-    with pytest.raises(Exception) as raised:
+    with pytest.raises(mapped_error, match="upstream failure") as raised:
         exception_type(
             model="model-under-test",
             original_exception=_UpstreamHTTPError(status_code=provider_status, message="upstream failure"),
             custom_llm_provider=provider,
         )
 
+    assert type(raised.value) is mapped_error
     assert (raised.value.status_code, provider_origin_status(raised.value)) == (public_status, provider_status)
 
 
@@ -3529,7 +3535,7 @@ def test_an_error_litellm_raised_itself_carries_no_provider_status(quiet_excepti
 def test_a_status_litellm_made_up_for_a_provider_error_is_not_kept_as_the_providers(quiet_exception_mapping):
     made_up: Final = BaseLLMException(status_code=429, message="no status upstream", status_code_is_synthesized=True)
 
-    with pytest.raises(Exception) as raised:
+    with pytest.raises(litellm.RateLimitError, match="no status upstream") as raised:
         exception_type(model="m", original_exception=made_up, custom_llm_provider="openai")
 
     assert provider_origin_status(raised.value) is None

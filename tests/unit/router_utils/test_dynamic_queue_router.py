@@ -392,7 +392,6 @@ async def test_a_request_that_does_not_queue_picks_as_today_without_reading_any_
     assert await prefer_uncongested(("d1", "d2"), lookup, _everywhere) == ("d1", "d2")
 
 
-
 def _model_list() -> list[dict[str, object]]:
     return [{"model_name": "group", "litellm_params": {"model": "openai/gpt-x", "mock_response": "served"}}]
 

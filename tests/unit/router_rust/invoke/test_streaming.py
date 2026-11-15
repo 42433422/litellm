@@ -242,7 +242,6 @@ async def test_a_stream_recovered_from_another_task_waits_with_its_own_requests_
     assert current_request_queue() is None
 
 
-
 class _OuterStreamCore(_RecoveringCore):
     """What the real chat and text stream wrappers ask of their core while they report a stream's end."""
 

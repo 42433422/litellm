@@ -3620,11 +3620,8 @@ class RustCore(
             return self._pre_call_facts(step, request, messages, input).answer()
         if step.get("stage") == "routing_plugins":
             return candidate_models(request)
-        if step.get("stage") == "callback_filters":
-            # Only the async candidate lists run the callback filters.
-            return step["candidates"]
-        if step.get("stage") == "dynamic_congested":
-            return []
+        if step.get("stage") in _ASYNC_ONLY_STAGES:
+            return _skipped_on_sync(step)
         if step.get("stage") == "text_only":
             return self._text_only(step)
         if step.get("stage") == "route_incapable":
@@ -3978,6 +3975,15 @@ def wildcard_request(model: str) -> str:
 
 def _provider_request(step: Mapping[str, object]) -> Mapping[str, object]:
     return {"models": [wildcard_request(str(step.get("model")))]}
+
+
+_ASYNC_ONLY_STAGES: Final = frozenset({"callback_filters", "dynamic_congested"})
+
+
+def _skipped_on_sync(step: Mapping[str, object]) -> object:
+    """A stage only async picks run, answered for a sync pick as if it never ran: the callback filters keep every
+    candidate and the dynamic queue holds none congested."""
+    return step["candidates"] if step.get("stage") == "callback_filters" else []
 
 
 def _lookup_error(kind: object, model: str, default_deployment: object) -> BaseException | None:
@@ -5337,12 +5343,24 @@ class _Driver:
             return None
         return await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
 
-    async def _settle_failed_admission(
+    @staticmethod
+    async def _give_turn_back(admission: Admission | None) -> None:
+        if admission is not None:
+            _ = await admission.finish(None)
+
+    @staticmethod
+    async def _report_served(admission: Admission | None, stream: StreamAttempt) -> None:
+        if admission is not None and not stream.reports_outcome:
+            _ = await admission.finish(Succeeded())
+
+    async def _queue_terminal(
         self, admission: Admission | None, error: Exception, model: str
-    ) -> DynamicQueueCoordinationError | None:
-        """The terminal coordination error when a congesting failure never reached the queue, so no later attempt
-        finds the capacity healthy."""
-        if admission is None or isinstance(error, QueueRejectedError):
+    ) -> QueueRejectedError | None:
+        """The queue error that ends the call: a rejection, or a congesting failure that never reached the queue, so
+        no later attempt finds the capacity healthy."""
+        if isinstance(error, QueueRejectedError):
+            return error
+        if admission is None:
             return None
         outcome: Final = admission.router.outcome_of(error, retry_after_seconds(error))
         reported: Final = await admission.finish(outcome)
@@ -5356,6 +5374,29 @@ class _Driver:
         active: Final = await self._core._cooldowns.async_get_active_cooldowns([deployment_id], None)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
         ends: Final = max((value["timestamp"] + value["cooldown_time"] for _, value in active), default=0.0)
         return max(ends - unix_time(), 0.0)
+
+    async def _attempt_failure(
+        self,
+        step: Mapping[str, object],
+        deployment: Mapping[str, object],
+        call: "AttemptCall | None",
+        error: Exception,
+        admission: Admission | None,
+        reading_stream: StreamAttempt | None,
+        *,
+        logs_failure: bool,
+        in_call: bool,
+    ) -> Mapping[str, object]:
+        terminal: Final = await self._queue_terminal(admission, error, "" if call is None else call.model_name)
+        if terminal is not None:
+            self._queue_rejection = terminal
+            return {**self._failed(step, deployment, call, terminal), "recorded": True}
+        failed: Final = self._failed(step, deployment, call, error)
+        if reading_stream is None or not logs_failure:
+            return {**failed, "recorded": not logs_failure and not self._records_blocked(failed, call, error, in_call)}
+        # `_dispatch_stream_failure`: the stream logs its failure in a task of its own.
+        reading_stream.report_first_chunk_failure(error)
+        return {**failed, "recorded": True}
 
     async def _routed_attempt(self, step: Mapping[str, object], attempt: RoutedAttempt) -> Mapping[str, object]:
         step = await self._resolve_pods(step)  # rebind-ok: the picked deployment, resolved to a pod
@@ -5397,8 +5438,7 @@ class _Driver:
                         # Only `_acompletion` hands the check its logging object.
                         if self._plan.kind == "chat":
                             _log_refused_pick(self._request, refused)
-                        if admission is not None:
-                            _ = await admission.finish(None)
+                        await self._give_turn_back(admission)
                         return await self._refused(step, deployment, call, refused)
                 first_to_log: Final = not failure_already_logged(call.kwargs, "async_failure")
                 logs_failure = first_to_log  # rebind-ok: whether a failure here is this attempt's to log
@@ -5429,8 +5469,7 @@ class _Driver:
                 # plain dict fails the attempt.
                 self._core._endpoints.counters.succeeded(self._plan, call)  # pyright: ignore[reportPrivateUsage]  # see above
         except asyncio.CancelledError:
-            if admission is not None:
-                _ = await admission.finish(None)
+            await self._give_turn_back(admission)
             if call is not None:
                 await released(
                     self._release(call, attempt, refund_io_tokens=not attempt.answered),
@@ -5442,26 +5481,10 @@ class _Driver:
         except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
             if call is not None:
                 await released(self._release(call, attempt, refund_io_tokens=True))
-            unpublished: Final = await self._settle_failed_admission(
-                admission, error, "" if call is None else call.model_name
+            return await self._attempt_failure(
+                step, deployment, call, error, admission, reading_stream, logs_failure=logs_failure, in_call=in_call
             )
-            if unpublished is not None:
-                self._queue_rejection = unpublished
-                return {**self._failed(step, deployment, call, unpublished), "recorded": True}
-            failed: Final = self._failed(step, deployment, call, error)
-            if isinstance(error, QueueRejectedError):
-                self._queue_rejection = error
-                return {**failed, "recorded": True}
-            if reading_stream is None or not logs_failure:
-                return {
-                    **failed,
-                    "recorded": not logs_failure and not self._records_blocked(failed, call, error, in_call),
-                }
-            # `_dispatch_stream_failure`: the stream logs its failure in a task of its own.
-            reading_stream.report_first_chunk_failure(error)
-            return {**failed, "recorded": True}
-        if admission is not None and not stream.reports_outcome:
-            _ = await admission.finish(Succeeded())
+        await self._report_served(admission, stream)
         served: Final = self._succeeded(call, response, call.host_op, stream)
         # The session re-pin the Python core's success callback runs; a wrapped stream runs it when it ends.
         if not served.get("deferred") and self._core.outcome_callbacks(call.kwargs, sync=False).get("success", True):

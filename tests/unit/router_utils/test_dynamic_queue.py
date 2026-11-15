@@ -472,6 +472,41 @@ async def test_an_unclaimed_probe_holds_a_queue_place_until_its_owner_claims_it(
     assert after_claim == Waiting()
 
 
+async def test_an_abandoned_congested_capacity_expires_after_the_state_ttl_and_ignores_its_old_probe() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1, lease_ms=10_000, state_ttl_ms=10_000)
+    await _congest(backend)
+    timer.at = 1.0
+    abandoned: Final = await backend.admit(_request("p"), 1_000)
+    assert isinstance(abandoned, Probe)
+
+    timer.at = 21.0
+    expired: Final = await backend.admit(_request("q"), FAR)
+    await _congest(backend)
+    timer.at = 22.0
+    current: Final = await backend.admit(_request("p"), FAR)
+    await backend.report(CAPACITY, "p", abandoned, Succeeded())
+
+    assert isinstance(expired, PassThrough)
+    assert isinstance(current, Probe) and current != abandoned
+    assert isinstance(await backend.admit(_request("c"), FAR), Waiting)
+
+
+async def test_a_congested_capacity_is_kept_through_a_retry_after_and_the_state_ttl_beyond_it() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, state_ttl_ms=10_000)
+    await _congest(backend, retry_after_ms=60_000, capacity="kept")
+    await _congest(backend, retry_after_ms=60_000, capacity="expiring")
+
+    timer.at = 69.999
+    kept: Final = await backend.admit(_request("a", capacity="kept"), FAR)
+    timer.at = 70.0
+    expired: Final = await backend.admit(_request("b", capacity="expiring"), FAR)
+
+    assert isinstance(kept, Probe)
+    assert isinstance(expired, PassThrough)
+
+
 async def test_a_full_queue_refuses_new_waiters_until_one_leaves() -> None:
     backend: Final = _backend(ManualTimer(), max_waiting=2)
     await _congest(backend, retry_after_ms=FAR)

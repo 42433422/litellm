@@ -583,31 +583,65 @@ def _idle(capacity: _Capacity) -> bool:
     return capacity.healthy and not capacity.queue
 
 
+def _horizon_ms(capacity: _Capacity, now: int) -> int:
+    """The latest moment the capacity's state still matters: its next probe, its lease and every waiter's deadline."""
+    lease: Final = capacity.lease
+    leased: Final = 0 if lease is None else max(lease.until_ms, lease.waiter.deadline_ms)
+    deadlines: Final = (waiter.deadline_ms for waiter in (*capacity.queue, *capacity.snapshot))
+    return max(now, capacity.next_probe_ms, leased, *deadlines)
+
+
+@dataclass(frozen=True, slots=True)
+class _Kept:
+    state: _Capacity
+    expires_ms: int
+
+
 class LocalQueueBackend:
     """Coordinates the attempts of one process. Every step runs without awaiting, so each is atomic on the loop.
 
-    Only capacities with someone waiting, probing or draining are kept. One that goes idle is forgotten, and any
+    Only capacities with someone waiting, probing or draining are kept. One that goes idle is forgotten, and so is one
+    left untouched ``state_ttl_ms`` past its next probe, lease and waiter deadlines, as its Redis keys would expire. Any
     capacity started afterwards begins its generations and tokens past every forgotten one's, so a report still in
     flight for a forgotten grant can never match a new one."""
 
     def __init__(self, settings: QueueSettings | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         self._settings = settings or QueueSettings()
         self._clock = clock
-        self._capacities: Final[dict[str, _Capacity]] = {}  # mutable-ok: updated in place so a step stays O(1)
+        self._capacities: Final[dict[str, _Kept]] = {}  # mutable-ok: updated in place so a step stays O(1)
         self._forgotten_past = 0
+        self._next_sweep_ms = 0
 
     @property
     def settings(self) -> QueueSettings:
         return self._settings
 
-    def _step(self, capacity: str, step: Callable[[_Capacity, int], tuple[_Capacity, _R]]) -> _R:
-        fresh: Final = _Capacity(generation=self._forgotten_past, tokens=self._forgotten_past)
-        updated, reply = step(self._capacities.get(capacity, fresh), int(self._clock() * 1000))
-        if not _idle(updated):
-            self._capacities[capacity] = updated
-            return reply
-        self._forgotten_past = max(self._forgotten_past, updated.generation, updated.tokens)
+    def _forget(self, capacity: str, state: _Capacity) -> None:
+        self._forgotten_past = max(self._forgotten_past, state.generation, state.tokens)
         _ = self._capacities.pop(capacity, None)
+
+    def _sweep_expired(self, now: int) -> None:
+        """At most once per ``state_ttl_ms``, so an abandoned capacity is dropped without a scan on every step."""
+        if now < self._next_sweep_ms:
+            return
+        self._next_sweep_ms = now + self._settings.state_ttl_ms
+        expired: Final = tuple((key, kept.state) for key, kept in self._capacities.items() if kept.expires_ms <= now)
+        for key, state in expired:
+            self._forget(key, state)
+
+    def _step(self, capacity: str, step: Callable[[_Capacity, int], tuple[_Capacity, _R]]) -> _R:
+        now: Final = int(self._clock() * 1000)
+        self._sweep_expired(now)
+        kept: Final = self._capacities.get(capacity)
+        if kept is not None and kept.expires_ms <= now:
+            self._forget(capacity, kept.state)
+        fresh: Final = _Capacity(generation=self._forgotten_past, tokens=self._forgotten_past)
+        current: Final = fresh if kept is None or kept.expires_ms <= now else kept.state
+        updated, reply = step(current, now)
+        if _idle(updated):
+            self._forget(capacity, updated)
+            return reply
+        self._capacities[capacity] = _Kept(updated, _horizon_ms(updated, now) + self._settings.state_ttl_ms)
         return reply
 
     async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:

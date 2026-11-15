@@ -11,9 +11,9 @@ gone the capacity is healthy again. Another matching failure folds unclaimed wai
 import asyncio
 import bisect
 import time
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
-from types import MappingProxyType, TracebackType
+from types import TracebackType
 from typing import Final, Protocol, TypeAlias, TypeVar
 
 OPERATION_TIMED_OUT: Final = "operation_timed_out"
@@ -148,8 +148,12 @@ class MonotonicTimer:
         await asyncio.sleep(seconds)
 
 
+def _unfinished(tasks: "tuple[asyncio.Task[object], ...]") -> "tuple[asyncio.Task[object], ...]":
+    return tuple(task for task in tasks if not task.done())
+
+
 async def _reap(*tasks: "asyncio.Task[object]") -> None:
-    unfinished: Final = tuple(task for task in tasks if not task.done())
+    unfinished: Final = _unfinished(tasks)
     for task in unfinished:
         _ = task.cancel()
     if unfinished:
@@ -166,16 +170,22 @@ async def _race(timer: Timer, seconds: float, work: "asyncio.Task[object]") -> b
         await _reap(guard, work)
 
 
-async def _until_done(
-    work: "tuple[asyncio.Task[object], ...]", guard: "asyncio.Task[None]", interrupted: bool = False
-) -> bool:
+async def _held_back(pending: "tuple[asyncio.Task[object], ...]", guard: "asyncio.Task[None]") -> bool:
+    """Waits for one of ``pending`` or ``guard`` to finish; True when the caller was cancelled meanwhile."""
     try:
-        _ = await asyncio.wait((*work, guard), return_when=asyncio.FIRST_COMPLETED)
+        _ = await asyncio.wait((*pending, guard), return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        return await _until_done(work, guard, interrupted=True)
-    if guard.done() or all(task.done() for task in work):
-        return interrupted
-    return await _until_done(work, guard, interrupted)
+        return True
+    return False
+
+
+async def _until_done(work: "tuple[asyncio.Task[object], ...]", guard: "asyncio.Task[None]") -> bool:
+    """Whether the caller was cancelled before all of ``work`` or ``guard`` finished. Only unfinished work is waited
+    on, so work that is already done never wakes the wait again."""
+    interrupted: bool = False  # rebind-ok: once any cancellation is held back it stays held
+    while not guard.done() and _unfinished(work):
+        interrupted = await _held_back(_unfinished(work), guard) or interrupted  # rebind-ok: see above
+    return interrupted
 
 
 async def _clean_up(timer: Timer, seconds: float, *work: "asyncio.Task[object]") -> bool:
@@ -396,13 +406,18 @@ def _unclaimed_back(capacity: _Capacity, now: int) -> tuple[_Waiter, ...]:
     return _queued(capacity.queue, lease.waiter)
 
 
-def _sweep(capacity: _Capacity, now: int) -> _Capacity:
+def _without_stale_lease(capacity: _Capacity, now: int) -> _Capacity:
     lease: Final = capacity.lease
     expired_lease: Final = lease is not None and lease.until_ms <= now
     dead_owner: Final = lease is not None and not lease.claimed and lease.waiter.deadline_ms <= now
     if expired_lease or dead_owner:
-        return _sweep(replace(capacity, queue=_unclaimed_back(capacity, now), lease=None), now)
-    return replace(capacity, queue=_live(capacity.queue, now), snapshot=_live(capacity.snapshot, now))
+        return replace(capacity, queue=_unclaimed_back(capacity, now), lease=None)
+    return capacity
+
+
+def _sweep(capacity: _Capacity, now: int) -> _Capacity:
+    kept: Final = _without_stale_lease(capacity, now)
+    return replace(kept, queue=_live(kept.queue, now), snapshot=_live(kept.snapshot, now))
 
 
 def _grant_probe(capacity: _Capacity, now: int, settings: QueueSettings) -> _Capacity:
@@ -417,11 +432,15 @@ def _grant_probe(capacity: _Capacity, now: int, settings: QueueSettings) -> _Cap
     )
 
 
-def _claim_probe(capacity: _Capacity, waiter_id: str) -> tuple[_Capacity, Probe] | None:
+def _claim_probe(
+    capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str
+) -> tuple[_Capacity, Probe] | None:
+    """A full lease from the claim on, however long the granted owner took to poll for it."""
     lease: Final = capacity.lease
     if lease is None or lease.claimed or lease.waiter.waiter_id != waiter_id:
         return None
-    return replace(capacity, lease=replace(lease, claimed=True)), Probe(capacity.generation, lease.token)
+    claimed: Final = replace(lease, claimed=True, until_ms=now + settings.lease_ms)
+    return replace(capacity, lease=claimed), Probe(capacity.generation, lease.token)
 
 
 def _congest(
@@ -476,17 +495,19 @@ def _admit(
     queued: Final = replace(swept, seq=waiter.seq, queue=_queued(swept.queue, waiter))
     if not queued.congested:
         return queued, Waiting(ahead=len(queued.snapshot))
-    return _settle_congested(_grant_probe(queued, now, settings), request.waiter_id)
+    return _settle_congested(_grant_probe(queued, now, settings), now, settings, request.waiter_id)
 
 
-def _settle_congested(capacity: _Capacity, waiter_id: str) -> tuple[_Capacity, Probe | Waiting]:
-    claimed: Final = _claim_probe(capacity, waiter_id)
+def _settle_congested(
+    capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str
+) -> tuple[_Capacity, Probe | Waiting]:
+    claimed: Final = _claim_probe(capacity, now, settings, waiter_id)
     return (capacity, Waiting()) if claimed is None else claimed
 
 
 def _poll(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str) -> tuple[_Capacity, PollReply]:
     swept: Final = _sweep(capacity, now)
-    claimed: Final = _claim_probe(swept, waiter_id)
+    claimed: Final = _claim_probe(swept, now, settings, waiter_id)
     if claimed is not None:
         return claimed
     position: Final = next((at for at, waiter in enumerate(swept.snapshot) if waiter.waiter_id == waiter_id), None)
@@ -500,7 +521,7 @@ def _poll(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str
         return replace(swept, queue=_without(swept.queue, waiter_id)), PassThrough(swept.generation)
     if not swept.congested:
         return swept, Waiting(ahead=len(swept.snapshot))
-    return _settle_congested(_grant_probe(swept, now, settings), waiter_id)
+    return _settle_congested(_grant_probe(swept, now, settings), now, settings, waiter_id)
 
 
 def _renew(
@@ -550,21 +571,35 @@ def _abandon(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: 
     return _grant_probe(remaining, now, settings)
 
 
+def _idle(capacity: _Capacity) -> bool:
+    return capacity.healthy and not capacity.queue
+
+
 class LocalQueueBackend:
-    """Coordinates the attempts of one process. Every step runs without awaiting, so each is atomic on the loop."""
+    """Coordinates the attempts of one process. Every step runs without awaiting, so each is atomic on the loop.
+
+    Only capacities with someone waiting, probing or draining are kept. One that goes idle is forgotten, and any
+    capacity started afterwards begins its generations and tokens past every forgotten one's, so a report still in
+    flight for a forgotten grant can never match a new one."""
 
     def __init__(self, settings: QueueSettings | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         self._settings = settings or QueueSettings()
         self._clock = clock
-        self._capacities: Mapping[str, _Capacity] = MappingProxyType({})
+        self._capacities: Final[dict[str, _Capacity]] = {}  # mutable-ok: updated in place so a step stays O(1)
+        self._forgotten_past = 0
 
     @property
     def settings(self) -> QueueSettings:
         return self._settings
 
     def _step(self, capacity: str, step: Callable[[_Capacity, int], tuple[_Capacity, _R]]) -> _R:
-        updated, reply = step(self._capacities.get(capacity, _Capacity()), int(self._clock() * 1000))
-        self._capacities = MappingProxyType({**self._capacities, capacity: updated})
+        fresh: Final = _Capacity(generation=self._forgotten_past, tokens=self._forgotten_past)
+        updated, reply = step(self._capacities.get(capacity, fresh), int(self._clock() * 1000))
+        if not _idle(updated):
+            self._capacities[capacity] = updated
+            return reply
+        self._forgotten_past = max(self._forgotten_past, updated.generation, updated.tokens)
+        _ = self._capacities.pop(capacity, None)
         return reply
 
     async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:

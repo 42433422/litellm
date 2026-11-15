@@ -235,6 +235,26 @@ async def test_a_renewed_lease_stays_exclusive_and_an_unrenewed_one_expires_to_t
 
 
 @pytest.mark.asyncio
+async def test_a_probe_claimed_late_holds_a_full_lease_from_its_claim(capacity: str, workers: WorkerFactory) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, lease_ms=3_000, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("owner", 0, first), ("later", 0, second)])
+    clock.ms = 1_000
+    assert await second.poll(capacity, "later") == Waiting()
+    clock.ms = 3_900
+    claimed: Final = await first.poll(capacity, "owner")
+    assert isinstance(claimed, Probe)
+
+    clock.ms = 6_500
+    held: Final = await second.poll(capacity, "later")
+    renewed: Final = await first.renew(capacity, "owner", claimed.token)
+
+    assert held == Waiting()
+    assert renewed is True
+
+
+@pytest.mark.asyncio
 async def test_a_waiter_whose_worker_stops_polling_is_dropped_after_its_liveness_window(
     capacity: str, workers: WorkerFactory
 ) -> None:

@@ -152,7 +152,7 @@ local function claim_probe(w)
   if redis.call('HGET', state, 'lease_waiter') ~= w or redis.call('HGET', state, 'lease_claimed') ~= '0' then
     return nil
   end
-  redis.call('HSET', state, 'lease_claimed', 1)
+  redis.call('HSET', state, 'lease_claimed', 1, 'lease_until', now + lease_ms)
   redis.call('HDEL', members, w)
   redis.call('ZREM', expiry, w)
   return {'grant', 'probe|' .. num('generation') .. '|' .. num('lease_token')}

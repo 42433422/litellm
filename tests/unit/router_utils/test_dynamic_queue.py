@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from collections.abc import Coroutine, Sequence
 from typing import Final, TypeVar
 
@@ -412,6 +413,45 @@ async def test_an_unrenewed_probe_lease_expires_so_the_next_waiter_probes_and_th
     assert isinstance(await backend.admit(_request("c"), FAR), Waiting)
 
 
+async def test_a_probe_claimed_late_holds_a_full_lease_from_its_claim() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, lease_ms=3_000)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0), ("later", 0))
+    timer.at = 1.0
+    assert await backend.poll(CAPACITY, "later") == Waiting()
+    timer.at = 3.9
+    claimed: Final = await backend.poll(CAPACITY, "owner")
+    assert isinstance(claimed, Probe)
+
+    timer.at = 6.5
+    held: Final = await backend.poll(CAPACITY, "later")
+    renewed: Final = await backend.renew(CAPACITY, "owner", claimed.token)
+
+    assert held == Waiting()
+    assert renewed is True
+
+
+async def test_a_capacity_that_went_idle_and_congests_again_ignores_a_report_for_an_earlier_grant() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _congest(backend)
+    timer.at = 1.0
+    earlier: Final = await backend.admit(_request("p"), FAR)
+    assert isinstance(earlier, Probe)
+    await backend.report(CAPACITY, "p", earlier, Succeeded())
+    recovered: Final = await backend.admit(_request("q"), FAR)
+    assert isinstance(recovered, PassThrough) and recovered.generation > earlier.generation
+
+    await _congest(backend)
+    timer.at = 2.0
+    current: Final = await backend.admit(_request("p"), FAR)
+    await backend.report(CAPACITY, "p", earlier, Succeeded())
+
+    assert isinstance(current, Probe) and current != earlier
+    assert isinstance(await backend.admit(_request("c"), FAR), Waiting)
+
+
 async def test_a_full_queue_refuses_new_waiters_until_one_leaves() -> None:
     backend: Final = _backend(ManualTimer(), max_waiting=2)
     await _congest(backend, retry_after_ms=FAR)
@@ -733,6 +773,31 @@ async def test_a_report_redis_never_answers_comes_back_as_unavailable_after_the_
 
     assert result == CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
     assert timer.pending() == 0
+
+
+async def test_a_slow_report_after_the_renewal_stopped_waits_idle_until_it_lands() -> None:
+    timer: Final = ManualTimer()
+    inner, holding, admitted = await _held_probe(timer)
+    attempt: Final = DynamicQueue(holding, timer).attempt(_request("p"), admitted)
+
+    async def probe() -> None | CoordinationUnavailable:
+        async with attempt:
+            return await attempt.report(Succeeded())
+
+    reporting: Final = asyncio.create_task(probe())
+    try:
+        await _signalled(holding.held)
+        for _ in range(sys.getrecursionlimit() * 4):
+            await asyncio.sleep(0)
+        waited: Final = not reporting.done()
+        holding.release.set()
+        result: Final = await _finished(reporting)
+    finally:
+        await _reap(reporting)
+
+    assert waited
+    assert result is None
+    assert isinstance(await inner.poll(CAPACITY, "behind"), Released)
 
 
 class NeverAnswersPolls(StallsAfterEnqueue):

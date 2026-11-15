@@ -3418,6 +3418,10 @@ class RustCore(
     def _records_of(self, ids: object) -> list[dict[str, object]]:  # mutable-ok: the deployment dicts filters take
         return [dict(as_str_mapping(self._handle.deployment(str(id))) or {}) for id in _as_list(ids)]
 
+    def _records_by_id(self, ids: Sequence[str]) -> tuple[Mapping[str, object], ...]:
+        """The deployments the dynamic queue reads, for ids it holds in any sequence."""
+        return tuple(as_str_mapping(self._handle.deployment(id)) or {} for id in ids)
+
     async def _answer_tags(self, step: Mapping[str, object], request: Mapping[str, object]) -> object:
         """``get_deployments_for_tag`` over the step's candidates (bridged: not ported to Rust yet)."""
         from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs
@@ -3553,7 +3557,7 @@ class RustCore(
             return self._text_only(step)
         if step.get("stage") == "dynamic_congested":
             cooling: Final = tuple(str(id) for id in _as_list(step.get("candidates")))
-            busy: Final = await congested_ids(cooling, self._records_of, self.queues_on(request))
+            busy: Final = await congested_ids(cooling, self._records_by_id, self.queues_on(request))
             if isinstance(busy, CoordinationUnavailable):
                 raise rejection_error(busy, str(step.get("model")))
             return tuple(sorted(busy))

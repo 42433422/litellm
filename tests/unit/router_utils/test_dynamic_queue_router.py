@@ -424,6 +424,47 @@ async def test_a_router_with_a_local_queue_serves_a_healthy_request_straight_thr
     assert "served" in str(response)
 
 
+def _ordered_pair() -> list[dict[str, object]]:
+    return [
+        {"model_name": "group", "litellm_params": {"model": "openai/gpt-x", "order": order}, "model_info": {"id": name}}
+        for name, order in (("first", 1), ("second", 2))
+    ]
+
+
+def _queueing_router(queue_timeout: float) -> litellm.Router:
+    return litellm.Router(
+        model_list=_ordered_pair(),
+        default_priority=0,
+        num_retries=0,
+        cooldown_time=60,
+        dynamic_queue={"enabled": True, "coordination": "local", "queue_timeout": queue_timeout},
+    )
+
+
+MESSAGES: Final = [{"role": "user", "content": "hi"}]
+
+
+async def test_a_group_whose_every_deployment_is_cooling_and_congested_waits_in_the_queue_instead_of_failing() -> None:
+    router: Final = _queueing_router(queue_timeout=0.01)
+    for _ in ("first", "second"):
+        with pytest.raises(litellm.RateLimitError):
+            _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
+
+    with pytest.raises(DynamicQueueTimeoutError):
+        _ = await router.acompletion(model="group", messages=MESSAGES, mock_response="never reached")
+
+
+async def test_a_group_with_a_healthy_deployment_left_serves_it_without_waiting_on_the_congested_one() -> None:
+    router: Final = _queueing_router(queue_timeout=30)
+    with pytest.raises(litellm.RateLimitError):
+        _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
+
+    served: Final = await router.acompletion(model="group", messages=MESSAGES, mock_response="served")
+
+    assert "served" in str(served)
+    assert served._hidden_params.get("model_id") == "second"  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the response's hidden params
+
+
 def test_a_sub_millisecond_backoff_still_waits_at_least_a_millisecond() -> None:
     settings: Final = DynamicQueueSettings(enabled=True, initial_backoff=0.0004, max_backoff=0.0004)
 

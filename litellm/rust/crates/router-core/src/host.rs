@@ -397,6 +397,9 @@ pub enum SelectStage {
     /// Every candidate is cooling down: return the ones the dynamic queue holds congested, which
     /// stay candidates so the attempt waits for its capacity's turn.
     DynamicCongested,
+    /// Return the candidates whose capacity the dynamic queue does not hold congested, or every
+    /// candidate when none is free or congestion cannot be read.
+    DynamicFree,
     /// `_deployment_serves_route`: return the candidates whose provider cannot serve the call
     /// `handler` names (a Decisions call on a provider with no Decisions config).
     RouteIncapable { handler: String },

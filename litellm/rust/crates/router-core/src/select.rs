@@ -706,10 +706,22 @@ impl Core {
             healthy.retain(|d| d.id == pinned);
         }
 
-        let order = inputs
-            .target_order
-            .or(request_order)
-            .or_else(|| healthy.iter().filter_map(|d| d.order()).min());
+        let requested_order = inputs.target_order.or(request_order);
+        if settings.dynamic_queue {
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            healthy = self
+                .without_congested(&ctx, request, inputs, requested_order, healthy)
+                .await?;
+        }
+        let order =
+            requested_order.or_else(|| healthy.iter().filter_map(|d| d.order()).min());
         if let Some(order) = order {
             healthy.retain(|d| d.order() == Some(order));
         }
@@ -778,6 +790,41 @@ impl Core {
         ctx.pool = pool;
         let facts = self.host.pre_call_facts(&ctx, &healthy).await?;
         crate::precall::filter(model_group, healthy, pool, &facts)
+    }
+
+    /// The dynamic queue's preference, once every eligibility filter ran: among the deployments the
+    /// pick could still land on, drop the ones whose capacity is congested while another is free.
+    async fn without_congested(
+        &self,
+        ctx: &RoutingContext<'_>,
+        request: &RouterRequest,
+        inputs: &SelectInputs,
+        order: Option<i64>,
+        healthy: Vec<Arc<Deployment>>,
+    ) -> Result<Vec<Arc<Deployment>>, Error> {
+        let reachable = |d: &Deployment| {
+            order.is_none_or(|order| d.order() == Some(order))
+                && !request.excluded_ids.contains(&d.id)
+                && !inputs.excluded_ids.contains(&d.id)
+                && !inputs.skipped_ids.contains(&d.id)
+                && !request.retry_skipped_ids.contains(&d.id)
+        };
+        let eligible: Vec<Arc<Deployment>> =
+            healthy.iter().filter(|d| reachable(d)).cloned().collect();
+        if eligible.len() < 2 {
+            return Ok(healthy);
+        }
+        let free = self
+            .host
+            .select(&SelectStage::DynamicFree, ctx, eligible.clone())
+            .await?;
+        if free.is_empty() || free.len() == eligible.len() {
+            return Ok(healthy);
+        }
+        Ok(healthy
+            .into_iter()
+            .filter(|d| !reachable(d) || free.iter().any(|f| f.id == d.id))
+            .collect())
     }
 
     /// Pick one of `candidates.healthy` with the group's strategy.

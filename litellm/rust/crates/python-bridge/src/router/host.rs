@@ -85,6 +85,8 @@ pub(crate) enum Stage {
     TextOnly,
     /// Every candidate is cooling down: return the ones the dynamic queue holds congested.
     DynamicCongested,
+    /// Return the candidates the dynamic queue does not hold congested, or all of them.
+    DynamicFree,
     /// `_deployment_serves_route`: return the candidates that cannot serve `handler`'s call.
     RouteIncapable { handler: String },
     /// `_decisions_deployment_refuses_media`: return the candidates that refuse the call's media.
@@ -897,6 +899,7 @@ impl Host for StepHost {
                 SelectStage::Tags => Stage::Tags,
                 SelectStage::TextOnly => Stage::TextOnly,
                 SelectStage::DynamicCongested => Stage::DynamicCongested,
+                SelectStage::DynamicFree => Stage::DynamicFree,
                 SelectStage::RouteIncapable { handler } => Stage::RouteIncapable {
                     handler: handler.clone(),
                 },

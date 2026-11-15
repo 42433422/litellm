@@ -1106,8 +1106,7 @@ from litellm.router import (
     LiteLLM_Params,
     ModelGroupInfo,
 )
-from litellm.router_api import ChangeSet, deployment_id, router_init_args
-from litellm.router_utils.dynamic_queue_router import refuse_local_queue_across_workers
+from litellm.router_api import ChangeSet, deployment_id, refuse_local_queue_across_workers, router_init_args
 from litellm.scheduler import FlowItem, Scheduler
 from litellm.secret_managers.aws_secret_manager import load_aws_kms
 from litellm.secret_managers.google_kms import load_google_kms

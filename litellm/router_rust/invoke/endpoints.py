@@ -2048,13 +2048,26 @@ class RustEndpoints:
         return await self._prioritized(model, priority, lambda: self._core.drive(plan, rest), rest)
 
     def _brings_caller_credentials(self, model: str, request: Mapping[str, object]) -> bool:
-        from litellm.litellm_core_utils.routing_common_utils import get_request_team_id
         from litellm.router_rust.invoke.shaping import serves_caller_credentials
 
         if serves_caller_credentials(request, {}):
             return True
-        candidates: Final = self._core.registry().deployments(model, team_id=get_request_team_id(request)) or ()
-        return any(serves_caller_credentials(request, as_dict(record)) for record in candidates)
+        return any(serves_caller_credentials(request, record) for record in self._requested_deployments(model, request))
+
+    def _requested_deployments(self, model: str, request: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
+        """The deployments ``model`` resolves to, as router-core resolves it: by ``litellm_params.model`` with
+        ``specific_deployment``, else the group (and what it aliases), else the deployment with that id."""
+        from litellm.litellm_core_utils.routing_common_utils import get_request_team_id
+
+        registry: Final = self._core.registry()
+        if request.get("specific_deployment") is True:
+            every: Final = (as_dict(record) for record in registry.deployments() or ())
+            return tuple(record for record in every if as_dict(record.get("litellm_params")).get("model") == model)
+        grouped: Final = registry.deployments(model, team_id=get_request_team_id(request)) or ()
+        if grouped:
+            return tuple(as_dict(record) for record in grouped)
+        by_id: Final = self._core.configured_deployment(model)
+        return () if by_id is None else (as_dict(by_id.model_dump()),)
 
     def _dynamic_queue(self) -> DynamicQueueRouter | None:
         settings: Final = self._core.resolved.dynamic_queue

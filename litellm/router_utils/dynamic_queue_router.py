@@ -31,7 +31,6 @@ from litellm.router_utils.dynamic_queue import (
     MonotonicTimer,
     OtherFailure,
     Outcome,
-    PassThrough,
     QueueBackend,
     QueueFull,
     QueueSettings,
@@ -197,7 +196,7 @@ class RequestQueue:
         self._priority = priority
         self._request_id = request_id
         self._deadline: Final[TotalDeadline | None] = current_total_deadline()
-        self._remaining_s = router.settings.queue_timeout
+        self._remaining_s = router.queue_timeout_s
         self._waits = 0
 
     def _budget_s(self) -> float:
@@ -217,8 +216,7 @@ class RequestQueue:
         admitted: Final = await queue.admit(request, budget, cooldown_left_s)
         if not isinstance(admitted, Admitted):
             raise rejection_error(admitted, model)
-        if not isinstance(admitted.grant, PassThrough):
-            self._remaining_s = max(self._remaining_s - (budget - admitted.remaining_s), 0.0)
+        self._remaining_s = max(self._remaining_s - (budget - admitted.remaining_s), 0.0)
         held: Final = contextlib.AsyncExitStack()
         attempt: Final = await held.enter_async_context(queue.attempt(request, admitted))
         return Admission(attempt, held, self.router)
@@ -252,6 +250,7 @@ class DynamicQueueRouter:
     ) -> None:
         self.settings = settings
         self.queue_settings: Final = settings.queue_settings()
+        self.queue_timeout_s: Final = settings.queue_timeout
         self.timer: Final[Timer] = timer or MonotonicTimer()
         self._redis = redis
         self._triggers: Final = frozenset(settings.trigger_status_codes)

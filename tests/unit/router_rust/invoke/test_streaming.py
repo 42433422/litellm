@@ -1,7 +1,8 @@
 import asyncio
 import contextlib
 import contextvars
-from collections.abc import AsyncIterator
+import dataclasses
+from collections.abc import AsyncIterator, Coroutine
 from typing import Final
 
 import httpx
@@ -36,6 +37,7 @@ from litellm.router_utils.dynamic_queue import (
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_router import (
+    QUEUE_FULL_CODE,
     Admission,
     DynamicQueueCoordinationError,
     DynamicQueueFullError,
@@ -75,19 +77,55 @@ def _provider_error(status_code: int) -> Exception:
     raise AssertionError("exception_type always raises for a provider error")
 
 
-class _RecoveringCore:
-    """Stands in for the core a stream recovers through, noting which request queue the recovery waited with."""
+def _real_router() -> litellm.Router:
+    """A router whose stream recoveries run on its own Rust core: the group, a fallback group, and a host that
+    records each retry backoff instead of waiting it out."""
+    arguments: Final = router_arguments(
+        model_list=[
+            {"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "d1"}},
+            {"model_name": "backup", "litellm_params": {"model": "openai/gpt-y"}, "model_info": {"id": "b1"}},
+        ],
+        default_priority=0,
+        num_retries=1,
+        fallbacks=[{"group": ["backup"]}],
+    )
+    return litellm.Router.from_config(build_router_config(arguments), _RecordsBackoffs())
 
-    def __init__(self) -> None:
-        self.recovered_with: list[RequestQueue | None] = []
 
-    async def recover_stream(self, *args: object) -> object:
-        self.recovered_with.append(current_request_queue())
-        return "recovered"
+def _local_queue(timer: ManualTimer, **settings: int | float) -> DynamicQueueRouter:
+    return DynamicQueueRouter(
+        DynamicQueueSettings(enabled=True, coordination="local", **settings), redis=lambda: None, timer=timer
+    )
 
-    async def retry_stream(self, *args: object, **options: object) -> object:
-        self.recovered_with.append(current_request_queue())
-        return ("retried", 1, 1)
+
+async def _congest_capacity(queue: DynamicQueueRouter, capacity: str) -> None:
+    admission: Final = await queue.request(priority=0, request_id=f"congests-{capacity}").admit(
+        capacity, "m", _no_cooldown
+    )
+    await admission.finish(MatchingFailure(retry_after_ms=60_000))
+
+
+def _recovering_attempt(router: litellm.Router, request_queue: RequestQueue | None) -> StreamAttempt:
+    return StreamAttempt(
+        core=router._core,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the router's own Rust core
+        op="acompletion",
+        request={"model": "group", "messages": MESSAGES, "stream": True, "mock_response": "recovered"},
+        kwargs={"stream": True},
+        group="group",
+        order=None,
+        depth=0,
+        level=0,
+        deployment_id="d1",
+        attempted_retries=0,
+        request_queue=request_queue,
+    )
+
+
+async def _outcome_of(call: Coroutine[object, object, object]) -> object:
+    try:
+        return await call
+    except Exception as error:  # noqa: BLE001  # a refused recovery raises, a retry returns its last failure
+        return error
 
 
 def _stream_attempt(
@@ -232,37 +270,30 @@ async def test_cancelling_the_task_reading_a_stream_gives_its_turn_back_without_
 @pytest.mark.parametrize("recovery", ["fallback", "retry"])
 async def test_a_stream_recovered_from_another_task_waits_with_its_own_requests_queue(recovery: str) -> None:
     timer: Final = ManualTimer()
-    router: Final = DynamicQueueRouter(
-        DynamicQueueSettings(enabled=True, coordination="local"), redis=lambda: None, timer=timer
-    )
-    request_queue: Final = router.request(priority=-1, request_id="r")
-    core: Final = _RecoveringCore()
-    attempt: Final = _stream_attempt(None, request_queue, core)
+    queue: Final = _local_queue(timer, queue_timeout=1.0)
+    await _congest_capacity(queue, "deployment:d1")
+    await _congest_capacity(queue, "deployment:b1")
+    router: Final = _real_router()
+    attempt: Final = _recovering_attempt(router, queue.request(priority=-1, request_id="r"))
     recover: Final = attempt.fallback if recovery == "fallback" else attempt.retry
 
-    consumer: Final = contextvars.Context().run(asyncio.ensure_future, recover(RuntimeError("cut")))
-    _ = await _finished(consumer)
+    consumer: Final = contextvars.Context().run(asyncio.ensure_future, _outcome_of(recover(_provider_error(500))))
+    try:
+        while not consumer.done():
+            await timer.parked(consumer)
+            timer.advance(0.25)
+        outcome: Final = consumer.result()
+    finally:
+        await _reap(consumer)
 
-    assert core.recovered_with == [request_queue]
+    assert isinstance(outcome, DynamicQueueTimeoutError)
+    assert timer.at <= 1.25
     assert current_request_queue() is None
-
-
-class _OuterStreamCore(_RecoveringCore):
-    """What the real chat and text stream wrappers ask of their core while they report a stream's end."""
-
-    def outcome_callbacks(self, kwargs: object, sync: bool) -> dict[str, bool]:
-        return {}
-
-    async def report_stream_success(self, *args: object) -> None:
-        return None
-
-    async def report_stream_failure(self, *args: object) -> None:
-        return None
 
 
 def _outer_attempt(op: str, admission: Admission) -> StreamAttempt:
     return StreamAttempt(
-        core=_OuterStreamCore(),  # pyright: ignore[reportArgumentType]  # serves only the stream-end reporting
+        core=_real_router()._core,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the router's own Rust core
         op=op,
         request={"stream": True},
         kwargs={"stream": True},
@@ -420,23 +451,7 @@ class _ReportsOnTheTimer:
         return await self.inner.abandon(capacity, waiter_id)
 
 
-class _RecordsWhetherTheFailureLanded(_RecoveringCore):
-    def __init__(self, backend: _ReportsOnTheTimer) -> None:
-        super().__init__()
-        self.backend = backend
-        self.landed_before_recovery: list[bool] = []
-
-    async def recover_stream(self, *args: object) -> object:
-        self.landed_before_recovery.append(self.backend.reported)
-        return await super().recover_stream(*args)
-
-    async def retry_stream(self, *args: object) -> object:
-        self.landed_before_recovery.append(self.backend.reported)
-        return await super().retry_stream(*args)
-
-
-@pytest.mark.parametrize("recovery", ["fallback", "retry"])
-async def test_a_stream_failure_reaches_the_queue_before_its_recovery_admits_anything(recovery: str) -> None:
+async def test_a_stream_failure_has_reached_the_queue_before_its_recovery_may_admit() -> None:
     timer: Final = ManualTimer()
     backend: Final = _ReportsOnTheTimer(timer)
     await backend.inner.report(CAPACITY, "congests", PassThrough(0), MatchingFailure())
@@ -446,38 +461,49 @@ async def test_a_stream_failure_reaches_the_queue_before_its_recovery_admits_any
     admitted: Final = await queue.admit(request, 30.0)
     assert isinstance(admitted, Admitted)
     held: Final = contextlib.AsyncExitStack()
-    router: Final = DynamicQueueRouter(DynamicQueueSettings(enabled=True), redis=lambda: None, timer=timer)
+    router: Final = _local_queue(timer)
     admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, router)
-    core: Final = _RecordsWhetherTheFailureLanded(backend)
-    attempt: Final = _stream_attempt(admission, router.request(0, "r"), core)
+    attempt: Final = _stream_attempt(admission, router.request(0, "r"))
 
     _ = attempt.settle_admission(_provider_error(429))
-    recovering: Final = asyncio.create_task(
-        attempt.fallback(RuntimeError("cut")) if recovery == "fallback" else attempt.retry(RuntimeError("cut"))
-    )
+    settled: Final = asyncio.create_task(attempt.admission_settled())
     try:
         await timer.parked(count=2)
+        before: Final = (settled.done(), backend.reported)
         timer.advance(0.5)
-        _ = await _finished(recovering)
+        congested: Final = await _finished(settled)
     finally:
-        await _reap(recovering)
+        await _reap(settled)
 
-    assert core.landed_before_recovery == [True]
+    assert before == (False, False)
+    assert backend.reported is True
+    assert congested is True
+
+
+async def _full_queues(timer: ManualTimer) -> "tuple[DynamicQueueRouter, tuple[asyncio.Task[Admission], ...]]":
+    """A local queue whose group and fallback capacities are congested and already hold their one waiter."""
+    queue: Final = _local_queue(timer, max_waiting=1)
+    await _congest_capacity(queue, "deployment:d1")
+    await _congest_capacity(queue, "deployment:b1")
+    waiters: Final = tuple(
+        asyncio.create_task(queue.request(priority=0, request_id=f"w-{capacity}").admit(capacity, "m", _no_cooldown))
+        for capacity in ("deployment:d1", "deployment:b1")
+    )
+    for waiter in waiters:
+        await timer.parked(waiter)
+    return queue, waiters
 
 
 async def test_a_queue_rejection_in_a_stream_recovery_ends_the_stream_with_that_rejection() -> None:
-    rejection: Final = DynamicQueueFullError("m")
-
-    class _RefusingCore(_RecoveringCore):
-        async def recover_stream(self, *args: object) -> object:
-            raise rejection
-
-    attempt: Final = _stream_attempt(None, None, _RefusingCore())
-
-    with pytest.raises(DynamicQueueFullError) as raised:
-        _raise_fallback_failure(await _recovered_or_error(attempt))
-
-    assert raised.value is rejection
+    timer: Final = ManualTimer()
+    queue, waiters = await _full_queues(timer)
+    router: Final = _real_router()
+    attempt: Final = _recovering_attempt(router, queue.request(priority=0, request_id="r"))
+    try:
+        with pytest.raises(DynamicQueueFullError):
+            _raise_fallback_failure(await _recovered_or_error(attempt))
+    finally:
+        await _reap(*waiters)
 
 
 async def _recovered_or_error(attempt: StreamAttempt) -> Exception:
@@ -596,27 +622,24 @@ async def test_a_stream_failure_the_queue_never_learned_of_ends_its_recovery_as_
     admitted: Final = await queue.admit(request, 30.0)
     assert isinstance(admitted, Admitted)
     held: Final = contextlib.AsyncExitStack()
-    router: Final = DynamicQueueRouter(DynamicQueueSettings(enabled=True), redis=lambda: None, timer=timer)
+    router: Final = _local_queue(timer)
     admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, router)
-    core: Final = _RecoveringCore()
-    attempt: Final = _stream_attempt(admission, router.request(0, "r"), core)
+    attempt: Final = dataclasses.replace(
+        _recovering_attempt(_real_router(), router.request(0, "r")), admission=admission
+    )
 
     _ = attempt.settle_admission(failure)
-    if recovers:
-        assert await attempt.fallback(RuntimeError("cut")) == "recovered"
-    else:
-        with pytest.raises(DynamicQueueCoordinationError):
-            _ = await attempt.fallback(RuntimeError("cut"))
+    outcome: Final = await _outcome_of(attempt.fallback(RuntimeError("cut")))
 
-    assert len(core.recovered_with) == (1 if recovers else 0)
+    if recovers:
+        assert "recovered" in str([chunk async for chunk in outcome])  # pyright: ignore[reportGeneralTypeIssues]  # the recovered stream
+    else:
+        assert isinstance(outcome, DynamicQueueCoordinationError)
 
 
 async def test_the_real_chat_stream_failing_before_content_ends_with_its_recoverys_queue_rejection() -> None:
-    rejection: Final = DynamicQueueFullError("gpt-x")
-
-    class _RefusingOuterCore(_OuterStreamCore):
-        async def recover_stream(self, *args: object) -> object:
-            raise rejection
+    timer: Final = ManualTimer()
+    queue, waiters = await _full_queues(timer)
 
     async def cut_before_content() -> AsyncIterator[object]:
         raise MidStreamFallbackError(
@@ -629,18 +652,7 @@ async def test_the_real_chat_stream_failing_before_content_ends_with_its_recover
         )
         yield _chunk("never")
 
-    attempt: Final = StreamAttempt(
-        core=_RefusingOuterCore(),  # pyright: ignore[reportArgumentType]  # serves only the stream's recovery
-        op="acompletion",
-        request={"stream": True},
-        kwargs={"stream": True},
-        group="group",
-        order=None,
-        depth=0,
-        level=0,
-        deployment_id="d1",
-        attempted_retries=0,
-    )
+    attempt: Final = _recovering_attempt(_real_router(), queue.request(priority=0, request_id="r"))
     model_response: Final = await litellm.acompletion(
         model="openai/gpt-x", messages=[{"role": "user", "content": "hi"}], mock_response="unused", stream=True
     )
@@ -649,10 +661,13 @@ async def test_the_real_chat_stream_failing_before_content_ends_with_its_recover
     )
     stream: Final = wrap_chat_stream(attempt, model_response, _FirstChunk(chunk=role_only, rest=cut_before_content()))  # pyright: ignore[reportArgumentType]  # the mock call answers a stream
 
-    with pytest.raises(DynamicQueueFullError) as raised:
-        _ = [chunk async for chunk in stream]
+    try:
+        with pytest.raises(DynamicQueueFullError) as raised:
+            _ = [chunk async for chunk in stream]
+    finally:
+        await _reap(*waiters)
 
-    assert raised.value is rejection
+    assert raised.value.code == QUEUE_FULL_CODE
 
 
 @pytest.mark.parametrize(("status", "backoffs"), [(429, 0), (503, 1)], ids=["congesting", "not_a_trigger"])

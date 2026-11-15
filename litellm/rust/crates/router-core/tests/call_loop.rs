@@ -113,6 +113,12 @@ impl Host for ScriptedHost {
                 .filter(|d| self.congested.contains(&d.id.as_str()))
                 .collect());
         }
+        if *stage == SelectStage::DynamicFree {
+            return Ok(candidates
+                .into_iter()
+                .filter(|d| !self.congested.contains(&d.id.as_str()))
+                .collect());
+        }
         match self.pick_failures.lock().pop_front() {
             Some(failure) => Err(failure.into()),
             None => Ok(candidates),
@@ -2232,4 +2238,50 @@ async fn a_pick_left_with_only_cooling_deployments_keeps_only_the_congested_ones
     let next = router.call(Op::from("acompletion"), request()).await;
     let served = next.ok().map(|response| response.deployment_id);
     assert_eq!(served.as_deref(), served_by);
+}
+
+#[rstest]
+#[case::a_free_deployment_is_picked(None, "a2")]
+#[case::a_filter_keeping_only_the_congested_one_keeps_it(Some("a1"), "a1")]
+#[tokio::test]
+async fn a_pick_passes_over_a_congested_deployment_only_while_its_filters_leave_a_free_one(
+    mut config: RouterConfig,
+    #[case] pinned: Option<&'static str>,
+    #[case] served_by: &str,
+) {
+    config.dynamic_queue = true;
+    config.callback_filters = true;
+    let host = Arc::new(ScriptedHost {
+        congested: vec!["a1"],
+        pinned,
+        ..ScriptedHost::default()
+    });
+    let router = router(config, json!({"num_retries": 0}), host.clone());
+    let served = router
+        .call(Op::from("acompletion"), request())
+        .await
+        .unwrap();
+    assert_eq!(served.deployment_id, served_by);
+}
+
+#[rstest]
+#[case::off_keeps_the_order(false, "p1")]
+#[case::on_prefers_the_free_deployment(true, "p2")]
+#[tokio::test]
+async fn a_congested_lower_order_deployment_gives_way_to_a_free_higher_order_one(
+    #[case] dynamic_queue: bool,
+    #[case] served_by: &str,
+) {
+    let mut config = tiers(true);
+    config.dynamic_queue = dynamic_queue;
+    let host = Arc::new(ScriptedHost {
+        congested: vec!["p1"],
+        ..ScriptedHost::default()
+    });
+    let router = router(config, json!({"num_retries": 0}), host.clone());
+    let served = router
+        .call(Op::from("acompletion"), request())
+        .await
+        .unwrap();
+    assert_eq!(served.deployment_id, served_by);
 }

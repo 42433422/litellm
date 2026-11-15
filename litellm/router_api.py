@@ -300,6 +300,13 @@ def router_init_args() -> tuple[str, ...]:
     return ROUTER_INIT_ARGS
 
 
+def refuse_local_queue_across_workers(dynamic_queue: object, num_workers: str) -> None:
+    """Refuse a process-local dynamic queue the proxy would split across several workers."""
+    from litellm.router_utils.dynamic_queue_router import refuse_local_queue_across_workers as refuse
+
+    refuse(dynamic_queue, num_workers)
+
+
 def mark_advisor_orchestration_failure(exception: BaseException) -> None:
     """Tag an advisor orchestration failure, so the router does not cool down the deployment it picked."""
     from litellm.router_utils.cooldown_handlers import mark_advisor_orchestration_failure as mark

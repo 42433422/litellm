@@ -253,6 +253,7 @@ from litellm.router_utils.dynamic_queue_router import (
     congested_ids,
     current_request_queue,
     parse_dynamic_queue,
+    prefer_uncongested,
     rejection_error,
 )
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, selected_endpoint
@@ -3425,6 +3426,15 @@ class RustCore(
         )
         return strategy, selector, str(step.get("model")), candidates
 
+    async def _answer_dynamic_queue(self, step: Mapping[str, object], request: Mapping[str, object]) -> object:
+        ids: Final = tuple(str(id) for id in _as_list(step.get("candidates")))
+        if step.get("stage") == "dynamic_free":
+            return list(await prefer_uncongested(ids, self._records_by_id, self.queues_on(request)))
+        busy: Final = await congested_ids(ids, self._records_by_id, self.queues_on(request))
+        if isinstance(busy, CoordinationUnavailable):
+            raise rejection_error(busy, str(step.get("model")))
+        return sorted(busy)
+
     def queues_on(self, request: Mapping[str, object]) -> Callable[[Mapping[str, object]], bool]:
         def queues(deployment: Mapping[str, object]) -> bool:
             deployment_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
@@ -3571,12 +3581,8 @@ class RustCore(
             return await self._answer_tags(step, request)
         if step.get("stage") == "text_only":
             return self._text_only(step)
-        if step.get("stage") == "dynamic_congested":
-            cooling: Final = tuple(str(id) for id in _as_list(step.get("candidates")))
-            busy: Final = await congested_ids(cooling, self._records_by_id, self.queues_on(request))
-            if isinstance(busy, CoordinationUnavailable):
-                raise rejection_error(busy, str(step.get("model")))
-            return tuple(sorted(busy))
+        if step.get("stage") in ("dynamic_congested", "dynamic_free"):
+            return await self._answer_dynamic_queue(step, request)
         if step.get("stage") == "route_incapable":
             return self._route_incapable(step)
         if step.get("stage") == "media_refusing":
@@ -3997,13 +4003,13 @@ def _provider_request(step: Mapping[str, object]) -> Mapping[str, object]:
     return {"models": [wildcard_request(str(step.get("model")))]}
 
 
-_ASYNC_ONLY_STAGES: Final = frozenset({"callback_filters", "dynamic_congested"})
+_ASYNC_ONLY_STAGES: Final = frozenset({"callback_filters", "dynamic_congested", "dynamic_free"})
 
 
 def _skipped_on_sync(step: Mapping[str, object]) -> object:
     """A stage only async picks run, answered for a sync pick as if it never ran: the callback filters keep every
     candidate and the dynamic queue holds none congested."""
-    return step["candidates"] if step.get("stage") == "callback_filters" else []
+    return [] if step.get("stage") == "dynamic_congested" else step["candidates"]
 
 
 def _lookup_error(kind: object, model: str, default_deployment: object) -> BaseException | None:
@@ -5373,6 +5379,16 @@ class _Driver:
             return None
         return await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
 
+    async def _slot_or_turn_back(
+        self, port: "_EndpointPort", deployment: Mapping[str, object], call: "AttemptCall", admission: Admission | None
+    ) -> "contextlib.ExitStack":
+        """A full ``max_parallel_requests`` slot never reached the provider: its queue turn goes back uncounted."""
+        try:
+            return enter_deployment_slot(port, self._plan, deployment, call.kwargs)
+        except Exception:
+            await self._give_turn_back(admission)
+            raise
+
     @staticmethod
     async def _give_turn_back(admission: Admission | None) -> None:
         if admission is not None:
@@ -5458,7 +5474,7 @@ class _Driver:
             admission = await self._admit(deployment, call)  # rebind-ok: see above
             # The deployment's max_parallel_requests slot; an open chat stream takes it along.
             port = self._core._port  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core  # rebind-ok: the same port on every attempt
-            with enter_deployment_slot(port, self._plan, deployment, call.kwargs) as slot:
+            with await self._slot_or_turn_back(port, deployment, call, admission) as slot:
                 # A search tool is no deployment: nothing to check; Python's `_arerank` and
                 # `amoderation` run no routing pre-call checks either.
                 if self._plan.kind not in _NO_ROUTING_PRE_CALL_CHECKS:

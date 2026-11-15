@@ -41,6 +41,7 @@ from litellm.router_utils.dynamic_queue_router import (
     DynamicQueueFullError,
     DynamicQueueRouter,
     DynamicQueueSettings,
+    DynamicQueueTimeoutError,
     RequestQueue,
     current_request_queue,
 )
@@ -687,6 +688,14 @@ async def test_a_stream_retry_after_a_failure_the_queue_took_waits_there_instead
     failure: Final = _provider_error(status)
     _ = attempt.settle_admission(failure)
 
-    _ = await attempt.retry(failure)
+    result: Final = await attempt.retry(failure)
+    if isinstance(result, tuple):
+        stream: Final = result[0]
+        assert isinstance(stream, litellm.CustomStreamWrapper)
+        try:
+            _ = [chunk async for chunk in stream]
+        finally:
+            await stream.aclose()
 
+    assert isinstance(result, DynamicQueueTimeoutError if status == 429 else tuple)
     assert len(host.backoffs) == backoffs

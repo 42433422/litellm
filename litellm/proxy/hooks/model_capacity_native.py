@@ -42,7 +42,6 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError, map_v3_rate_limit_type
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RATE_LIMIT_UNVERIFIABLE_MESSAGE,
-    BatchEnqueuedTokenStore,
     LimiterPostCall,
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitedModel,
@@ -66,7 +65,6 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
     NativeBatchEnqueuedTokenStore,
     native_engine,
-    native_parallel_request_limiter_enabled,
     post_call_request,
     pre_call_request,
 )
@@ -660,17 +658,13 @@ class NativeDynamicRateLimiter(RustLogger):
             raise TypeError(f"model capacity counts on the native rate limit store, not {type(handle).__name__}")
         window_size: Final = rate_limit_window_size()
         usage_cache: Final = InternalUsageCache(dual_cache=internal_usage_cache)
-        engine: Final = (
-            native_engine(store, window_size, tpm_token_reservation_enabled(), time_provider or datetime.now)
-            if native_parallel_request_limiter_enabled()
-            else None
+        engine: Final = native_engine(
+            store, window_size, tpm_token_reservation_enabled(), time_provider or datetime.now
         )
         post_call: Final = LimiterPostCall(
             rate_limits=store,
             native=engine,
-            batch_enqueued_token_store=BatchEnqueuedTokenStore(internal_usage_cache=usage_cache)
-            if engine is None
-            else NativeBatchEnqueuedTokenStore(usage_cache, engine),
+            batch_enqueued_token_store=NativeBatchEnqueuedTokenStore(usage_cache, engine),
             memory_lock=asyncio.Lock(),
         )
         delegate: Final = CapacityDelegate(internal_usage_cache, post_call, window_size, media_model_resolver)

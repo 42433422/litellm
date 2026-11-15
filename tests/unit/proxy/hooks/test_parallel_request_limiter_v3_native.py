@@ -29,11 +29,11 @@ from litellm.constants import REDIS_CIRCUIT_BREAKER_FAILURE_THRESHOLD
 from litellm.integrations.custom_logger_v2.call import CallContext, CallFacts, CallIds, CallKind, CallTarget, CallTiming
 from litellm.integrations.custom_logger_v2.enforcement import FieldView
 from litellm.integrations.custom_logger_v2.enums import Field, Hook
+from litellm.integrations.custom_logger_v2.field_sources import FieldSource, HookArgs, with_sources
 from litellm.integrations.custom_logger_v2.legacy import PROXY_REQUEST_KEYS, KwargsFields
-from litellm.integrations.custom_logger_v2.rust import RustState
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.integrations.custom_logger_v2.patches import apply_patch
-from litellm.integrations.custom_logger_v2.field_sources import FieldSource, HookArgs, with_sources
+from litellm.integrations.custom_logger_v2.rust import RustState
 from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_request_processing import (
@@ -62,6 +62,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointT
 from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
 from litellm.types.utils import CallTypes, ModelResponse, Usage
 from tests._support.parallel_request_limiter_golden import Golden, Ttl
+from tests._support.rust_parallel_request_limiter import declared_reads
 from tests.unit.proxy.hooks.native_capacity_handler import NativeDynamicRateLimitHandler
 
 pytest.importorskip("litellm.rust_bridge._native")
@@ -69,7 +70,6 @@ pytest.importorskip("litellm.rust_bridge._native")
 if TYPE_CHECKING:
     from litellm.rust_bridge._native import NativeParallelRequestLimiterState
 
-_READS: Final = frozenset({Field.deprecated_kwargs})
 _ADMIT_ERROR: Final[contextvars.ContextVar[str]] = contextvars.ContextVar("admit_error")
 _DESCRIPTORS: Final = TypeAdapter(list[RateLimitDescriptor])
 _GOLDEN: Final = Golden()
@@ -214,12 +214,10 @@ def _dynamic(monkeypatch: pytest.MonkeyPatch, clock: Clock, port: int | None) ->
     )
     monkeypatch.setattr("litellm.callbacks", ["dynamic_rate_limiter_v3"])
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     handler: Final = NativeDynamicRateLimitHandler(
         DualCache() if port is None else DualCache(redis_cache=RedisCache(host="127.0.0.1", port=port)),
         time_provider=clock.now,
     )
-    monkeypatch.delenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER")
     assert handler.logger.delegate.post_call.native is not None
     handler.update_variables(llm_router=router)
     return handler
@@ -305,7 +303,7 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             with PreCallAuthScope(request.auth):
                 outcome = await side.native.run_rust(
                     Hook.pre_call,
-                    _READS,
+                    declared_reads(side.native, Hook.pre_call),
                     _proxy_view(request, data, PRE_CALL_SOURCES),
                     _proxy_ctx(side, index, Hook.pre_call, request, data),
                 )
@@ -388,7 +386,7 @@ async def _ended(
             if side.native is not None:
                 await side.native.run_rust(
                     Hook.post_call_success,
-                    frozenset({Field.deprecated_kwargs, Field.deprecated_response_obj}),
+                    declared_reads(side.native, Hook.post_call_success),
                     SimpleNamespace(deprecated_kwargs=data, deprecated_response_obj=response),
                     _ctx(side, index, Hook.post_call_success, request),
                 )
@@ -396,7 +394,7 @@ async def _ended(
             if side.native is not None:
                 prepared = await side.native.run_rust(
                     Hook.log_prepare,
-                    frozenset({Field.deprecated_kwargs, Field.standard_logging_payload}),
+                    declared_reads(side.native, Hook.log_prepare),
                     SimpleNamespace(
                         deprecated_kwargs=kwargs, standard_logging_payload=kwargs["standard_logging_object"]
                     ),
@@ -429,7 +427,7 @@ async def _ended(
             if side.native is not None:
                 await side.native.run_rust(
                     Hook.post_call_failure,
-                    _READS,
+                    declared_reads(side.native, Hook.post_call_failure),
                     _proxy_view(request, data, DERIVED_POST_CALL_FAILURE_PROXY_FIELDS),
                     _proxy_ctx(side, index, Hook.post_call_failure, request, data),
                 )
@@ -779,7 +777,7 @@ async def test_a_request_without_auth_metadata_falls_through_to_python() -> None
     assert isinstance(state, RustState)
     outcome: Final = await native.native.run_rust(
         Hook.pre_call,
-        _READS,
+        declared_reads(native.native, Hook.pre_call),
         SimpleNamespace(deprecated_kwargs=data),
         CallContext(hook=Hook.pre_call, call=None, state=state),
     )
@@ -1011,18 +1009,15 @@ async def test_mcp_tool_calls_are_limited_natively_like_python(
 
 
 @pytest.mark.asyncio
-async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine_when_the_flag_is_on(
+async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
         _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class has no public alias
     )
 
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     handler: Final = _PROXY_DynamicRateLimitHandlerV3(DualCache())
     assert handler.delegate.post_call.native is not None
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "false")
-    assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).delegate.post_call.native is None
 
 
 def _with_dynamic(
@@ -1147,7 +1142,7 @@ async def test_python_and_rust_callers_racing_on_the_memory_tier_lose_no_update(
 
 
 def _batch_usage(monkeypatch: pytest.MonkeyPatch, total_tokens: int, request_count: int) -> None:
-    from litellm.proxy.hooks.batch_rate_limiter import PROXY_BatchRateLimiter, BatchFileUsage
+    from litellm.proxy.hooks.batch_rate_limiter import BatchFileUsage, PROXY_BatchRateLimiter
 
     async def counted(*_: object, **__: object) -> BatchFileUsage:
         return BatchFileUsage(
@@ -1477,7 +1472,7 @@ async def _native_first_pass(
     with PreCallAuthScope(request.auth):
         await native.run_rust(
             Hook.pre_call,
-            _READS,
+            declared_reads(native, Hook.pre_call),
             _proxy_view(request, data, PRE_CALL_SOURCES),
             _proxy_ctx(side, 0, Hook.pre_call, request, data),
         )
@@ -1581,7 +1576,6 @@ async def test_auth_descriptors_from_rust_limit_requests_like_python(
 
 
 async def _through_proxy_logging(monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     monkeypatch.setattr(litellm, "callbacks", [])
     proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test
@@ -1636,7 +1630,6 @@ async def test_the_real_dispatcher_registers_one_native_and_limits_like_python(
 
 
 async def _capped_through_proxy_logging(monkeypatch: pytest.MonkeyPatch) -> object:
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     monkeypatch.setattr(litellm, "callbacks", [])
     proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test
@@ -1665,7 +1658,6 @@ class _Unprintable:
 
 
 async def _refused_through_proxy_logging(monkeypatch: pytest.MonkeyPatch, member: str) -> object:
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     monkeypatch.setattr(litellm, "callbacks", [])
     proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test

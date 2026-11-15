@@ -16,7 +16,6 @@ Redis.
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Final
 
@@ -29,7 +28,6 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROJECT_ITPM_DESCRIPTOR_KEY,
     PROJECT_OTPM_DESCRIPTOR_KEY,
     RateLimitedModel,
-    WindowGuardedIncrement,
     _call_id_from_callback_kwargs,
     _request_stash,
     get_or_create_request_stash,
@@ -39,7 +37,8 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROXY_MaxParallelRequestsHandler_v3 as RateLimitHandler,
 )
 from litellm.proxy.utils import InternalUsageCache, hash_token
-from litellm.redis.stores.rate_limits import AtomicCounter, CounterIncrement, RateLimitScope
+from litellm.redis.stores.connection import connect
+from litellm.redis.stores.rate_limits import CounterIncrement, RateLimitScope, RateLimitStore
 from litellm.types.llms.openai import (
     InputTokensDetails,
     ResponseAPIUsage,
@@ -47,7 +46,6 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.rerank import RerankResponse
 from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
-from tests.unit.redis.stores.fake_rate_limits import FakeRateLimits
 
 
 @pytest.fixture
@@ -57,23 +55,27 @@ def rate_limiter():
     return handler, cache
 
 
-@dataclass
-class PipelineRecordingRateLimits(FakeRateLimits):
-    connected: bool = False
-    pipelined: list[CounterIncrement] = field(default_factory=list)
+class PipelineRecordingRateLimits(RateLimitStore):
+    def __init__(self, cache: DualCache) -> None:
+        super().__init__(connect(cache.redis_cache).rate_limits(cache.default_in_memory_ttl))
+        self.pipelined: Final[list[CounterIncrement]] = []
 
     async def increment_many(self, increments: Sequence[CounterIncrement]) -> None:
         self.pipelined.extend(increments)
         await super().increment_many(increments)
 
+    async def increment_many_post_call(self, increments: Sequence[CounterIncrement]) -> None:
+        self.pipelined.extend(increments)
+        await super().increment_many_post_call(increments)
+
 
 @pytest.fixture
 def recording_rate_limiter():
     cache = DualCache()
-    rate_limits = PipelineRecordingRateLimits()
+    rate_limits = PipelineRecordingRateLimits(cache)
     handler = RateLimitHandler(
         internal_usage_cache=InternalUsageCache(cache),
-        rate_limit_store=rate_limits.store(),
+        rate_limit_store=rate_limits,
     )
     return handler, cache, rate_limits.pipelined
 
@@ -562,84 +564,6 @@ async def test_project_itpm_reconciled_on_success_excludes_cached_tokens(recordi
     assert any(i.amount == -20 for i in otpm_adjustments), (
         f"Expected a -20 OTPM adjustment (40 actual - 60 reserved), got: {otpm_adjustments}"
     )
-
-
-@pytest.mark.asyncio
-async def test_redis_window_guard_uses_reservation_identity_and_never_falls_back_negative():
-    calls = []
-
-    async def failing_guard(*, keys, args):
-        calls.append((keys, args))
-        raise RuntimeError("redis unavailable")
-
-    rate_limits = FakeRateLimits(window_guarded_token_increment_script=failing_guard)
-    handler = RateLimitHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()),
-        rate_limit_store=rate_limits.store(),
-    )
-    counter = handler.rate_limit_counter(PROJECT_ITPM_DESCRIPTOR_KEY, "project:model", "tokens")
-    await handler.async_increment_reservation_aware_tokens(
-        pipeline_operations=[
-            WindowGuardedIncrement(
-                increment=CounterIncrement(counter=counter, amount=-90, ttl=60),
-                expected_window_start="1234",
-                reservation_backend="redis",
-            )
-        ]
-    )
-
-    assert calls == [
-        (
-            [
-                "{model_per_project_itpm:project:model}:window",
-                "{model_per_project_itpm:project:model}:tokens",
-            ],
-            ["1234", -90, 60],
-        )
-    ]
-    assert rate_limits.redis_increments == []
-    assert handler.rate_limits.local((counter,)) == (None,)
-
-
-@pytest.mark.asyncio
-async def test_atomic_lua_response_carries_redis_window_identity():
-    async def successful_reservation(*, keys, args):
-        return [0, 25, 1234]
-
-    handler = RateLimitHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()),
-        rate_limit_store=FakeRateLimits(check_and_increment_by_n_script=successful_reservation).store(),
-    )
-    counter = handler.rate_limit_counter(PROJECT_ITPM_DESCRIPTOR_KEY, "project:model", "tokens")
-    meta = [
-        {
-            "descriptor_key": PROJECT_ITPM_DESCRIPTOR_KEY,
-            "descriptor_value": "project:model",
-            "current_limit": 100,
-            "rate_limit_type": "tokens",
-            "counter": counter,
-            "increment": 25,
-            "ttl": 60,
-            "window_size": 60,
-        }
-    ]
-
-    assert await handler._atomic_lua_per_descriptor([]) == {
-        "overall_code": "OK",
-        "statuses": [],
-    }
-
-    response = await handler._atomic_lua_per_descriptor(
-        descriptor_groups=[
-            (
-                [AtomicCounter(counter=counter, limit=100, increment=25, ttl=60, window_size=60)],
-                meta,
-            )
-        ]
-    )
-
-    assert response["statuses"][0]["limit_remaining"] == 75
-    assert response["reservation_windows"] == frozenset({(counter, "1234", "redis")})
 
 
 @pytest.mark.asyncio

@@ -55,11 +55,6 @@ from tests._support.rust_parallel_request_limiter import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _native_parallel_request_limiter(monkeypatch):
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
-
-
 @pytest.fixture
 def rate_limiter():
     cache = DualCache()

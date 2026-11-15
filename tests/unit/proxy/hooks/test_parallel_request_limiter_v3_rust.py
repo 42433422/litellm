@@ -149,11 +149,6 @@ def _capture_token_increments(fakes: FakeRateLimits) -> list[dict[str, object]]:
 
 
 @pytest.fixture(autouse=True)
-def _native_parallel_request_limiter(monkeypatch):
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
-
-
-@pytest.fixture(autouse=True)
 def _isolated_request_stash():
     token = _request_stash.set(None)
     yield

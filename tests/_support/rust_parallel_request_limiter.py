@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Final
 
-import pytest
 from pydantic import TypeAdapter
 
 from litellm.caching.caching import DualCache
@@ -16,6 +15,7 @@ from litellm.integrations.custom_logger_v2.field_sources import FieldSource, Hoo
 from litellm.integrations.custom_logger_v2.legacy import PROXY_REQUEST_KEYS, KwargsFields
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.integrations.custom_logger_v2.patches import apply_patch
+from litellm.integrations.custom_logger_v2.rust import WireManifest
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.utils import CallTypes
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
@@ -32,7 +32,6 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash as _live_request_stash
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
-    NATIVE_PARALLEL_REQUEST_LIMITER_ENV,
     ParallelRequestLimiterNativeLogger,
     PreCallAuthScope,
     native_parallel_request_limiter,
@@ -41,7 +40,6 @@ from litellm.proxy.v2_proxy_fields import DERIVED_POST_CALL_FAILURE_PROXY_FIELDS
 from litellm.rust_bridge._native import NativeParallelRequestLimiter
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
-_READS: Final = frozenset({Field.deprecated_kwargs})
 _DESCRIPTORS: Final = TypeAdapter(list[RateLimitDescriptor])
 
 
@@ -126,9 +124,7 @@ def rate_limit_descriptors() -> list[RateLimitDescriptor] | None:
 
 class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
     def __init__(self, *args: object, **kwargs: object) -> None:
-        with pytest.MonkeyPatch.context() as flag:
-            flag.setenv(NATIVE_PARALLEL_REQUEST_LIMITER_ENV, "true")
-            super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # the replicas pass the limiter's own arguments
+        super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # the replicas pass the limiter's own arguments
         assert self.native_companion is not None
         _NATIVES.append(self.native_companion)
         self.native_logger: Final[ParallelRequestLimiterNativeLogger] = native_parallel_request_limiter(self)
@@ -156,7 +152,7 @@ class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
         with PreCallAuthScope(user_api_key_dict):
             outcome: Final = await self.native_logger.run_rust(
                 Hook.pre_call,
-                _READS,
+                declared_reads(self.native_logger, Hook.pre_call),
                 _view(data, user_api_key_dict, call_type, PRE_CALL_SOURCES),
                 _context(Hook.pre_call, data, call_type, user_api_key_dict, endpoint_type.value),
             )
@@ -166,7 +162,7 @@ class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
     async def async_post_call_success_hook(self, data: dict, user_api_key_dict: UserAPIKeyAuth, response) -> None:  # pyright: ignore[reportMissingTypeArgument, reportMissingParameterType]  # the legacy hook's signature
         outcome: Final = await self.native_logger.run_rust(
             Hook.post_call_success,
-            frozenset({Field.deprecated_kwargs, Field.deprecated_response_obj}),
+            declared_reads(self.native_logger, Hook.post_call_success),
             SimpleNamespace(deprecated_kwargs=data, deprecated_response_obj=response),
             _context(Hook.post_call_success, data, None, user_api_key_dict, EndpointType.GENERIC.value),
         )
@@ -177,7 +173,7 @@ class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
         payload: Final = kwargs.get("standard_logging_object")
         prepared: Final = await self.native_logger.run_rust(
             Hook.log_prepare,
-            frozenset({Field.deprecated_kwargs, Field.standard_logging_payload}),
+            declared_reads(self.native_logger, Hook.log_prepare),
             SimpleNamespace(deprecated_kwargs=kwargs, standard_logging_payload=payload),
             _context(Hook.log_prepare, kwargs, call_type, None, EndpointType.GENERIC.value),
         )
@@ -196,7 +192,7 @@ class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
     ) -> None:
         await self.native_logger.run_rust(
             Hook.post_call_failure,
-            _READS,
+            declared_reads(self.native_logger, Hook.post_call_failure),
             _view(request_data, user_api_key_dict, None, DERIVED_POST_CALL_FAILURE_PROXY_FIELDS),
             _context(Hook.post_call_failure, request_data, None, user_api_key_dict, EndpointType.GENERIC.value),
         )
@@ -261,3 +257,8 @@ __all__ = [
     "get_request_stash",
     "rate_limit_descriptors",
 ]
+
+
+def declared_reads(native: ParallelRequestLimiterNativeLogger, hook: Hook) -> frozenset[Field]:
+    manifest: Final = WireManifest.model_validate_json(native.bridge.manifest())
+    return next(subscription.reads for subscription in manifest.subscriptions if subscription.hook is hook)

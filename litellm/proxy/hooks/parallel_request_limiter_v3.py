@@ -1239,16 +1239,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         # follow-up because Lua dominates wall-time and the lock is held for
         # one round-trip.
         self._check_and_increment_lock = asyncio.Lock()
-        self.native_companion: NativeParallelRequestLimiter | None = None
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
             NativeBatchEnqueuedTokenStore,
             limiter_engine,
-            native_parallel_request_limiter_enabled,
         )
 
-        if native_parallel_request_limiter_enabled():
-            self.native_companion = limiter_engine(self)
-            self.batch_enqueued_token_store = NativeBatchEnqueuedTokenStore(internal_usage_cache, self.native_companion)
+        self.native_companion: NativeParallelRequestLimiter | None = limiter_engine(self)
+        self.batch_enqueued_token_store = NativeBatchEnqueuedTokenStore(internal_usage_cache, self.native_companion)
 
     def _adopt_native_state(
         self,

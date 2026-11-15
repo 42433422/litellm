@@ -184,7 +184,7 @@ async def _until_done(work: "tuple[asyncio.Task[object], ...]", guard: "asyncio.
     on, so work that is already done never wakes the wait again."""
     interrupted: bool = False  # rebind-ok: once any cancellation is held back it stays held
     while not guard.done() and _unfinished(work):
-        interrupted = await _held_back(_unfinished(work), guard) or interrupted  # rebind-ok: see above
+        interrupted = await _held_back(_unfinished(work), guard) or interrupted
     return interrupted
 
 

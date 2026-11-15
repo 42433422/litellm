@@ -965,11 +965,10 @@ def limiter_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativePar
 def native_parallel_request_limiter(
     limiter: "PROXY_MaxParallelRequestsHandler_v3",
 ) -> ParallelRequestLimiterNativeLogger:
-    bridge: Final = limiter.native_companion or limiter_engine(limiter)
+    bridge: Final = limiter.native_companion
     manifest: Final = WireManifest.model_validate_json(bridge.manifest())
     cls: Final = type(manifest.selection.name, (ParallelRequestLimiterNativeLogger,), _namespace(bridge, manifest))  # pyright: ignore[reportArgumentType]  # the bridge takes its own state type
     logger: Final = cls(bridge, limiter)
-    limiter.native_companion = bridge  # rebind-ok: the Python limiter settles through the native's bridge
     store: Final = limiter.batch_enqueued_token_store
     if not isinstance(store, NativeBatchEnqueuedTokenStore):
         native_store: Final = NativeBatchEnqueuedTokenStore(store.internal_usage_cache, bridge)

@@ -264,15 +264,16 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
         data: Final = _request_data(_member(view, Field.deprecated_kwargs.value))
         match hook:
             case Hook.pre_call:
-                return await self._pre_call(data, view, ctx)
+                return await self._pre_call(data, reads, view, ctx)
             case Hook.post_call_success:
                 response: Final = _member(view, Field.deprecated_response_obj.value)
                 return await self._call(
-                    hook, view, ctx, {"call_id": _call_id(data), "batch": _batch_response(response)}
+                    hook, reads, view, ctx, {"call_id": _call_id(data), "batch": _batch_response(response)}
                 )
             case Hook.post_call_failure:
                 return await self._call(
                     hook,
+                    reads,
                     view,
                     ctx,
                     {
@@ -281,13 +282,14 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
                     },
                 )
             case Hook.log_prepare:
-                return await self._call(hook, view, ctx, {"call_id": _call_id(data)})
+                return await self._call(hook, reads, view, ctx, {"call_id": _call_id(data)})
             case _:
                 return None
 
     async def _call(
         self,
         hook: Hook,
+        reads: frozenset[Field],
         view: object,
         ctx: CallContext[object],
         inputs: Mapping[str, object],
@@ -299,7 +301,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
             return None
         call: Final = None if ctx.call is None else dataclasses.asdict(ctx.call)
         returned: Final = await self.bridge.handle(
-            hook.value, _fields(view, ctx), call, handle, request=request, inputs=inputs
+            hook.value, _fields(view, ctx, reads), call, handle, request=request, inputs=inputs
         )
         return verdict(returned)
 
@@ -325,6 +327,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
     async def _pre_call(
         self,
         data: dict[str, object],  # mutable-ok: the output cap is written into the request body
+        reads: frozenset[Field],
         view: object,
         ctx: CallContext[object],
     ) -> Patch | Abort | None:
@@ -368,6 +371,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
                 return prepared
             batch_outcome: Final = await self._call(
                 Hook.pre_call,
+                reads,
                 view,
                 ctx,
                 {**common, "phase": "first_pass", "batch_call": True, "batch": prepared},
@@ -381,6 +385,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
         stash.native_state = state
         try:
             return await self._hosted(
+                reads,
                 view,
                 ctx,
                 {
@@ -398,6 +403,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
 
     async def _hosted(
         self,
+        reads: frozenset[Field],
         view: object,
         ctx: CallContext[object],
         inputs: Mapping[str, object],
@@ -407,7 +413,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
         call: Final = None if ctx.call is None else dataclasses.asdict(ctx.call)
         execution: Final = self.bridge.start(
             Hook.pre_call.value,
-            _fields(view, ctx),
+            _fields(view, ctx, reads),
             call,
             state,
             host,
@@ -436,11 +442,11 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
             stash.ptu_ceiling = ceiling  # rebind-ok: the next pre_call line and settlement read the held ceiling
 
 
-def _fields(view: object, ctx: CallContext[object]) -> Mapping[str, object]:
-    reads: Final = _READS if ctx.call is None or not ctx.call.kind.call_type else _TYPED_READS
+def _fields(view: object, ctx: CallContext[object], reads: frozenset[Field]) -> Mapping[str, object]:
+    projected: Final = reads & (_READS if ctx.call is None or not ctx.call.kind.call_type else _TYPED_READS)
     return {
         Field.deprecated_kwargs.value: None,
-        **{field.value: _plain(value) for field in reads if (value := _member(view, field.value)) is not None},
+        **{field.value: _plain(value) for field in projected if (value := _member(view, field.value)) is not None},
     }
 
 

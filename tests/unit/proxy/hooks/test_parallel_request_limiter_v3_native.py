@@ -65,13 +65,13 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointT
 from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
 from litellm.types.utils import CallTypes, ModelResponse, Usage
 from tests._support.parallel_request_limiter_golden import Golden, Ttl
+from tests._support.rust_parallel_request_limiter import declared_reads
 
 pytest.importorskip("litellm.rust_bridge._native")
 
 if TYPE_CHECKING:
     from litellm.rust_bridge._native import NativeParallelRequestLimiterState
 
-_READS: Final = frozenset({Field.deprecated_kwargs})
 _ADMIT_ERROR: Final[contextvars.ContextVar[str]] = contextvars.ContextVar("admit_error")
 _DESCRIPTORS: Final = TypeAdapter(list[RateLimitDescriptor])
 _GOLDEN: Final = Golden()
@@ -305,7 +305,7 @@ async def _admit(side: Side, index: int, request: Request) -> object:
             with PreCallAuthScope(request.auth):
                 outcome = await side.native.run_rust(
                     Hook.pre_call,
-                    _READS,
+                    declared_reads(side.native, Hook.pre_call),
                     _proxy_view(request, data, PRE_CALL_SOURCES),
                     _proxy_ctx(side, index, Hook.pre_call, request, data),
                 )
@@ -388,7 +388,7 @@ async def _ended(
             if side.native is not None:
                 await side.native.run_rust(
                     Hook.post_call_success,
-                    frozenset({Field.deprecated_kwargs, Field.deprecated_response_obj}),
+                    declared_reads(side.native, Hook.post_call_success),
                     SimpleNamespace(deprecated_kwargs=data, deprecated_response_obj=response),
                     _ctx(side, index, Hook.post_call_success, request),
                 )
@@ -396,7 +396,7 @@ async def _ended(
             if side.native is not None:
                 prepared = await side.native.run_rust(
                     Hook.log_prepare,
-                    frozenset({Field.deprecated_kwargs, Field.standard_logging_payload}),
+                    declared_reads(side.native, Hook.log_prepare),
                     SimpleNamespace(
                         deprecated_kwargs=kwargs, standard_logging_payload=kwargs["standard_logging_object"]
                     ),
@@ -429,7 +429,7 @@ async def _ended(
             if side.native is not None:
                 await side.native.run_rust(
                     Hook.post_call_failure,
-                    _READS,
+                    declared_reads(side.native, Hook.post_call_failure),
                     _proxy_view(request, data, DERIVED_POST_CALL_FAILURE_PROXY_FIELDS),
                     _proxy_ctx(side, index, Hook.post_call_failure, request, data),
                 )
@@ -779,7 +779,7 @@ async def test_a_request_without_auth_metadata_falls_through_to_python() -> None
     assert isinstance(state, RustState)
     outcome: Final = await native.native.run_rust(
         Hook.pre_call,
-        _READS,
+        declared_reads(native.native, Hook.pre_call),
         SimpleNamespace(deprecated_kwargs=data),
         CallContext(hook=Hook.pre_call, call=None, state=state),
     )
@@ -1474,7 +1474,7 @@ async def _native_first_pass(
     with PreCallAuthScope(request.auth):
         await native.run_rust(
             Hook.pre_call,
-            _READS,
+            declared_reads(native, Hook.pre_call),
             _proxy_view(request, data, PRE_CALL_SOURCES),
             _proxy_ctx(side, 0, Hook.pre_call, request, data),
         )

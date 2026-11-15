@@ -220,7 +220,8 @@ if op == 'admit' then
   if budget <= 0 then
     return {'gone'}
   end
-  if redis.call('ZCARD', queue) + redis.call('ZCARD', drain) >= max_waiting then
+  local unclaimed = redis.call('HGET', state, 'lease_claimed') == '0' and 1 or 0
+  if redis.call('ZCARD', queue) + redis.call('ZCARD', drain) + unclaimed >= max_waiting then
     touch()
     return {'full'}
   end

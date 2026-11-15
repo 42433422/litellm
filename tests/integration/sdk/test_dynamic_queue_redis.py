@@ -272,6 +272,26 @@ async def test_a_waiter_whose_worker_stops_polling_is_dropped_after_its_liveness
 
 
 @pytest.mark.asyncio
+async def test_an_unclaimed_probe_holds_a_queue_place_until_its_owner_claims_it(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, max_waiting=2, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("owner", 0, first)])
+    clock.ms = 1_000
+    assert await second.admit(WaitRequest(capacity, "second", 0), FAR) == Waiting()
+
+    refused: Final = await second.admit(WaitRequest(capacity, "third", 0), FAR)
+    claimed: Final = await first.poll(capacity, "owner")
+    after_claim: Final = await second.admit(WaitRequest(capacity, "third", 0), FAR)
+
+    assert isinstance(refused, QueueFull)
+    assert isinstance(claimed, Probe)
+    assert after_claim == Waiting()
+
+
+@pytest.mark.asyncio
 async def test_a_full_queue_refuses_until_a_waiter_passes_its_deadline(capacity: str, workers: WorkerFactory) -> None:
     clock: Final = SharedClock()
     first, second = workers.pair(clock, max_waiting=1, liveness_ms=FAR)

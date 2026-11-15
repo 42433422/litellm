@@ -1,6 +1,6 @@
 import asyncio
-import sys
-from collections.abc import Coroutine, Sequence
+import contextvars
+from collections.abc import Callable, Coroutine, Sequence
 from typing import Final, TypeVar
 
 import pytest
@@ -58,6 +58,9 @@ class ManualTimer:
 
     def pending(self) -> int:
         return sum(1 for _, wake, _ in self._sleepers if not wake.done())
+
+    def sleeping(self) -> "tuple[asyncio.Task[object] | None, ...]":
+        return tuple(owner for _, wake, owner in self._sleepers if not wake.done())
 
     def _is_parked(self, task: "asyncio.Task[object] | None", count: int) -> bool:
         if task is None:
@@ -452,6 +455,23 @@ async def test_a_capacity_that_went_idle_and_congests_again_ignores_a_report_for
     assert isinstance(await backend.admit(_request("c"), FAR), Waiting)
 
 
+async def test_an_unclaimed_probe_holds_a_queue_place_until_its_owner_claims_it() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, max_waiting=2)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0))
+    timer.at = 1.0
+    assert await backend.admit(_request("second"), FAR) == Waiting()
+
+    refused: Final = await backend.admit(_request("third"), FAR)
+    claimed: Final = await backend.poll(CAPACITY, "owner")
+    after_claim: Final = await backend.admit(_request("third"), FAR)
+
+    assert isinstance(refused, QueueFull)
+    assert isinstance(claimed, Probe)
+    assert after_claim == Waiting()
+
+
 async def test_a_full_queue_refuses_new_waiters_until_one_leaves() -> None:
     backend: Final = _backend(ManualTimer(), max_waiting=2)
     await _congest(backend, retry_after_ms=FAR)
@@ -775,27 +795,115 @@ async def test_a_report_redis_never_answers_comes_back_as_unavailable_after_the_
     assert timer.pending() == 0
 
 
-async def test_a_slow_report_after_the_renewal_stopped_waits_idle_until_it_lands() -> None:
+class WaitObserver:
+    """Sees every wait put on a task the loop creates while it is the task factory: ``asyncio.wait`` and an ``await``
+    on a task both register a done callback on it."""
+
+    def __init__(self) -> None:
+        self.waits: dict[asyncio.Task[object], int] = {}  # mutable-ok: counts grow as waits register
+        self.after_done: dict[asyncio.Task[object], int] = {}  # mutable-ok: see above
+        self._targets: list[tuple[asyncio.Task[object], int, asyncio.Event]] = []  # mutable-ok: see above
+
+    def factory(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        coro: Coroutine[object, object, object],
+        name: str | None = None,
+        context: contextvars.Context | None = None,
+    ) -> "asyncio.Task[object]":
+        return _ObservedTask(coro, self, loop, name, context)
+
+    def waited_on(self, task: "asyncio.Task[object]") -> None:
+        self.waits[task] = self.waits.get(task, 0) + 1
+        if task.done():
+            self.after_done[task] = self.after_done.get(task, 0) + 1
+        for target, times, reached in self._targets:
+            if target is task and self.waits[task] >= times:
+                reached.set()
+
+    async def waited(self, task: "asyncio.Task[object]", times: int) -> None:
+        reached: Final = asyncio.Event()
+        self._targets.append((task, times, reached))
+        if self.waits.get(task, 0) >= times:
+            reached.set()
+        await _signalled(reached)
+
+
+class _ObservedTask(asyncio.Task[object]):
+    def __init__(
+        self,
+        coro: Coroutine[object, object, object],
+        observer: WaitObserver,
+        loop: asyncio.AbstractEventLoop,
+        name: str | None,
+        context: contextvars.Context | None,
+    ) -> None:
+        self._observer = observer
+        if context is None:
+            super().__init__(coro, loop=loop, name=name)
+        else:
+            super().__init__(coro, loop=loop, name=name, context=context)
+
+    def add_done_callback(
+        self, fn: "Callable[[asyncio.Task[object]], object]", *, context: contextvars.Context | None = None
+    ) -> None:
+        self._observer.waited_on(self)
+        super().add_done_callback(fn, context=context)
+
+
+class RecordsHeldReports(HoldsReleases):
+    def __init__(self, inner: LocalQueueBackend) -> None:
+        super().__init__(inner)
+        self.reporting: asyncio.Task[object] | None = None
+
+    async def report(
+        self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
+    ) -> None | CoordinationUnavailable:
+        self.reporting = asyncio.current_task()
+        return await super().report(capacity, waiter_id, grant, outcome)
+
+
+async def test_a_slow_report_is_waited_on_alone_once_the_renewal_it_stopped_has_finished() -> None:
     timer: Final = ManualTimer()
-    inner, holding, admitted = await _held_probe(timer)
+    inner: Final = _backend(timer, required_successes=1)
+    await _congest(inner)
+    holding: Final = RecordsHeldReports(inner)
+    admitted: Final = await _run(timer, DynamicQueue(holding, timer).admit(_request("p"), 9.0), 1.0)
+    assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
+    await _enqueue(inner, ("behind", 0))
     attempt: Final = DynamicQueue(holding, timer).attempt(_request("p"), admitted)
+    observer: Final = WaitObserver()
+    entered: Final = asyncio.Event()
+    go: Final = asyncio.Event()
 
     async def probe() -> None | CoordinationUnavailable:
         async with attempt:
+            entered.set()
+            await go.wait()
             return await attempt.report(Succeeded())
 
+    loop: Final = asyncio.get_running_loop()
+    previous_factory: Final = loop.get_task_factory()
+    loop.set_task_factory(observer.factory)
     reporting: Final = asyncio.create_task(probe())
     try:
+        await _signalled(entered)
+        await timer.parked()
+        (renewal,) = timer.sleeping()
+        go.set()
         await _signalled(holding.held)
-        for _ in range(sys.getrecursionlimit() * 4):
-            await asyncio.sleep(0)
-        waited: Final = not reporting.done()
+        assert holding.reporting is not None
+        await observer.waited(holding.reporting, times=2)
+        awaiting: Final = not reporting.done()
         holding.release.set()
         result: Final = await _finished(reporting)
     finally:
+        loop.set_task_factory(previous_factory)
         await _reap(reporting)
 
-    assert waited
+    assert renewal is not None and renewal.done()
+    assert awaiting
+    assert observer.after_done.get(renewal, 0) == 0
     assert result is None
     assert isinstance(await inner.poll(CAPACITY, "behind"), Released)
 

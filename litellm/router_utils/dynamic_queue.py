@@ -481,6 +481,14 @@ def _recover(capacity: _Capacity) -> _Capacity:
     )
 
 
+def _waiting(capacity: _Capacity) -> int:
+    """Every waiter that holds a place, including a probe's owner that has not claimed it yet and so can still go
+    back into the queue. A claimed probe is out calling the provider and holds none."""
+    lease: Final = capacity.lease
+    unclaimed: Final = lease is not None and not lease.claimed
+    return len(capacity.queue) + len(capacity.snapshot) + int(unclaimed)
+
+
 def _admit(
     capacity: _Capacity, now: int, settings: QueueSettings, request: WaitRequest, budget_ms: int
 ) -> tuple[_Capacity, AdmitReply]:
@@ -489,7 +497,7 @@ def _admit(
         return swept, PassThrough(swept.generation)
     if budget_ms <= 0:
         return swept, Gone()
-    if len(swept.queue) + len(swept.snapshot) >= settings.max_waiting:
+    if _waiting(swept) >= settings.max_waiting:
         return swept, QueueFull()
     waiter: Final = _Waiter(request.waiter_id, request.priority, swept.seq + 1, now + budget_ms)
     queued: Final = replace(swept, seq=waiter.seq, queue=_queued(swept.queue, waiter))

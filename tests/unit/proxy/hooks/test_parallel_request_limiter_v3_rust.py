@@ -43,7 +43,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
-from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy
+from litellm.proxy.hooks.parallel_request_limiter_v3_native import limiter_policy
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
     RATE_LIMIT_UNVERIFIABLE_MESSAGE,
@@ -5959,7 +5959,7 @@ def test_default_hash_tag_grouping_resolver_uses_litellm_setting(monkeypatch: py
     scopes: Final = tuple(counter.scope for counter in _GROUPING_COUNTERS)
 
     def slot_groups() -> tuple[tuple[int, ...], ...]:
-        force: Final = policy(handler)["force_grouping"]
+        force: Final = limiter_policy(handler)["force_grouping"]
         assert isinstance(force, bool)
         return handler.rate_limits.slot_groups(scopes, force)
 

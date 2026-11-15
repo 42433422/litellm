@@ -984,13 +984,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self._force_hash_tag_grouping_resolver = force_hash_tag_grouping_resolver
         self.rate_limits: Final = rate_limit_store or native_rate_limit_store(internal_usage_cache.dual_cache)
 
-        self.window_size = int(os.getenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", 60))
+        self.window_size = rate_limit_window_size()
 
         # When disabled, TPM is enforced post-call from actual usage (pre-v1.82
         # behavior) instead of reserving an estimated budget upfront, shedding
         # the extra per-request Redis Lua round-trip and the global-lock
         # in-memory fallback that the reservation path incurs.
-        self.tpm_reservation_enabled = os.getenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", "true").lower() == "true"
+        self.tpm_reservation_enabled = tpm_token_reservation_enabled()
 
         # Batch rate limiter (lazy loaded)
         self._batch_rate_limiter: CallTypeRateLimiter | None = None
@@ -1014,12 +1014,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self.native_companion: NativeParallelRequestLimiter | None = None
         from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
             NativeBatchEnqueuedTokenStore,
-            native_engine,
+            limiter_engine,
             native_parallel_request_limiter_enabled,
         )
 
         if native_parallel_request_limiter_enabled():
-            self.native_companion = native_engine(self)
+            self.native_companion = limiter_engine(self)
             self.batch_enqueued_token_store = NativeBatchEnqueuedTokenStore(internal_usage_cache, self.native_companion)
 
     def _adopt_native_state(
@@ -1298,27 +1298,18 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         team_id: str | None,
         rate_limit_type: str = "total",
     ) -> int:
-        """The reservation this limiter would hold for the request, for another limiter settling the same call."""
-        if rate_limit_type == "total":
-            return self._estimate_tokens_for_request(
-                data=data,
-                model=model,
-                min_configured_tpm_limit=min_configured_tpm_limit,
-                call_type=call_type,
-                team_id=team_id,
-            )
-        estimated_input, output_budget = self._estimate_input_and_output_tokens(
+        return estimate_request_tokens(
             data=data,
+            model=model,
             min_configured_tpm_limit=min_configured_tpm_limit,
             call_type=call_type,
             team_id=team_id,
+            rate_limit_type=rate_limit_type,
             media_model_resolver=self._media_model_resolver,
         )
-        return output_budget if rate_limit_type == "output" else estimated_input
 
     def bound_output_for_limit(self, data: object, min_configured_limit: int, call_type: str | None) -> None:
-        """Cap a request without an explicit output cap the way this limiter does for its own small TPM limits."""
-        self._apply_implicit_output_cap(data=data, min_configured_limit=min_configured_limit, call_type=call_type)
+        return bound_output_for_limit(data=data, min_configured_limit=min_configured_limit, call_type=call_type)
 
     def _estimate_tokens_for_request(
         self,
@@ -1329,44 +1320,15 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         configured_output_tokens: int | None = None,
         team_id: str | None = None,
     ) -> int:
-        """
-        Estimate total tokens this request will consume so we can reserve them
-        upfront (input + output budget):
-        estimated = input_tokens + max_tokens.
-
-        Supports chat (messages), completions (prompt), embeddings (input),
-        and the Responses API (also `input`, disambiguated from embeddings
-        via ``call_type``).
-
-        ``min_configured_tpm_limit`` is the smallest ``tokens_per_unit`` among
-        the TPM-bearing descriptors this request will be charged against. When
-        provided, the no-``max_tokens`` output-budget floor is capped at a
-        fraction of that limit so small TPM caps remain usable. Omit to
-        preserve the unconstrained floor.
-
-        ``configured_output_tokens`` is the operator-declared estimate resolved
-        from key or team metadata. When provided it replaces the heuristic
-        floor entirely, so the reservation reflects what this tenant's model
-        actually emits rather than one constant shared by every tenant.
-        """
-        estimated_input_tokens, max_tokens_estimate = self._estimate_input_and_output_tokens(
+        return estimate_tokens_for_request(
             data=data,
+            model=model,
             min_configured_tpm_limit=min_configured_tpm_limit,
             call_type=call_type,
             configured_output_tokens=configured_output_tokens,
             team_id=team_id,
             media_model_resolver=self._media_model_resolver,
         )
-        total_estimated: Final = estimated_input_tokens + max_tokens_estimate
-
-        verbose_proxy_logger.debug(
-            "TPM reservation estimate: input=%s, max_tokens=%s, total=%s",
-            estimated_input_tokens,
-            max_tokens_estimate,
-            total_estimated,
-        )
-
-        return total_estimated
 
     def _estimate_ptu_tokens_for_request(
         self,
@@ -1405,120 +1367,15 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         team_id: str | None = None,
         media_model_resolver: Callable[[str, str | None], tuple[str, ...]] | None = None,
     ) -> tuple[int, int]:
-        """
-        Estimate input tokens and output (max_tokens) budget separately, so
-        callers needing independent ITPM/OTPM reservations (rather than one
-        combined TPM reservation) can use each half on its own.
-
-        ``min_configured_tpm_limit`` is the smallest ``tokens_per_unit`` among
-        the TPM-bearing descriptors this request will be charged against. When
-        provided, the no-``max_tokens`` output-budget floor is capped at a
-        fraction of that limit so small TPM caps remain usable. Omit to
-        preserve the unconstrained floor.
-
-        ``call_type`` disambiguates embeddings from the Responses API: both
-        put their prompt in ``data["input"]``, but only embeddings have no
-        output tokens. Unset (the default) preserves the historical
-        "any `input` means zero output" behavior for callers that don't have
-        a call type to pass.
-
-        ``configured_output_tokens`` is the operator-declared estimate resolved
-        from key or team metadata. When provided it replaces the heuristic
-        floor entirely, so the reservation reflects what this tenant's model
-        actually emits rather than one constant shared by every tenant.
-        """
-        request_data: Final = as_str_mapping(data)
-        if not isinstance(data, dict) or request_data is None:
-            return 0, 0
-        request_model: Final = request_data.get("model")
-        translated_data: Final = self._translate_google_genai_native_request(data, call_type)
-        estimable_data: Final = translated_data if translated_data is not None else request_data
-        selected_fields: Final[tuple[object | None, object | None, object | None]] = (
-            (None, None, estimable_data.get("input"))
-            if call_type in RESPONSES_API_CALL_TYPES or call_type in EMBEDDING_API_CALL_TYPES
-            else (None, estimable_data.get("prompt"), None)
-            if call_type in TEXT_COMPLETION_API_CALL_TYPES
-            else (None, self._extraction_input_text(_REQUEST_RATE_LIMIT_DATA.validate_python(estimable_data)), None)
-            if call_type in EXTRACTION_API_CALL_TYPES
-            else (estimable_data.get("messages"), None, None)
-            if call_type
-            else (
-                estimable_data.get("messages"),
-                estimable_data.get("prompt"),
-                estimable_data.get("input"),
-            )
+        return estimate_input_and_output_tokens(
+            data=data,
+            min_configured_tpm_limit=min_configured_tpm_limit,
+            call_type=call_type,
+            configured_output_tokens=configured_output_tokens,
+            include_media=include_media,
+            team_id=team_id,
+            media_model_resolver=media_model_resolver,
         )
-        messages, prompt, raw_input = selected_fields
-        original_input: Final = (
-            billable_input_since_newest_compaction(raw_input) if call_type in RESPONSES_API_CALL_TYPES else raw_input
-        )
-
-        media_source: Final = messages if messages is not None else original_input
-        is_embedding_call: Final = call_type in EMBEDDING_API_CALL_TYPES
-        projected, media = (
-            split_media_for_tpm(media_source)
-            if include_media and (isinstance(messages, list) or call_type in RESPONSES_API_CALL_TYPES)
-            else (original_input, ())
-        )
-        fallback_model: Final = request_model if isinstance(request_model, str) else None
-        resolved_models: Final = (
-            _media_models(media_model_resolver, fallback_model or "", team_id) if media else (fallback_model or "",)
-        )
-        embedding_text, embedding_media_tokens = (
-            split_embedding_input_tokens(
-                original_input,
-                lambda: _media_models(media_model_resolver, fallback_model or "", team_id),
-                fallback_model,
-            )
-            if include_media and is_embedding_call
-            else (original_input, 0)
-        )
-        input_text: Final = projected if call_type in RESPONSES_API_CALL_TYPES else embedding_text
-        media_tokens: Final = embedding_media_tokens + sum(
-            estimate_media_block_tokens(block, resolved_models, fallback_model) for block in media
-        )
-
-        total_chars: Final = (
-            len(get_str_from_messages(messages))
-            if isinstance(messages, list) and messages
-            else len(prompt)
-            if isinstance(prompt, str)
-            else sum(len(str(item)) for item in prompt)
-            if isinstance(prompt, list)
-            else len(input_text)
-            if isinstance(input_text, str)
-            else sum(len(str(item)) for item in input_text)
-            if isinstance(input_text, list)
-            else 0
-        )
-
-        estimated_input_tokens: Final = (
-            max(1, total_chars // DEFAULT_CHARS_PER_TOKEN) if total_chars > 0 else 0
-        ) + media_tokens
-
-        explicit_max_tokens: Final = self._get_explicit_output_cap(data, call_type)
-        generates_no_output: Final = (
-            self._is_embedding_request(data, call_type) or call_type in EXTRACTION_API_CALL_TYPES
-        )
-
-        base_output_floor: Final = self.no_max_tokens_output_floor(min_configured_tpm_limit)
-        output_floor: Final = (
-            max(base_output_floor, RESPONSES_API_MIN_OUTPUT_TOKENS)
-            if call_type in RESPONSES_API_CALL_TYPES
-            else base_output_floor
-        )
-        max_tokens_estimate: Final = (
-            0
-            if generates_no_output
-            or (explicit_max_tokens is None and estimated_input_tokens == 0 and configured_output_tokens is None)
-            else explicit_max_tokens
-            if explicit_max_tokens is not None
-            else configured_output_tokens
-            if configured_output_tokens is not None
-            else max(estimated_input_tokens, output_floor)
-        )
-
-        return estimated_input_tokens, max_tokens_estimate * self.get_output_candidate_count(data, call_type)
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def in_memory_cache_sliding_window(
@@ -1762,7 +1619,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         parallel_slot_id: str | None,
         skip_parallel_check: bool,
     ) -> RateLimitResponse:
-        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, pre_call_request
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import limiter_policy, pre_call_request
 
         assert self.native_companion is not None
         reply: Final = await self.native_companion.should_rate_limit(
@@ -1771,7 +1628,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             skip_tpm_check,
             parallel_slot_id,
             skip_parallel_check,
-            json.dumps(policy(self)),
+            json.dumps(limiter_policy(self)),
             pre_call_request() if self.rate_limits.has_request_batch else None,
         )
         response: Final = self._native_reply(reply)
@@ -1782,7 +1639,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         descriptors: Sequence[RateLimitDescriptor],
         increments: Sequence[Mapping[Literal["requests", "tokens"], int]],
     ) -> RateLimitResponse:
-        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, pre_call_request
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import limiter_policy, pre_call_request
 
         assert self.native_companion is not None
         reply: Final = await self.native_companion.atomic_check_and_increment(
@@ -1791,7 +1648,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 (int(increment.get("requests", 0) or 0), int(increment.get("tokens", 0) or 0))
                 for increment in increments
             ],
-            json.dumps(policy(self)),
+            json.dumps(limiter_policy(self)),
             pre_call_request() if self.rate_limits.has_request_batch else None,
         )
         return self._native_reply(reply)
@@ -2912,11 +2769,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         return self._rate_limited_model(requested_model)
 
     def _rate_limited_model(self, requested_model: str | None) -> RateLimitedModel | None:
-        if not requested_model:
-            return None
-        return RateLimitedModel(
-            requested=requested_model,
-            group=self._model_group_resolver(requested_model) or requested_model,
+        return resolve_rate_limited_model(
+            requested_model=requested_model, model_group_resolver=self._model_group_resolver
         )
 
     def _rate_limited_models(self, model: RateLimitedModel | None) -> tuple[RateLimitedModel, ...]:
@@ -4382,7 +4236,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         native_state: Final = self._native_state(stash)
         if self.native_companion is not None and native_state is not None:
             from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
-                policy,
+                limiter_policy,
                 pre_call_request,
                 raise_wire_abort,
             )
@@ -4391,7 +4245,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 native_state,
                 json.dumps([dict(descriptor) for descriptor in descriptors]),
                 model,
-                json.dumps(policy(self)),
+                json.dumps(limiter_policy(self)),
                 pre_call_request(),
             )
             raise_wire_abort(reply.get("abort"))
@@ -4724,9 +4578,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 reuses_request_slot=reuses_request_slot,
             )
 
-    def _get_total_tokens_from_usage(
-        self, usage: object | None, rate_limit_type: Literal["output", "input", "total"]
-    ) -> int:
+    @staticmethod
+    def _get_total_tokens_from_usage(usage: object | None, rate_limit_type: Literal["output", "input", "total"]) -> int:
         """
         Get total tokens from response usage for rate limiting.
 
@@ -4934,16 +4787,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             await self._apply_redis_window_guarded_token_increments(redis_guarded_operations)
 
     def get_rate_limit_type(self) -> Literal["output", "input", "total"]:
-        from litellm.proxy.proxy_server import general_settings
-
-        specified_rate_limit_type: Final = general_settings.get("token_rate_limit_type", "total")
-        if specified_rate_limit_type not in [
-            "output",
-            "input",
-            "total",
-        ]:
-            return "total"  # default to total
-        return specified_rate_limit_type
+        return token_rate_limit_type()
 
     @staticmethod
     def _merge_ratelimit_statuses_into_additional_headers(
@@ -4982,80 +4826,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         return None
 
     def _resolve_reconciled_usage(self, response_obj: object) -> _ReconciledUsage | None:
-        """The prompt, completion, and cache-read token counts a response reports, else None
-        when it reports no usage at all. Cache-read tokens stay inside ``prompt_tokens`` here;
-        each consumer decides what they cost it."""
-        rerank_usage: Final = self._resolve_rerank_token_usage(response_obj)
-        if rerank_usage is not None:
-            return _ReconciledUsage(prompt_tokens=rerank_usage[0], completion_tokens=rerank_usage[1], cached_tokens=0)
-
-        usage: Final = self._response_usage(response_obj)
-
-        if isinstance(usage, Usage):
-            prompt_tokens: Final = usage.prompt_tokens or 0
-            completion_tokens: Final = usage.completion_tokens or 0
-            cached_tokens: Final = (
-                getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
-                if usage.prompt_tokens_details is not None
-                else 0
-            )
-            if prompt_tokens == 0 and completion_tokens == 0:
-                return None
-            return _ReconciledUsage(
-                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached_tokens=cached_tokens
-            )
-
-        if isinstance(usage, ResponseAPIUsage):
-            response_input_tokens: Final = usage.input_tokens or 0
-            response_output_tokens: Final = usage.output_tokens or 0
-            response_cached_tokens: Final = (
-                usage.input_tokens_details.cached_tokens or 0 if usage.input_tokens_details is not None else 0
-            )
-            if response_input_tokens == 0 and response_output_tokens == 0:
-                return None
-            return _ReconciledUsage(
-                prompt_tokens=response_input_tokens,
-                completion_tokens=response_output_tokens,
-                cached_tokens=response_cached_tokens,
-            )
-
-        if isinstance(usage, Mapping):
-            raw_prompt_tokens: Final = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            raw_completion_tokens: Final = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-            mapped_prompt_tokens: Final = raw_prompt_tokens if isinstance(raw_prompt_tokens, int) else 0
-            mapped_completion_tokens: Final = raw_completion_tokens if isinstance(raw_completion_tokens, int) else 0
-            prompt_details: Final = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
-            raw_cached_tokens: Final = (
-                (prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0)
-                or usage.get("cache_read_input_tokens")
-                or 0
-            )
-            mapped_cached_tokens: Final = raw_cached_tokens if isinstance(raw_cached_tokens, int) else 0
-            if mapped_prompt_tokens == 0 and mapped_completion_tokens == 0:
-                return None
-            return _ReconciledUsage(
-                prompt_tokens=mapped_prompt_tokens,
-                completion_tokens=mapped_completion_tokens,
-                cached_tokens=mapped_cached_tokens,
-            )
-
-        return None
+        return resolve_reconciled_usage(response_obj=response_obj)
 
     def _resolve_io_token_reconcile_usage(
         self,
         response_obj: object,
     ) -> tuple[int, int, bool]:
-        """
-        Resolve ``(billable_input_tokens, completion_tokens, usage_resolved)``
-        for ITPM/OTPM reconciliation. Cache-read tokens are excluded from
-        billable input -- Bedrock Mantle doesn't count them toward ITPM --
-        but they're untouched everywhere else (cost/usage logging still sees
-        the full prompt token count).
-        """
-        usage: Final = self._resolve_reconciled_usage(response_obj)
-        if usage is None:
-            return 0, 0, False
-        return usage.billable_input_tokens, usage.completion_tokens, True
+        return resolve_io_token_reconcile_usage(response_obj=response_obj)
 
     def _build_io_token_reservation_ops(
         self,
@@ -5495,7 +5272,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         from litellm.litellm_core_utils.core_helpers import (
             get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper is untyped
         )
-        from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy, post_call_request, usage_facts
+        from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+            limiter_policy,
+            post_call_request,
+            usage_facts,
+        )
 
         if not keep_slot:
             await native.release_for_settlement(
@@ -5552,7 +5333,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 if model is not None
             },
             "team_label": f"{_callback_kwargs_mapping(metadata).get('user_api_key_team_id')}",
-            "policy": policy(self),
+            "policy": limiter_policy(self),
             "keep_slot": keep_slot,
             "usage": usage_facts(self._resolve_reconciled_usage(usage_source)),
             "io_usage": {
@@ -5799,21 +5580,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             )
 
     def _recovered_partial_usage(self, source: Mapping[str, object]) -> Usage | None:
-        usage: Final = source.get("combined_usage_object")
-        if not isinstance(usage, Usage) or (usage.completion_tokens or 0) <= 0:
-            return None
-        return usage
+        return recovered_partial_usage(source=source)
 
     def _recovered_partial_usage_tokens(self, source: Mapping[str, object]) -> tuple[int, int, int]:
-        usage: Final = self._recovered_partial_usage(source)
-        if usage is None:
-            return 0, 0, 0
-        billable_input, completion_tokens, _ = self._resolve_io_token_reconcile_usage(usage)
-        return (
-            self._get_total_tokens_from_usage(usage=usage, rate_limit_type=self.get_rate_limit_type()),
-            billable_input,
-            completion_tokens,
-        )
+        return recovered_partial_usage_tokens(source=source, rate_limit_type=self.get_rate_limit_type())
 
     def _build_ptu_failure_settlement_ops(
         self, stash: RequestRateLimiterStash, source: Mapping[str, object], raw_actual_tokens: int
@@ -5869,7 +5639,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 await self.native_companion.settle_failure(
                     native_state,
                     json.dumps(
-                        {**failure_facts(self, failed_call), "call_id": _call_id_from_callback_kwargs(failed_call)}
+                        {
+                            **failure_facts(failed_call, self.get_rate_limit_type()),
+                            "call_id": _call_id_from_callback_kwargs(failed_call),
+                        }
                     ),
                     post_call_request() if self.rate_limits.has_redis else None,
                 )
@@ -6106,7 +5879,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 from litellm.proxy.hooks.parallel_request_limiter_v3_native import failure_facts
 
                 await self.native_companion.post_call_failure(
-                    native_state, json.dumps(failure_facts(self, request_data))
+                    native_state, json.dumps(failure_facts(request_data, self.get_rate_limit_type()))
                 )
                 return
             await self._release_stashed_parallel_slot(stash, user_api_key_dict.parent_otel_span)
@@ -6211,3 +5984,353 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
 
 PROXY_MaxParallelRequestsHandler_v3 = _PROXY_MaxParallelRequestsHandler_v3
+
+
+def rate_limit_window_size() -> int:
+    return int(os.getenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", 60))
+
+
+def tpm_token_reservation_enabled() -> bool:
+    return os.getenv("LITELLM_TPM_TOKEN_RESERVATION_ENABLED", "true").lower() == "true"
+
+
+def estimate_input_and_output_tokens(
+    data: object,
+    min_configured_tpm_limit: int | None = None,
+    call_type: str | None = None,
+    configured_output_tokens: int | None = None,
+    include_media: bool = True,
+    team_id: str | None = None,
+    media_model_resolver: Callable[[str, str | None], tuple[str, ...]] | None = None,
+) -> tuple[int, int]:
+    """
+    Estimate input tokens and output (max_tokens) budget separately, so
+    callers needing independent ITPM/OTPM reservations (rather than one
+    combined TPM reservation) can use each half on its own.
+
+    ``min_configured_tpm_limit`` is the smallest ``tokens_per_unit`` among
+    the TPM-bearing descriptors this request will be charged against. When
+    provided, the no-``max_tokens`` output-budget floor is capped at a
+    fraction of that limit so small TPM caps remain usable. Omit to
+    preserve the unconstrained floor.
+
+    ``call_type`` disambiguates embeddings from the Responses API: both
+    put their prompt in ``data["input"]``, but only embeddings have no
+    output tokens. Unset (the default) preserves the historical
+    "any `input` means zero output" behavior for callers that don't have
+    a call type to pass.
+
+    ``configured_output_tokens`` is the operator-declared estimate resolved
+    from key or team metadata. When provided it replaces the heuristic
+    floor entirely, so the reservation reflects what this tenant's model
+    actually emits rather than one constant shared by every tenant.
+    """
+    request_data: Final = as_str_mapping(data)
+    if not isinstance(data, dict) or request_data is None:
+        return 0, 0
+    request_model: Final = request_data.get("model")
+    translated_data: Final = PROXY_MaxParallelRequestsHandler_v3._translate_google_genai_native_request(data, call_type)
+    estimable_data: Final = translated_data if translated_data is not None else request_data
+    selected_fields: Final[tuple[object | None, object | None, object | None]] = (
+        (None, None, estimable_data.get("input"))
+        if call_type in RESPONSES_API_CALL_TYPES or call_type in EMBEDDING_API_CALL_TYPES
+        else (None, estimable_data.get("prompt"), None)
+        if call_type in TEXT_COMPLETION_API_CALL_TYPES
+        else (
+            None,
+            PROXY_MaxParallelRequestsHandler_v3._extraction_input_text(
+                _REQUEST_RATE_LIMIT_DATA.validate_python(estimable_data)
+            ),
+            None,
+        )
+        if call_type in EXTRACTION_API_CALL_TYPES
+        else (estimable_data.get("messages"), None, None)
+        if call_type
+        else (
+            estimable_data.get("messages"),
+            estimable_data.get("prompt"),
+            estimable_data.get("input"),
+        )
+    )
+    messages, prompt, raw_input = selected_fields
+    original_input: Final = (
+        billable_input_since_newest_compaction(raw_input) if call_type in RESPONSES_API_CALL_TYPES else raw_input
+    )
+
+    media_source: Final = messages if messages is not None else original_input
+    is_embedding_call: Final = call_type in EMBEDDING_API_CALL_TYPES
+    projected, media = (
+        split_media_for_tpm(media_source)
+        if include_media and (isinstance(messages, list) or call_type in RESPONSES_API_CALL_TYPES)
+        else (original_input, ())
+    )
+    fallback_model: Final = request_model if isinstance(request_model, str) else None
+    resolved_models: Final = (
+        _media_models(media_model_resolver, fallback_model or "", team_id) if media else (fallback_model or "",)
+    )
+    embedding_text, embedding_media_tokens = (
+        split_embedding_input_tokens(
+            original_input,
+            lambda: _media_models(media_model_resolver, fallback_model or "", team_id),
+            fallback_model,
+        )
+        if include_media and is_embedding_call
+        else (original_input, 0)
+    )
+    input_text: Final = projected if call_type in RESPONSES_API_CALL_TYPES else embedding_text
+    media_tokens: Final = embedding_media_tokens + sum(
+        estimate_media_block_tokens(block, resolved_models, fallback_model) for block in media
+    )
+
+    total_chars: Final = (
+        len(get_str_from_messages(messages))
+        if isinstance(messages, list) and messages
+        else len(prompt)
+        if isinstance(prompt, str)
+        else sum(len(str(item)) for item in prompt)
+        if isinstance(prompt, list)
+        else len(input_text)
+        if isinstance(input_text, str)
+        else sum(len(str(item)) for item in input_text)
+        if isinstance(input_text, list)
+        else 0
+    )
+
+    estimated_input_tokens: Final = (
+        max(1, total_chars // DEFAULT_CHARS_PER_TOKEN) if total_chars > 0 else 0
+    ) + media_tokens
+
+    explicit_max_tokens: Final = PROXY_MaxParallelRequestsHandler_v3._get_explicit_output_cap(data, call_type)
+    generates_no_output: Final = (
+        PROXY_MaxParallelRequestsHandler_v3._is_embedding_request(data, call_type)
+        or call_type in EXTRACTION_API_CALL_TYPES
+    )
+
+    base_output_floor: Final = PROXY_MaxParallelRequestsHandler_v3.no_max_tokens_output_floor(min_configured_tpm_limit)
+    output_floor: Final = (
+        max(base_output_floor, RESPONSES_API_MIN_OUTPUT_TOKENS)
+        if call_type in RESPONSES_API_CALL_TYPES
+        else base_output_floor
+    )
+    max_tokens_estimate: Final = (
+        0
+        if generates_no_output
+        or (explicit_max_tokens is None and estimated_input_tokens == 0 and configured_output_tokens is None)
+        else explicit_max_tokens
+        if explicit_max_tokens is not None
+        else configured_output_tokens
+        if configured_output_tokens is not None
+        else max(estimated_input_tokens, output_floor)
+    )
+
+    return estimated_input_tokens, max_tokens_estimate * PROXY_MaxParallelRequestsHandler_v3.get_output_candidate_count(
+        data, call_type
+    )
+
+
+def estimate_tokens_for_request(
+    data: object,
+    model: str | None = None,
+    min_configured_tpm_limit: int | None = None,
+    call_type: str | None = None,
+    configured_output_tokens: int | None = None,
+    team_id: str | None = None,
+    media_model_resolver: Callable[[str, str | None], tuple[str, ...]] = _resolve_media_models_via_proxy_router,
+) -> int:
+    """
+    Estimate total tokens this request will consume so we can reserve them
+    upfront (input + output budget):
+    estimated = input_tokens + max_tokens.
+
+    Supports chat (messages), completions (prompt), embeddings (input),
+    and the Responses API (also `input`, disambiguated from embeddings
+    via ``call_type``).
+
+    ``min_configured_tpm_limit`` is the smallest ``tokens_per_unit`` among
+    the TPM-bearing descriptors this request will be charged against. When
+    provided, the no-``max_tokens`` output-budget floor is capped at a
+    fraction of that limit so small TPM caps remain usable. Omit to
+    preserve the unconstrained floor.
+
+    ``configured_output_tokens`` is the operator-declared estimate resolved
+    from key or team metadata. When provided it replaces the heuristic
+    floor entirely, so the reservation reflects what this tenant's model
+    actually emits rather than one constant shared by every tenant.
+    """
+    estimated_input_tokens, max_tokens_estimate = estimate_input_and_output_tokens(
+        data=data,
+        min_configured_tpm_limit=min_configured_tpm_limit,
+        call_type=call_type,
+        configured_output_tokens=configured_output_tokens,
+        team_id=team_id,
+        media_model_resolver=media_model_resolver,
+    )
+    total_estimated: Final = estimated_input_tokens + max_tokens_estimate
+
+    verbose_proxy_logger.debug(
+        "TPM reservation estimate: input=%s, max_tokens=%s, total=%s",
+        estimated_input_tokens,
+        max_tokens_estimate,
+        total_estimated,
+    )
+
+    return total_estimated
+
+
+def estimate_request_tokens(
+    data: object,
+    model: str,
+    min_configured_tpm_limit: int,
+    call_type: str | None,
+    team_id: str | None,
+    rate_limit_type: str = "total",
+    media_model_resolver: Callable[[str, str | None], tuple[str, ...]] = _resolve_media_models_via_proxy_router,
+) -> int:
+    """The reservation this limiter would hold for the request, for another limiter settling the same call."""
+    if rate_limit_type == "total":
+        return estimate_tokens_for_request(
+            data=data,
+            model=model,
+            min_configured_tpm_limit=min_configured_tpm_limit,
+            call_type=call_type,
+            team_id=team_id,
+            media_model_resolver=media_model_resolver,
+        )
+    estimated_input, output_budget = estimate_input_and_output_tokens(
+        data=data,
+        min_configured_tpm_limit=min_configured_tpm_limit,
+        call_type=call_type,
+        team_id=team_id,
+        media_model_resolver=media_model_resolver,
+    )
+    return output_budget if rate_limit_type == "output" else estimated_input
+
+
+def bound_output_for_limit(data: object, min_configured_limit: int, call_type: str | None) -> None:
+    """Cap a request without an explicit output cap the way this limiter does for its own small TPM limits."""
+    PROXY_MaxParallelRequestsHandler_v3._apply_implicit_output_cap(
+        data=data, min_configured_limit=min_configured_limit, call_type=call_type
+    )
+
+
+def token_rate_limit_type() -> Literal["output", "input", "total"]:
+    from litellm.proxy.proxy_server import general_settings
+
+    specified_rate_limit_type: Final = general_settings.get("token_rate_limit_type", "total")
+    if specified_rate_limit_type not in [
+        "output",
+        "input",
+        "total",
+    ]:
+        return "total"  # default to total
+    return specified_rate_limit_type
+
+
+def resolve_rate_limited_model(
+    requested_model: str | None,
+    model_group_resolver: Callable[[str], str | None] = _resolve_model_group_alias_via_proxy_router,
+) -> RateLimitedModel | None:
+    if not requested_model:
+        return None
+    return RateLimitedModel(
+        requested=requested_model,
+        group=model_group_resolver(requested_model) or requested_model,
+    )
+
+
+def resolve_reconciled_usage(response_obj: object) -> _ReconciledUsage | None:
+    """The prompt, completion, and cache-read token counts a response reports, else None
+    when it reports no usage at all. Cache-read tokens stay inside ``prompt_tokens`` here;
+    each consumer decides what they cost it."""
+    rerank_usage: Final = PROXY_MaxParallelRequestsHandler_v3._resolve_rerank_token_usage(response_obj)
+    if rerank_usage is not None:
+        return _ReconciledUsage(prompt_tokens=rerank_usage[0], completion_tokens=rerank_usage[1], cached_tokens=0)
+
+    usage: Final = PROXY_MaxParallelRequestsHandler_v3._response_usage(response_obj)
+
+    if isinstance(usage, Usage):
+        prompt_tokens: Final = usage.prompt_tokens or 0
+        completion_tokens: Final = usage.completion_tokens or 0
+        cached_tokens: Final = (
+            getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            if usage.prompt_tokens_details is not None
+            else 0
+        )
+        if prompt_tokens == 0 and completion_tokens == 0:
+            return None
+        return _ReconciledUsage(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached_tokens=cached_tokens
+        )
+
+    if isinstance(usage, ResponseAPIUsage):
+        response_input_tokens: Final = usage.input_tokens or 0
+        response_output_tokens: Final = usage.output_tokens or 0
+        response_cached_tokens: Final = (
+            usage.input_tokens_details.cached_tokens or 0 if usage.input_tokens_details is not None else 0
+        )
+        if response_input_tokens == 0 and response_output_tokens == 0:
+            return None
+        return _ReconciledUsage(
+            prompt_tokens=response_input_tokens,
+            completion_tokens=response_output_tokens,
+            cached_tokens=response_cached_tokens,
+        )
+
+    if isinstance(usage, Mapping):
+        raw_prompt_tokens: Final = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+        raw_completion_tokens: Final = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        mapped_prompt_tokens: Final = raw_prompt_tokens if isinstance(raw_prompt_tokens, int) else 0
+        mapped_completion_tokens: Final = raw_completion_tokens if isinstance(raw_completion_tokens, int) else 0
+        prompt_details: Final = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+        raw_cached_tokens: Final = (
+            (prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0)
+            or usage.get("cache_read_input_tokens")
+            or 0
+        )
+        mapped_cached_tokens: Final = raw_cached_tokens if isinstance(raw_cached_tokens, int) else 0
+        if mapped_prompt_tokens == 0 and mapped_completion_tokens == 0:
+            return None
+        return _ReconciledUsage(
+            prompt_tokens=mapped_prompt_tokens,
+            completion_tokens=mapped_completion_tokens,
+            cached_tokens=mapped_cached_tokens,
+        )
+
+    return None
+
+
+def resolve_io_token_reconcile_usage(
+    response_obj: object,
+) -> tuple[int, int, bool]:
+    """
+    Resolve ``(billable_input_tokens, completion_tokens, usage_resolved)``
+    for ITPM/OTPM reconciliation. Cache-read tokens are excluded from
+    billable input -- Bedrock Mantle doesn't count them toward ITPM --
+    but they're untouched everywhere else (cost/usage logging still sees
+    the full prompt token count).
+    """
+    usage: Final = resolve_reconciled_usage(response_obj)
+    if usage is None:
+        return 0, 0, False
+    return usage.billable_input_tokens, usage.completion_tokens, True
+
+
+def recovered_partial_usage(source: Mapping[str, object]) -> Usage | None:
+    usage: Final = source.get("combined_usage_object")
+    if not isinstance(usage, Usage) or (usage.completion_tokens or 0) <= 0:
+        return None
+    return usage
+
+
+def recovered_partial_usage_tokens(
+    source: Mapping[str, object], rate_limit_type: Literal["output", "input", "total"]
+) -> tuple[int, int, int]:
+    usage: Final = recovered_partial_usage(source)
+    if usage is None:
+        return 0, 0, 0
+    billable_input, completion_tokens, _ = resolve_io_token_reconcile_usage(usage)
+    return (
+        PROXY_MaxParallelRequestsHandler_v3._get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type),
+        billable_input,
+        completion_tokens,
+    )

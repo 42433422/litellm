@@ -52,6 +52,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     claim_request_stash_for_data,
     get_or_create_request_stash,
     get_request_stash,
+    native_rate_limit_store,
     request_stash_for_callback,
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy as limiter_policy
@@ -60,7 +61,6 @@ from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.proxy.request_auth_context import REQUEST_AUTH
 from litellm.proxy.utils import InternalUsageCache
-from litellm.redis.stores.connection import connect
 from litellm.redis.stores.rate_limits import RATE_LIMITS_TARGET, RateLimitStore
 from litellm.types.integrations.custom_logger_v2 import KeyIdentity
 from litellm.types.integrations.custom_logger_v2 import Outcome as AttemptOutcome
@@ -461,9 +461,7 @@ def shared_rate_limit_store(internal_usage_cache: DualCache) -> RateLimitStore:
     )
     if registered is not None:
         return registered
-    return RateLimitStore(
-        connect(internal_usage_cache.redis_cache).rate_limits(internal_usage_cache.default_in_memory_ttl)
-    )
+    return native_rate_limit_store(internal_usage_cache)
 
 
 def _rate_limit_error(wire: WireAbort) -> Exception:

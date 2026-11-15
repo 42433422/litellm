@@ -173,6 +173,10 @@ class RateLimitedModel:
         return requested_limit if requested_limit is not None else limits.get(self.group)
 
 
+def native_rate_limit_store(cache: DualCache) -> RateLimitStore:
+    return RateLimitStore(connect(cache.redis_cache).rate_limits(cache.default_in_memory_ttl))
+
+
 def dynamic_rate_limiter_covers(model_group: str) -> bool:
     from litellm.proxy.hooks.model_capacity_native import NativeDynamicRateLimiter
     from litellm.proxy.proxy_server import llm_router
@@ -978,11 +982,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         self._ptu_team_ceiling_resolver = ptu_team_ceiling_resolver
         self._fail_closed_resolver = fail_closed_resolver
         self._force_hash_tag_grouping_resolver = force_hash_tag_grouping_resolver
-        self.rate_limits: Final = rate_limit_store or RateLimitStore(
-            connect(internal_usage_cache.dual_cache.redis_cache).rate_limits(
-                internal_usage_cache.dual_cache.default_in_memory_ttl
-            )
-        )
+        self.rate_limits: Final = rate_limit_store or native_rate_limit_store(internal_usage_cache.dual_cache)
 
         self.window_size = int(os.getenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", 60))
 

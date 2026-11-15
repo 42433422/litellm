@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from typing import Final
 
 import httpx
@@ -9,6 +9,9 @@ from pydantic import ValidationError
 import litellm
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.total_deadline import total_deadline
+from litellm.router import router_arguments
+from litellm.router_config import build_router_config
+from litellm.router_python_host import PythonHost
 from litellm.router_utils.dynamic_queue import (
     CoordinationUnavailable,
     MatchingFailure,
@@ -431,12 +434,13 @@ def _ordered_pair() -> list[dict[str, object]]:
     ]
 
 
-def _queueing_router(queue_timeout: float) -> litellm.Router:
+def _queueing_router(queue_timeout: float, disable_cooldowns: bool = False) -> litellm.Router:
     return litellm.Router(
         model_list=_ordered_pair(),
         default_priority=0,
         num_retries=0,
         cooldown_time=60,
+        disable_cooldowns=disable_cooldowns,
         dynamic_queue={"enabled": True, "coordination": "local", "queue_timeout": queue_timeout},
     )
 
@@ -454,8 +458,8 @@ async def test_a_group_whose_every_deployment_is_cooling_and_congested_waits_in_
         _ = await router.acompletion(model="group", messages=MESSAGES, mock_response="never reached")
 
 
-async def test_a_group_with_a_healthy_deployment_left_serves_it_without_waiting_on_the_congested_one() -> None:
-    router: Final = _queueing_router(queue_timeout=30)
+async def test_a_pick_passes_over_a_congested_deployment_its_order_would_pick_for_a_healthy_one() -> None:
+    router: Final = _queueing_router(queue_timeout=0.01, disable_cooldowns=True)
     with pytest.raises(litellm.RateLimitError):
         _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
 
@@ -463,6 +467,49 @@ async def test_a_group_with_a_healthy_deployment_left_serves_it_without_waiting_
 
     assert "served" in str(served)
     assert served._hidden_params.get("model_id") == "second"  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # the response's hidden params
+
+
+class _RecordsBackoffs(PythonHost):
+    def __init__(self) -> None:
+        self.backoffs: list[float] = []  # mutable-ok: each retry backoff the router asked for
+
+    def sleep(self, seconds: float) -> Awaitable[None]:
+        self.backoffs.append(seconds)
+        return _no_wait()
+
+
+async def _no_wait() -> None:
+    return None
+
+
+def _retrying_router(host: PythonHost) -> litellm.Router:
+    arguments: Final = router_arguments(
+        model_list=[{"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "only"}}],
+        default_priority=0,
+        num_retries=1,
+        dynamic_queue={"enabled": True, "coordination": "local", "queue_timeout": 0.01},
+    )
+    return litellm.Router.from_config(build_router_config(arguments), host)
+
+
+async def test_a_retry_after_a_congesting_failure_waits_in_the_queue_instead_of_the_retry_backoff() -> None:
+    host: Final = _RecordsBackoffs()
+    router: Final = _retrying_router(host)
+
+    with pytest.raises(DynamicQueueTimeoutError):
+        _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
+
+    assert host.backoffs == []
+
+
+async def test_a_retry_after_a_failure_the_queue_does_not_handle_keeps_its_retry_backoff() -> None:
+    host: Final = _RecordsBackoffs()
+    router: Final = _retrying_router(host)
+
+    with pytest.raises(litellm.ServiceUnavailableError):
+        _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(503))
+
+    assert len(host.backoffs) == 1
 
 
 def test_a_sub_millisecond_backoff_still_waits_at_least_a_millisecond() -> None:

@@ -3045,6 +3045,16 @@ class RustCore(
             driver.close_route_phase()
             raise
 
+    async def _retry_backoff(self, driver: "_Driver", step: Mapping[str, object]) -> None:
+        """A retry after a congesting failure the dynamic queue took waits there, behind the provider's retry-after
+        and in priority order, so it spends queue time instead of this backoff."""
+        if driver.queue_holds_retry():
+            return
+        if (outlasted := _error_outlasting_total_timeout(driver, _sleep_seconds(step))) is not None:
+            driver.close_route_phase()
+            raise outlasted
+        await self._host.sleep(_sleep_seconds(step))
+
     async def _run_steps(
         self, driver: "_Driver", call: "RouterCall[_CallSteps]"
     ) -> "tuple[_Driver, Mapping[str, object]]":
@@ -3061,10 +3071,7 @@ class RustCore(
                 case "attempt":
                     outcome = await driver.attempt(step)
                 case "sleep":
-                    if (outlasted := _error_outlasting_total_timeout(driver, _sleep_seconds(step))) is not None:
-                        driver.close_route_phase()
-                        raise outlasted
-                    await self._host.sleep(_sleep_seconds(step))
+                    await self._retry_backoff(driver, step)
                     outcome = None
                 case "allow_fallback":
                     outcome = await driver.allow_fallback(str(step["target"]))
@@ -3419,7 +3426,6 @@ class RustCore(
         return [dict(as_str_mapping(self._handle.deployment(str(id))) or {}) for id in _as_list(ids)]
 
     def _records_by_id(self, ids: Sequence[str]) -> tuple[Mapping[str, object], ...]:
-        """The deployments the dynamic queue reads, for ids it holds in any sequence."""
         return tuple(as_str_mapping(self._handle.deployment(id)) or {} for id in ids)
 
     async def _answer_tags(self, step: Mapping[str, object], request: Mapping[str, object]) -> object:
@@ -4524,6 +4530,7 @@ class _Driver:
             (stream_failure,) if stream_failure else ()
         )
         self._queue_rejection: QueueRejectedError | None = None
+        self._queued_retry = False
         # The retry counts an exhausted retry loop stamps on the pick error its level then raises.
         self._pending_stamps: Final[dict[int, tuple[object, object]]] = {}  # mutable-ok: filled as the call runs
         # Each level's current hop's first failure, once it retries: the error its retry loop raises
@@ -5311,7 +5318,13 @@ class _Driver:
         self._served = (name, self._request)
         return {"ok": True, "total_tokens": total_tokens(answered)}
 
+    def queue_holds_retry(self) -> bool:
+        held: Final = self._queued_retry
+        self._queued_retry = False
+        return held
+
     async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        self._queued_retry = False
         if self._passthrough is not None and not step.get("deployment_id"):
             return await self._passthrough_attempt(step)
         with routed_attempt() as attempt:
@@ -5368,8 +5381,11 @@ class _Driver:
             return None
         outcome: Final = admission.router.outcome_of(error, retry_after_seconds(error))
         reported: Final = await admission.finish(outcome)
-        if isinstance(reported, CoordinationUnavailable) and isinstance(outcome, MatchingFailure):
+        if not isinstance(outcome, MatchingFailure):
+            return None
+        if isinstance(reported, CoordinationUnavailable):
             return DynamicQueueCoordinationError(model)
+        self._queued_retry = True
         return None
 
     async def _cooldown_left_s(self, deployment_id: object) -> float:

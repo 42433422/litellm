@@ -125,7 +125,6 @@ def rate_limit_descriptors() -> list[RateLimitDescriptor] | None:
 class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # the replicas pass the limiter's own arguments
-        assert self.native_companion is not None
         _NATIVES.append(self.native_companion)
         self.native_logger: Final[ParallelRequestLimiterNativeLogger] = native_parallel_request_limiter(self)
         self.minted_call_ids: Final[set[str]] = set()

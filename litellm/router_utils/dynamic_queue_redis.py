@@ -134,7 +134,7 @@ local function sweep()
 end
 
 local function first_ready(set)
-  for _, member in ipairs(redis.call('ZRANGE', set, 0, sweep_limit - 1)) do
+  for _, member in ipairs(redis.call('ZRANGE', set, 0, max_waiting - 1)) do
     local w = waiter_of(member)
     if expired(w) then
       drop(w)

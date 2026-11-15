@@ -748,16 +748,8 @@ async def test_a_fallback_target_sending_its_own_credentials_skips_the_queue_and
     router: Final = _on_the_clock(
         litellm.Router(
             model_list=[
-                {
-                    "model_name": "primary",
-                    "litellm_params": {"model": "openai/gpt-x", "mock_response": _provider_error(429)},
-                    "model_info": {"id": "primary-1"},
-                },
-                {
-                    "model_name": "backup",
-                    "litellm_params": {"model": "openai/gpt-y", "mock_response": "served"},
-                    "model_info": {"id": "backup-1"},
-                },
+                {"model_name": name, "litellm_params": {"model": f"openai/{name}"}, "model_info": {"id": f"{name}-1"}}
+                for name in ("primary", "backup")
             ],
             default_priority=0,
             num_retries=0,
@@ -768,8 +760,13 @@ async def test_a_fallback_target_sending_its_own_credentials_skips_the_queue_and
     queue: Final = router._core._endpoints._dynamic_queue()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # the queue the router waits in
     await _congest(queue, "deployment:backup-1", retry_after_ms=60_000)  # pyright: ignore[reportUnknownArgumentType]  # see above
 
+    fallback: Final = {"model": "backup", "mock_response": "served", **override}
     outcome: Final = await _waited(
-        timer, router.acompletion(model="primary", messages=MESSAGES, fallbacks=[{"model": "backup", **override}]), 0.25
+        timer,
+        router.acompletion(
+            model="primary", messages=MESSAGES, mock_response=_provider_error(429), fallbacks=[fallback]
+        ),
+        0.25,
     )
 
     if served:

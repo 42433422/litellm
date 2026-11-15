@@ -504,28 +504,6 @@ async def test_a_congested_capacity_is_kept_through_a_retry_after_and_the_state_
     assert isinstance(expired, PassThrough)
 
 
-@pytest.mark.parametrize("head_leaves", ["expires", "cancels"])
-async def test_a_ready_waiter_past_a_head_still_cooling_down_probes_once_that_head_leaves(head_leaves: str) -> None:
-    timer: Final = ManualTimer()
-    backend: Final = _backend(timer, sweep_limit=2)
-    await _congest(backend)
-    for waiter in ("a", "b"):
-        assert isinstance(await backend.admit(_request(waiter), 3_000, ready_in_ms=60_000), Waiting)
-    assert isinstance(await backend.admit(_request("c"), FAR), Waiting)
-    timer.at = 1.0
-    held_back: Final = await backend.poll(CAPACITY, "c")
-
-    if head_leaves == "expires":
-        timer.at = 3.0
-    else:
-        for waiter in ("a", "b"):
-            await backend.abandon(CAPACITY, waiter)
-    turn: Final = await backend.poll(CAPACITY, "c")
-
-    assert held_back == Waiting()
-    assert isinstance(turn, Probe)
-
-
 async def test_a_full_queue_refuses_new_waiters_until_one_leaves() -> None:
     backend: Final = _backend(ManualTimer(), max_waiting=2)
     await _congest(backend, retry_after_ms=FAR)

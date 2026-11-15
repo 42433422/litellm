@@ -462,17 +462,14 @@ def _sweep(capacity: _Capacity, now: int) -> _Capacity:
     return replace(kept, queue=_live(kept.queue, now), snapshot=_live(kept.snapshot, now))
 
 
-def _first_ready(waiters: tuple[_Waiter, ...], now: int, settings: QueueSettings) -> int | None:
-    """The first ready waiter among the ``sweep_limit`` at the head, as the Redis script looks. A deployment's waiters
-    wait out its one cooldown, so a head that is not ready holds the rest back only until it is ready, leaves, or
-    passes its deadline."""
-    return next((at for at, waiter in enumerate(waiters[: settings.sweep_limit]) if waiter.ready_ms <= now), None)
+def _first_ready(waiters: tuple[_Waiter, ...], now: int) -> int | None:
+    return next((at for at, waiter in enumerate(waiters) if waiter.ready_ms <= now), None)
 
 
 def _grant_probe(capacity: _Capacity, now: int, settings: QueueSettings) -> _Capacity:
     if not capacity.congested or capacity.lease is not None or now < capacity.next_probe_ms:
         return capacity
-    at: Final = _first_ready(capacity.queue, now, settings)
+    at: Final = _first_ready(capacity.queue, now)
     if at is None:
         return capacity
     token: Final = capacity.tokens + 1
@@ -592,7 +589,7 @@ def _poll(
     if claimed is not None:
         return claimed
     position: Final = next((at for at, waiter in enumerate(swept.snapshot) if waiter.waiter_id == waiter_id), None)
-    if position is not None and position == _first_ready(swept.snapshot, now, settings):
+    if position is not None and position == _first_ready(swept.snapshot, now):
         return replace(swept, snapshot=_without(swept.snapshot, waiter_id)), Released(swept.generation)
     if position is not None:
         return swept, Waiting(ahead=position)

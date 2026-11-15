@@ -43,7 +43,7 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import (
     arm_saturation_fallback_walk,
     mark_saturation_fallbacks_exhausted,
 )
-from litellm.proxy.hooks import dynamic_rate_limiter_v3, parallel_request_limiter_v3
+from litellm.proxy.hooks import dynamic_rate_limiter_v3, model_capacity_native, parallel_request_limiter_v3
 from litellm.proxy.hooks.model_capacity_native import (
     UNLICENSED_PRIORITY_MESSAGE,
     NativeDynamicRateLimiter,
@@ -200,7 +200,9 @@ class NativeSide:
             build_native_dynamic_rate_limiter(DualCache(), time_provider=clock.now) if logger is None else logger
         )
         self.logger.update_variables(router)
-        self.limiter = self.logger.v3_limiter
+        self.limiter = PROXY_MaxParallelRequestsHandler_v3(
+            InternalUsageCache(dual_cache=DualCache()), rate_limit_store=self.logger.rate_limits
+        )
         self.callbacks: Final[list[object]] = [self.logger]
 
     async def pre_call(self, data: dict[str, object], call_type: str) -> Outcome:
@@ -820,6 +822,7 @@ async def test_an_unavailable_team_registry_and_a_failing_post_call_log_like_pyt
         registry = side.logger.delegate.active_teams
         monkeypatch.setattr(registry, "touch", registry_down)
         monkeypatch.setattr(side.limiter, "async_post_call_success_hook", post_call_fails)
+        monkeypatch.setattr(model_capacity_native, "limiter_post_call_success", post_call_fails)
 
     native: Final = await _differential(
         monkeypatch,
@@ -2235,7 +2238,7 @@ async def test_the_limiter_is_constructed_as_on_main_and_admits_and_refuses_like
         (
             dynamic_rate_limiter_v3.PROXY_DynamicRateLimitHandlerV3 in type(logger).__mro__,
             dynamic_rate_limiter_v3._PROXY_DynamicRateLimitHandlerV3 in type(logger).__mro__,
-            type(logger.v3_limiter) is PROXY_MaxParallelRequestsHandler_v3,
+            not hasattr(logger, "v3_limiter"),
         )
         for logger in (by_keyword, by_position, registered)
     )

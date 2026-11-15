@@ -228,6 +228,7 @@ class NativeDynamicRateLimitHandler:
         self._build: Final = build
         self.logger: NativeDynamicRateLimiter = build(internal_usage_cache, time_provider=time_provider)
         self.callbacks: list[object] = [self.logger]
+        self._limiter: PROXY_MaxParallelRequestsHandler_v3 = self._reader()
         self._redis: FakeRedis | None = None
         self._touched = False
 
@@ -242,13 +243,28 @@ class NativeDynamicRateLimitHandler:
         self._redis = redis  # rebind-ok: the handler counts on this fake Redis from now on
         return redis
 
-    def _rebuild(self, rate_limits: RateLimitStore) -> None:
+    def _reader(self) -> PROXY_MaxParallelRequestsHandler_v3:
+        return PROXY_MaxParallelRequestsHandler_v3(
+            InternalUsageCache(dual_cache=self._internal_usage_cache),
+            time_provider=self._time_provider,
+            rate_limit_store=self.logger.rate_limits,
+        )
+
+    def _rebuild(
+        self,
+        rate_limits: RateLimitStore,
+        media_model_resolver: Callable[[str, str | None], tuple[str, ...]] | None = None,
+    ) -> None:
         router: Final = self.logger.delegate.llm_router
         active_teams: Final = self.logger.delegate.active_teams
         self.logger = self._build(  # rebind-ok: the engine is built on the store the test hands in
-            self._internal_usage_cache, time_provider=self._time_provider, rate_limits=rate_limits
+            self._internal_usage_cache,
+            time_provider=self._time_provider,
+            rate_limits=rate_limits,
+            media_model_resolver=media_model_resolver,
         )
         self.callbacks = [self.logger]  # rebind-ok: the rebuilt logger takes the list position
+        self._limiter = self._reader()  # rebind-ok: the test's reader follows the rebuilt store
         vars(self.logger.delegate)["active_teams"] = active_teams
         if router is not None:
             self.logger.update_variables(router)
@@ -267,11 +283,11 @@ class NativeDynamicRateLimitHandler:
 
     @property
     def v3_limiter(self) -> PROXY_MaxParallelRequestsHandler_v3:
-        return self.logger.v3_limiter
+        return self._limiter
 
     @property
     def internal_usage_cache(self) -> InternalUsageCache:
-        return self.logger.v3_limiter.internal_usage_cache
+        return self._limiter.internal_usage_cache
 
     @property
     def active_teams(self) -> ActiveTeamRegistry:
@@ -286,11 +302,14 @@ class NativeDynamicRateLimitHandler:
     @v3_limiter.setter
     def v3_limiter(self, limiter: PROXY_MaxParallelRequestsHandler_v3) -> None:
         self._touched = True  # rebind-ok: the test's own store stays
-        same_cache: Final = limiter.internal_usage_cache is self.logger.v3_limiter.internal_usage_cache
+        same_cache: Final = limiter.internal_usage_cache is self._limiter.internal_usage_cache
         if self._redis is not None and not same_cache:
             self._redis = None  # rebind-ok: a limiter on another cache takes its own Redis
-        self._rebuild(limiter.rate_limits if self._redis is None else self.logger.rate_limits)
-        vars(self.logger.delegate)["v3_limiter"] = limiter
+        self._rebuild(
+            limiter.rate_limits if self._redis is None else self.logger.rate_limits,
+            limiter._media_model_resolver,  # pyright: ignore[reportPrivateUsage]  # the test's resolver moves to the engine
+        )
+        self._limiter = limiter  # rebind-ok: the test reads through the limiter it handed in
 
     @active_teams.setter
     def active_teams(self, registry: ActiveTeamRegistry) -> None:

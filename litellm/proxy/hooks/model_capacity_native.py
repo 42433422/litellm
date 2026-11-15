@@ -42,20 +42,35 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError, map_v3_rate_limit_type
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RATE_LIMIT_UNVERIFIABLE_MESSAGE,
+    BatchEnqueuedTokenStore,
+    LimiterPostCall,
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitedModel,
     RateLimitUnverifiableError,
     RequestRateLimiterStash,
     borrowing_team_model_limits,
+    bound_output_for_limit,
     callback_kwargs_mapping,
     claim_request_stash_for_data,
+    estimate_request_tokens,
     get_or_create_request_stash,
     get_request_stash,
+    limiter_post_call_success,
     native_rate_limit_store,
+    rate_limit_window_size,
     request_stash_for_callback,
+    resolve_rate_limited_model,
+    token_rate_limit_type,
+    tpm_token_reservation_enabled,
+)
+from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
+    NativeBatchEnqueuedTokenStore,
+    native_engine,
+    native_parallel_request_limiter_enabled,
+    post_call_request,
+    pre_call_request,
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy as limiter_policy
-from litellm.proxy.hooks.parallel_request_limiter_v3_native import post_call_request, pre_call_request
 from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.proxy.request_auth_context import REQUEST_AUTH
@@ -78,6 +93,7 @@ _TRACES: Final = frozenset({"untraced", "attempt", "key"})
 RATE_LIMIT_KIND: Final = "model_capacity_rate_limit"
 RERAISE_KIND: Final = "model_capacity_reraise"
 _TOKENS: Final = count(1)
+MediaModelResolver = Callable[[str, str | None], tuple[str, ...]]
 _LOG_LEVELS: Final = MappingProxyType({"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO})
 _TARGETED_HOOKS: Final = frozenset({Hook.pre_call, Hook.post_call_success, Hook.post_call_failure})
 _SETTLING_HOOKS: Final = frozenset({Hook.post_call_failure.value, Hook.attempt_ended.value})
@@ -300,9 +316,13 @@ class CapacityDelegate:
     def __init__(
         self,
         internal_usage_cache: DualCache,
-        v3_limiter: PROXY_MaxParallelRequestsHandler_v3,
+        post_call: LimiterPostCall,
+        window_size: int,
+        media_model_resolver: MediaModelResolver | None = None,
     ) -> None:
-        self.v3_limiter: Final = v3_limiter
+        self.post_call: Final = post_call
+        self.window_size: Final = window_size
+        self.media_model_resolver: Final = media_model_resolver
         self.active_teams: Final = ActiveTeamRegistry(internal_usage_cache)
         self.llm_router: Router | None = None
 
@@ -339,9 +359,9 @@ class CapacityDelegate:
             "saturation_threshold": settings.saturation_threshold,
             "class_split": settings.priority_class_share_splits_equally_among_active_teams,
             "saturation_check_cache_ttl": settings.saturation_check_cache_ttl,
-            "window_size": self.v3_limiter.window_size,
-            "rate_limit_type": self.v3_limiter.get_rate_limit_type(),
-            "policy": limiter_policy(self.v3_limiter),
+            "window_size": self.window_size,
+            "rate_limit_type": token_rate_limit_type(),
+            "policy": limiter_policy(),
         }
 
     @_seam_now
@@ -359,9 +379,7 @@ class CapacityDelegate:
     @_seam_now
     def borrowing_limits(self, args: Mapping[str, object]) -> object:
         model: Final = str(args["model"])
-        rate_limited: Final = self.v3_limiter.rate_limited_model(model) or RateLimitedModel(
-            requested=model, group=model
-        )
+        rate_limited: Final = resolve_rate_limited_model(model) or RateLimitedModel(requested=model, group=model)
         limits: Final = borrowing_team_model_limits(self._auth(), rate_limited)
         if limits.tpm is None and limits.rpm is None:
             return None
@@ -375,7 +393,7 @@ class CapacityDelegate:
     @_seam
     async def model_group(self, args: Mapping[str, object]) -> object:
         model: Final = str(args["model"])
-        return (self.v3_limiter.rate_limited_model(model) or RateLimitedModel(requested=model, group=model)).group
+        return (resolve_rate_limited_model(model) or RateLimitedModel(requested=model, group=model)).group
 
     @_seam
     async def estimate_tokens(self, args: Mapping[str, object]) -> object:
@@ -387,16 +405,18 @@ class CapacityDelegate:
         tpm_share: Final = int(str(args["tpm_share"]))
         call_type: Final = args["call_type"] if isinstance(args["call_type"], str) else None
         as_dispatched: Final = dict(data, model=model)
-        if self.v3_limiter.get_rate_limit_type() != "input":
-            self.v3_limiter.bound_output_for_limit(as_dispatched, tpm_share, call_type)
+        rate_limit_type: Final = token_rate_limit_type()
+        if rate_limit_type != "input":
+            bound_output_for_limit(as_dispatched, tpm_share, call_type)
         try:
-            estimate: Final = await offload_token_count(self.v3_limiter.estimate_request_tokens)(
+            estimate: Final = await offload_token_count(estimate_request_tokens)(
                 data=as_dispatched,
                 model=model,
                 min_configured_tpm_limit=tpm_share,
                 call_type=call_type,
                 team_id=None if live.auth is None else live.auth.team_id,
-                rate_limit_type=self.v3_limiter.get_rate_limit_type(),
+                rate_limit_type=rate_limit_type,
+                **({} if self.media_model_resolver is None else {"media_model_resolver": self.media_model_resolver}),
             )
         except Exception as error:  # noqa: BLE001  # an unreadable prompt still holds the minimum so admission runs
             from litellm._logging import verbose_proxy_logger
@@ -408,7 +428,7 @@ class CapacityDelegate:
         return {"kind": "tokens", "tokens": estimate}
 
     def cap_output(self, data: object, tpm_share: int, call_type: str | None) -> None:
-        self.v3_limiter.bound_output_for_limit(data, tpm_share, call_type)
+        bound_output_for_limit(data, tpm_share, call_type)
 
     @_seam_now
     def stash_call_type(self, _args: Mapping[str, object]) -> object:
@@ -417,11 +437,8 @@ class CapacityDelegate:
     @_seam
     async def post_call_success(self, args: Mapping[str, object]) -> object:
         live: Final = _live()
-        await self.v3_limiter.async_post_call_success_hook(  # pyright: ignore[reportUnknownMemberType]  # the legacy hook signature
-            data=dict(live.data or {}) if not isinstance(live.data, dict) else live.data,
-            user_api_key_dict=self._auth(),
-            response=live.response,  # pyright: ignore[reportArgumentType]  # the live response the proxy handed this hook
-        )
+        with service_target(RATE_LIMITS_TARGET):
+            await limiter_post_call_success(self.post_call, live.data or {}, self._auth(), live.response)
         if not response_has_hidden_params(live.response):
             return None
         additional_headers: Final = ensure_response_additional_headers(live.response)
@@ -631,26 +648,37 @@ class NativeDynamicRateLimiter(RustLogger):
         time_provider: Callable[[], datetime] | None = None,
         *,
         rate_limits: RateLimitStore | None = None,
+        media_model_resolver: MediaModelResolver | None = None,
     ) -> "NativeDynamicRateLimiter":
         from litellm.rust_bridge._native import NativeModelCapacity, NativeRateLimits
 
         register_abort_error(RATE_LIMIT_KIND, _rate_limit_error)
         register_abort_error(RERAISE_KIND, _reraise)
         store: Final = rate_limits or shared_rate_limit_store(internal_usage_cache)
-        v3_limiter: Final = PROXY_MaxParallelRequestsHandler_v3(
-            InternalUsageCache(dual_cache=internal_usage_cache),
-            time_provider=time_provider,
-            rate_limit_store=store,
-        )
         handle: Final = store.handle
         if not isinstance(handle, NativeRateLimits):
             raise TypeError(f"model capacity counts on the native rate limit store, not {type(handle).__name__}")
-        delegate: Final = CapacityDelegate(internal_usage_cache, v3_limiter)
+        window_size: Final = rate_limit_window_size()
+        usage_cache: Final = InternalUsageCache(dual_cache=internal_usage_cache)
+        engine: Final = (
+            native_engine(store, window_size, tpm_token_reservation_enabled(), time_provider or datetime.now)
+            if native_parallel_request_limiter_enabled()
+            else None
+        )
+        post_call: Final = LimiterPostCall(
+            rate_limits=store,
+            native=engine,
+            batch_enqueued_token_store=BatchEnqueuedTokenStore(internal_usage_cache=usage_cache)
+            if engine is None
+            else NativeBatchEnqueuedTokenStore(usage_cache, engine),
+            memory_lock=asyncio.Lock(),
+        )
+        delegate: Final = CapacityDelegate(internal_usage_cache, post_call, window_size, media_model_resolver)
         capacity: Final = NativeModelCapacity(
             delegate,
             handle,
-            v3_limiter.window_size,
-            v3_limiter.tpm_reservation_enabled,
+            window_size,
+            tpm_token_reservation_enabled(),
             None if time_provider is None else (lambda: time_provider().timestamp()),
         )
         native: Final = _StashedNative(capacity, capacity.callback(), delegate, store)
@@ -660,7 +688,7 @@ class NativeDynamicRateLimiter(RustLogger):
         logger.delegate = delegate
         logger.capacity = capacity
         logger.rate_limits = store
-        logger.window_size = v3_limiter.window_size
+        logger.window_size = window_size
         return logger
 
     def __init__(
@@ -669,12 +697,9 @@ class NativeDynamicRateLimiter(RustLogger):
         time_provider: Callable[[], datetime] | None = None,
         *,
         rate_limits: RateLimitStore | None = None,
+        media_model_resolver: MediaModelResolver | None = None,
     ) -> None:
         pass
-
-    @property
-    def v3_limiter(self) -> PROXY_MaxParallelRequestsHandler_v3:
-        return self.delegate.v3_limiter
 
     def update_variables(self, llm_router: Router) -> None:
         self.delegate.llm_router = llm_router
@@ -808,8 +833,11 @@ def build_native_dynamic_rate_limiter(
     time_provider: Callable[[], datetime] | None = None,
     *,
     rate_limits: RateLimitStore | None = None,
+    media_model_resolver: MediaModelResolver | None = None,
 ) -> NativeDynamicRateLimiter:
-    return NativeDynamicRateLimiter(internal_usage_cache, time_provider, rate_limits=rate_limits)
+    return NativeDynamicRateLimiter(
+        internal_usage_cache, time_provider, rate_limits=rate_limits, media_model_resolver=media_model_resolver
+    )
 
 
 @dataclass(slots=True)

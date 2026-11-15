@@ -220,7 +220,7 @@ def _dynamic(monkeypatch: pytest.MonkeyPatch, clock: Clock, port: int | None) ->
         time_provider=clock.now,
     )
     monkeypatch.delenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER")
-    assert handler.v3_limiter.native_companion is not None
+    assert handler.logger.delegate.post_call.native is not None
     handler.update_variables(llm_router=router)
     return handler
 
@@ -1020,9 +1020,9 @@ async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine_when_the_
 
     monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     handler: Final = _PROXY_DynamicRateLimitHandlerV3(DualCache())
-    assert handler.v3_limiter.native_companion is not None
+    assert handler.delegate.post_call.native is not None
     monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "false")
-    assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).v3_limiter.native_companion is None
+    assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).delegate.post_call.native is None
 
 
 def _with_dynamic(

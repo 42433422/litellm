@@ -1106,7 +1106,7 @@ from litellm.router import (
     LiteLLM_Params,
     ModelGroupInfo,
 )
-from litellm.router_api import ChangeSet, deployment_id, refuse_local_queue_across_workers, router_init_args
+from litellm.router_api import ChangeSet, deployment_id, router_init_args
 from litellm.scheduler import FlowItem, Scheduler
 from litellm.secret_managers.aws_secret_manager import load_aws_kms
 from litellm.secret_managers.google_kms import load_google_kms
@@ -7870,8 +7870,6 @@ class ProxyConfig:
 
         if redis_usage_cache is not None and router.health().store.redis_cache is None:
             router.apply(ChangeSet(redis_cache=redis_usage_cache))
-        read_router_params: Final = as_str_mapping(_UNTYPED_VALUE.validate_python(router_params)) or {}
-        refuse_local_queue_across_workers(read_router_params.get("dynamic_queue"), os.getenv("NUM_WORKERS", "1"))
 
         # Guardrail settings
         guardrails_v2: list[dict] | None = None

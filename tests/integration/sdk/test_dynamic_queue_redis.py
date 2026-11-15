@@ -305,6 +305,31 @@ async def test_an_unclaimed_probe_holds_a_queue_place_until_its_owner_claims_it(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("head_leaves", ["expires", "cancels"])
+async def test_a_ready_waiter_past_a_head_still_cooling_down_probes_once_that_head_leaves(
+    capacity: str, workers: WorkerFactory, head_leaves: str
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, sweep_limit=2, liveness_ms=FAR)
+    await _congest(first, capacity)
+    for waiter in ("a", "b"):
+        assert isinstance(await first.admit(WaitRequest(capacity, waiter, 0), 3_000, ready_in_ms=60_000), Waiting)
+    assert isinstance(await second.admit(WaitRequest(capacity, "c", 0), FAR), Waiting)
+    clock.ms = 1_000
+    held_back: Final = await second.poll(capacity, "c")
+
+    if head_leaves == "expires":
+        clock.ms = 3_000
+    else:
+        for waiter in ("a", "b"):
+            assert await first.abandon(capacity, waiter) is None
+    turn: Final = await second.poll(capacity, "c")
+
+    assert held_back == Waiting()
+    assert isinstance(turn, Probe)
+
+
+@pytest.mark.asyncio
 async def test_a_full_queue_refuses_until_a_waiter_passes_its_deadline(capacity: str, workers: WorkerFactory) -> None:
     clock: Final = SharedClock()
     first, second = workers.pair(clock, max_waiting=1, liveness_ms=FAR)

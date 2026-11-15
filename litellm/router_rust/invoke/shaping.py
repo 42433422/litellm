@@ -24,6 +24,7 @@ from litellm.constants import (
 )
 from litellm.litellm_core_utils.batch_utils import get_router_metadata_variable_name
 from litellm.litellm_core_utils.clientside_credential_handler import (
+    clientside_credential_keys,
     get_dynamic_litellm_params,  # pyright: ignore[reportUnknownVariableType]  # litellm's untyped helpers and request values
     is_clientside_credential,  # pyright: ignore[reportUnknownVariableType]  # litellm's untyped helpers and request values
 )
@@ -413,8 +414,10 @@ def forwarded_caller_authorization(kwargs: Mapping[str, object], deployment_para
 
 
 def serves_caller_credentials(kwargs: Mapping[str, object], deployment: Mapping[str, object]) -> bool:
+    """Whether the attempt authenticates with what its caller sent: a client-side credential field that carries a
+    value (``api_key: null`` leaves the deployment's own auth in use), or a forwarded ``Authorization``."""
     return (
-        is_clientside_credential(request_kwargs=dict(kwargs))
+        any(kwargs.get(key) is not None for key in clientside_credential_keys)
         or forwarded_caller_authorization(kwargs, as_dict(deployment.get("litellm_params"))) is not None
     )
 

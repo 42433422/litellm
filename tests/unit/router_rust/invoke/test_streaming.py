@@ -39,7 +39,6 @@ from litellm.router_utils.dynamic_queue import (
 from litellm.router_utils.dynamic_queue_router import (
     QUEUE_FULL_CODE,
     Admission,
-    DynamicQueueCoordinationError,
     DynamicQueueFullError,
     DynamicQueueRouter,
     DynamicQueueSettings,
@@ -50,7 +49,7 @@ from litellm.router_utils.dynamic_queue_router import (
 from litellm.text_completions.streaming_iterator import TextCompletionStreamWrapper
 from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _finished, _reap
-from tests.unit.router_utils.test_dynamic_queue_router import _RecordsBackoffs
+from tests.unit.router_utils.test_dynamic_queue_router import _in_memory, _RecordsBackoffs
 
 CAPACITY: Final = "deployment:d1"
 MESSAGES: Final = [{"role": "user", "content": "hi"}]
@@ -93,16 +92,15 @@ def _real_router() -> litellm.Router:
 
 
 def _local_queue(timer: ManualTimer, **settings: int | float) -> DynamicQueueRouter:
-    return DynamicQueueRouter(
-        DynamicQueueSettings(enabled=True, coordination="local", **settings), redis=lambda: None, timer=timer
-    )
+    return DynamicQueueRouter(DynamicQueueSettings(enabled=True, **settings), _in_memory(timer), timer=timer)
 
 
 async def _congest_capacity(queue: DynamicQueueRouter, capacity: str) -> None:
     admission: Final = await queue.request(priority=0, request_id=f"congests-{capacity}").admit(
         capacity, "m", _no_cooldown
     )
-    await admission.finish(MatchingFailure(retry_after_ms=60_000))
+    assert admission is not None
+    assert await admission.finish(MatchingFailure(retry_after_ms=60_000)) is True
 
 
 def _recovering_attempt(router: litellm.Router, request_queue: RequestQueue | None) -> StreamAttempt:
@@ -149,15 +147,13 @@ def _stream_attempt(
 
 async def _probe(timer: ManualTimer) -> tuple[DynamicQueueRouter, Admission]:
     """A local queue whose capacity a provider failure congested, and the probe its first waiter was granted."""
-    router: Final = DynamicQueueRouter(
-        DynamicQueueSettings(enabled=True, coordination="local", recovery_successes=1),
-        redis=lambda: None,
-        timer=timer,
-    )
+    router: Final = DynamicQueueRouter(DynamicQueueSettings(enabled=True), _in_memory(timer, successes=1), timer=timer)
     healthy: Final = await router.request(priority=0, request_id="congests").admit(CAPACITY, "m", _no_cooldown)
-    await healthy.finish(MatchingFailure())
+    assert healthy is not None
+    _ = await healthy.finish(MatchingFailure())
     timer.advance(1.0)
     probe: Final = await router.request(priority=0, request_id="probe").admit(CAPACITY, "m", _no_cooldown)
+    assert probe is not None
     return router, probe
 
 
@@ -461,9 +457,9 @@ async def test_a_stream_failure_has_reached_the_queue_before_its_recovery_may_ad
     admitted: Final = await queue.admit(request, 30.0)
     assert isinstance(admitted, Admitted)
     held: Final = contextlib.AsyncExitStack()
-    router: Final = _local_queue(timer)
-    admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, router)
-    attempt: Final = _stream_attempt(admission, router.request(0, "r"))
+    request_queue: Final = _local_queue(timer).request(0, "r")
+    admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, request_queue)
+    attempt: Final = _stream_attempt(admission, request_queue)
 
     _ = attempt.settle_admission(_provider_error(429))
     settled: Final = asyncio.create_task(attempt.admission_settled())
@@ -603,16 +599,11 @@ class _CannotPublish(_ReportsOnTheTimer):
 
 
 @pytest.mark.parametrize(
-    ("failure", "recovers"),
-    [
-        (_provider_error(429), False),
-        (litellm.RateLimitError(message="deployment at capacity", llm_provider="", model="m"), True),
-    ],
+    "failure",
+    [_provider_error(429), litellm.RateLimitError(message="deployment at capacity", llm_provider="", model="m")],
     ids=["congesting_failure", "failure_that_congests_nothing"],
 )
-async def test_a_stream_failure_the_queue_never_learned_of_ends_its_recovery_as_unavailable(
-    failure: Exception, recovers: bool
-) -> None:
+async def test_a_stream_failure_the_queue_never_learned_of_recovers_without_the_queue(failure: Exception) -> None:
     timer: Final = ManualTimer()
     backend: Final = _CannotPublish(timer)
     await backend.inner.report(CAPACITY, "congests", PassThrough(0), MatchingFailure())
@@ -622,19 +613,16 @@ async def test_a_stream_failure_the_queue_never_learned_of_ends_its_recovery_as_
     admitted: Final = await queue.admit(request, 30.0)
     assert isinstance(admitted, Admitted)
     held: Final = contextlib.AsyncExitStack()
-    router: Final = _local_queue(timer)
-    admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, router)
-    attempt: Final = dataclasses.replace(
-        _recovering_attempt(_real_router(), router.request(0, "r")), admission=admission
-    )
+    request_queue: Final = _local_queue(timer).request(0, "r")
+    admission: Final = Admission(await held.enter_async_context(queue.attempt(request, admitted)), held, request_queue)
+    attempt: Final = dataclasses.replace(_recovering_attempt(_real_router(), request_queue), admission=admission)
 
     _ = attempt.settle_admission(failure)
-    outcome: Final = await _outcome_of(attempt.fallback(RuntimeError("cut")))
+    recovered: Final = await attempt.fallback(RuntimeError("cut"))
+    chunks: Final = [chunk async for chunk in recovered]  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType]  # the recovered stream
 
-    if recovers:
-        assert "recovered" in str([chunk async for chunk in outcome])  # pyright: ignore[reportGeneralTypeIssues]  # the recovered stream
-    else:
-        assert isinstance(outcome, DynamicQueueCoordinationError)
+    assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "recovered"  # pyright: ignore[reportUnknownMemberType]  # streamed chunks
+    assert request_queue.coordinated is False
 
 
 async def test_the_real_chat_stream_failing_before_content_ends_with_its_recoverys_queue_rejection() -> None:
@@ -681,11 +669,10 @@ async def test_a_stream_retry_after_a_failure_the_queue_took_waits_there_instead
         num_retries=1,
     )
     router: Final = litellm.Router.from_config(build_router_config(arguments), host)
-    queue: Final = DynamicQueueRouter(
-        DynamicQueueSettings(enabled=True, coordination="local", queue_timeout=0.01), redis=lambda: None
-    )
-    request_queue: Final = queue.request(priority=0, request_id="stream")
+    timer: Final = ManualTimer()
+    request_queue: Final = _local_queue(timer, queue_timeout=0.5).request(priority=0, request_id="stream")
     admission: Final = await request_queue.admit(CAPACITY, "group", _no_cooldown)
+    assert admission is not None
     attempt: Final = StreamAttempt(
         core=router._core,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the router's own Rust core
         op="acompletion",
@@ -703,7 +690,15 @@ async def test_a_stream_retry_after_a_failure_the_queue_took_waits_there_instead
     failure: Final = _provider_error(status)
     _ = attempt.settle_admission(failure)
 
-    result: Final = await attempt.retry(failure)
+    retrying: Final = asyncio.create_task(attempt.retry(failure))
+    try:
+        await timer.parked(retrying)
+        while not retrying.done():
+            timer.advance(0.25)
+            await timer.parked(retrying)
+        result: Final = retrying.result()
+    finally:
+        await _reap(retrying)
     if isinstance(result, tuple):
         stream: Final = result[0]
         assert isinstance(stream, litellm.CustomStreamWrapper)
@@ -713,4 +708,5 @@ async def test_a_stream_retry_after_a_failure_the_queue_took_waits_there_instead
             await stream.aclose()
 
     assert isinstance(result, DynamicQueueTimeoutError if status == 429 else tuple)
+    assert timer.at == (0.5 if status == 429 else 0.0)
     assert len(host.backoffs) == backoffs

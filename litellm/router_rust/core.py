@@ -243,10 +243,9 @@ from litellm.router_strategy.least_busy import (
     release_started_attempt,
 )
 from litellm.router_utils.cooldown_handlers import get_cooldown_deployment_info, mark_deployment_selection_failure
-from litellm.router_utils.dynamic_queue import CoordinationUnavailable, MatchingFailure, Succeeded
+from litellm.router_utils.dynamic_queue import MatchingFailure, Succeeded
 from litellm.router_utils.dynamic_queue_router import (
     Admission,
-    DynamicQueueCoordinationError,
     DynamicQueueSettings,
     QueueRejectedError,
     capacity_of,
@@ -254,7 +253,6 @@ from litellm.router_utils.dynamic_queue_router import (
     current_request_queue,
     parse_dynamic_queue,
     prefer_uncongested,
-    rejection_error,
 )
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, selected_endpoint
 from litellm.router_utils.kubernetes_pod_discovery import (
@@ -3430,10 +3428,7 @@ class RustCore(
         ids: Final = tuple(str(id) for id in _as_list(step.get("candidates")))
         if step.get("stage") == "dynamic_free":
             return list(await prefer_uncongested(ids, self._records_by_id, self.queues_on(request)))
-        busy: Final = await congested_ids(ids, self._records_by_id, self.queues_on(request))
-        if isinstance(busy, CoordinationUnavailable):
-            raise rejection_error(busy, str(step.get("model")))
-        return sorted(busy)
+        return sorted(await congested_ids(ids, self._records_by_id, self.queues_on(request)))
 
     def queues_on(self, request: Mapping[str, object]) -> Callable[[Mapping[str, object]], bool]:
         def queues(deployment: Mapping[str, object]) -> bool:
@@ -5033,12 +5028,10 @@ class _Driver:
         self._attempts += 1
         self._attempt_started = datetime.now()  # noqa: DTZ005  # naive to match the logging pipeline's api_call_start_time
         level: Final = step.get("fallback_level")
-        # The request params the walk's dict targets merged in (`kwargs.update(target)`).
-        params: Final = as_str_mapping(step.get("params"))
         call: Final = attempt_call(
             self._core._port,  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
             self._plan,
-            self._request if params is None else {**self._request, **params},
+            self._attempt_request(step),
             deployment,
             group=requested,
             requested=requested,
@@ -5366,18 +5359,27 @@ class _Driver:
         )
         return tuple(release for release in releases if release is not None)
 
-    async def _admit(self, deployment: Mapping[str, object], call: "AttemptCall") -> Admission | None:
+    async def _admit(
+        self, step: Mapping[str, object], deployment: Mapping[str, object], call: "AttemptCall"
+    ) -> Admission | None:
         request_queue: Final = current_request_queue()
         if request_queue is None or self._plan.sync or self._plan.kind not in ("chat", "text"):
             return None
-        own_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
-        served_as: Final = (as_str_mapping(call.kwargs.get("model_info")) or {}).get("id")
-        if served_as != own_id or self._core.per_user_deployment(own_id):
-            return None
         capacity: Final = capacity_of(deployment)
-        if capacity is None:
+        if capacity is None or not self._core.queues_on(self._attempt_request(step))(deployment):
             return None
-        return await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
+        own_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
+        admission: Final = await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
+        if admission is None and await self._cooldown_left_s(own_id) > 0:
+            raise self._core._failure_error(  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+                {"error_kind": "no_healthy_deployments"}, call.model_name, None, request=self._request
+            )
+        return admission
+
+    def _attempt_request(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        """The request as the attempt sends it: with the params a fallback's dict target sets (``kwargs.update``)."""
+        params: Final = as_str_mapping(step.get("params"))
+        return self._request if params is None else {**self._request, **params}
 
     async def _slot_or_turn_back(
         self, port: "_EndpointPort", deployment: Mapping[str, object], call: "AttemptCall", admission: Admission | None
@@ -5399,22 +5401,16 @@ class _Driver:
         if admission is not None and not stream.reports_outcome:
             _ = await admission.finish(Succeeded())
 
-    async def _queue_terminal(
-        self, admission: Admission | None, error: Exception, model: str
-    ) -> QueueRejectedError | None:
-        """The queue error that ends the call: a rejection, or a congesting failure that never reached the queue, so
-        no later attempt finds the capacity healthy."""
+    async def _queue_terminal(self, admission: Admission | None, error: Exception) -> QueueRejectedError | None:
+        """The queue error that ends the call. A congesting failure the queue learned of holds the retry in the
+        queue; one it could not learn of keeps the provider's error and the usual retry backoff."""
         if isinstance(error, QueueRejectedError):
             return error
         if admission is None:
             return None
         outcome: Final = admission.router.outcome_of(error, retry_after_seconds(error))
         reported: Final = await admission.finish(outcome)
-        if not isinstance(outcome, MatchingFailure):
-            return None
-        if isinstance(reported, CoordinationUnavailable):
-            return DynamicQueueCoordinationError(model)
-        self._queued_retry = True
+        self._queued_retry = reported and isinstance(outcome, MatchingFailure)
         return None
 
     async def _cooldown_left_s(self, deployment_id: object) -> float:
@@ -5436,7 +5432,7 @@ class _Driver:
         logs_failure: bool,
         in_call: bool,
     ) -> Mapping[str, object]:
-        terminal: Final = await self._queue_terminal(admission, error, "" if call is None else call.model_name)
+        terminal: Final = await self._queue_terminal(admission, error)
         if terminal is not None:
             self._queue_rejection = terminal
             return {**self._failed(step, deployment, call, terminal), "recorded": True}
@@ -5471,7 +5467,7 @@ class _Driver:
                 compacted: Final = await compacted_attempt(self._core._port, self._plan, deployment, call)  # pyright: ignore[reportPrivateUsage]  # see above
             except Exception as refused:  # noqa: BLE001  # raised before the provider call, so no cooldown reads it
                 return {**self._failed(step, deployment, call, refused), "recorded": True}
-            admission = await self._admit(deployment, call)  # rebind-ok: see above
+            admission = await self._admit(step, deployment, call)  # rebind-ok: see above
             # The deployment's max_parallel_requests slot; an open chat stream takes it along.
             port = self._core._port  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core  # rebind-ok: the same port on every attempt
             with await self._slot_or_turn_back(port, deployment, call, admission) as slot:

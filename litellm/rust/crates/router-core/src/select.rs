@@ -720,8 +720,7 @@ impl Core {
                 .without_congested(&ctx, request, inputs, requested_order, healthy)
                 .await?;
         }
-        let order =
-            requested_order.or_else(|| healthy.iter().filter_map(|d| d.order()).min());
+        let order = requested_order.or_else(|| healthy.iter().filter_map(|d| d.order()).min());
         if let Some(order) = order {
             healthy.retain(|d| d.order() == Some(order));
         }

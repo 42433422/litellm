@@ -68,10 +68,9 @@ from litellm.litellm_core_utils.core_helpers import as_str_mapping, without
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR, get_hidden_params, set_hidden_params
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.router_rust.surface.health import failure_already_logged, logged_call
-from litellm.router_utils.dynamic_queue import CoordinationUnavailable, MatchingFailure, Succeeded
+from litellm.router_utils.dynamic_queue import MatchingFailure, Succeeded
 from litellm.router_utils.dynamic_queue_router import (
     Admission,
-    DynamicQueueCoordinationError,
     RequestQueue,
     StreamReads,
     bound_request_queue,
@@ -137,7 +136,7 @@ class StreamAttempt:
     request_queue: RequestQueue | None = None
     reads: int = 0
     reading: bool = False
-    settling: "asyncio.Task[None | CoordinationUnavailable] | None" = None
+    settling: "asyncio.Task[bool] | None" = None
     congesting: bool = False
     watching: "asyncio.Task[None] | None" = None
 
@@ -252,7 +251,7 @@ class StreamAttempt:
 
     def settle_admission(
         self, error: BaseException | None = None, *, succeeded: bool = False
-    ) -> "asyncio.Task[None | CoordinationUnavailable] | None":
+    ) -> "asyncio.Task[bool] | None":
         """Reports the stream's outcome once, in the background, so it never holds up or replaces what the client
         already read."""
         admission: Final = self.admission
@@ -280,19 +279,16 @@ class StreamAttempt:
 
     async def admission_settled(self) -> bool:
         """A recovery admits only after this stream's failure reached the queue, so it never picks the capacity the
-        failure is about to congest. True when the failure congested the capacity, so the queue holds the retry."""
+        failure is about to congest. True when the failure congested the capacity, so the queue holds the retry; a
+        failure the queue could not learn of leaves the recovery to go on without the queue."""
         settling: Final = self.settling
         if settling is None:
             return False
         _ = await asyncio.wait({settling})
-        unpublished: Final = (
-            settling.cancelled()
-            or settling.exception() is not None
-            or isinstance(settling.result(), CoordinationUnavailable)
-        )
-        if unpublished and self.congesting:
-            raise DynamicQueueCoordinationError(self.group)
-        return self.congesting
+        published: Final = not settling.cancelled() and settling.exception() is None and settling.result()
+        if not published and self.request_queue is not None:
+            self.request_queue.lose_coordination()
+        return published and self.congesting
 
     def read_began(self) -> None:
         self.reading = True

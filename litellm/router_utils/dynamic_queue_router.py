@@ -1,21 +1,21 @@
 """The router's side of ``dynamic_queue``: the ``router_settings.dynamic_queue`` block, the queue time each request
 owns across its attempts, per-attempt admission, and the public errors a refused wait raises.
 
-Enabled, every async chat or text completion attempt on a deployment the router owns waits for its capacity's turn,
-and its outcome is reported back. Only a failure whose provider answered with one of ``trigger_status_codes`` congests
-a capacity. A refused wait ends the request with no retry, fallback or cooldown.
+Enabled, every async chat or text completion attempt on a deployment the router owns waits for that deployment's
+turn, and its outcome is reported back. Only a failure whose provider answered with one of ``trigger_status_codes``
+congests a deployment. A full queue or a spent queue time ends the request with no retry, fallback or cooldown. When the
+queue's Redis cannot be reached, the request goes on as it would without the queue.
 """
 
 import asyncio
 import contextlib
-import math
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Annotated, Final, Literal, Protocol, TypeAlias, TypeVar
+from typing import Annotated, Final, Protocol, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model_validator
-from typing_extensions import Self, assert_never
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter
+from typing_extensions import assert_never
 
 from litellm.exceptions import ServiceUnavailableError, Timeout
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
@@ -26,7 +26,6 @@ from litellm.router_utils.dynamic_queue import (
     Attempt,
     CoordinationUnavailable,
     DynamicQueue,
-    LocalQueueBackend,
     MatchingFailure,
     MonotonicTimer,
     OtherFailure,
@@ -35,16 +34,13 @@ from litellm.router_utils.dynamic_queue import (
     QueueFull,
     QueueSettings,
     QueueTimeout,
-    Rejection,
     Timer,
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, ScriptHost
 
-CAPACITY_ID_FIELD: Final = "dynamic_queue_capacity_id"
-REDIS_NOT_CONFIGURED: Final = "redis_not_configured"
 QUEUE_FULL_CODE: Final = "queue_full"
-QUEUE_COORDINATION_UNAVAILABLE_CODE: Final = "queue_coordination_unavailable"
+REDIS_NOT_CONFIGURED: Final = "redis_not_configured"
 
 _HttpErrorStatus: TypeAlias = Annotated[StrictInt, Field(ge=400, le=599)]
 
@@ -56,24 +52,9 @@ class DynamicQueueSettings(BaseModel):
     trigger_status_codes: tuple[_HttpErrorStatus, ...] = (429, 529)
     queue_timeout: float = Field(default=30.0, gt=0)
     max_waiting: int = Field(default=1_000, gt=0)
-    coordination: Literal["redis", "local"] = "redis"
-    recovery_successes: int = Field(default=2, ge=1)
-    initial_backoff: float = Field(default=1.0, gt=0)
-    max_backoff: float = Field(default=30.0, gt=0)
-
-    @model_validator(mode="after")
-    def _backoff_grows_to_its_cap(self) -> Self:
-        if self.max_backoff < self.initial_backoff:
-            raise ValueError("dynamic_queue.max_backoff must be at least dynamic_queue.initial_backoff")
-        return self
 
     def queue_settings(self) -> QueueSettings:
-        return QueueSettings(
-            required_successes=self.recovery_successes,
-            initial_backoff_ms=math.ceil(self.initial_backoff * 1000),
-            max_backoff_ms=math.ceil(self.max_backoff * 1000),
-            max_waiting=self.max_waiting,
-        )
+        return QueueSettings(max_waiting=self.max_waiting)
 
 
 _SETTINGS: Final[TypeAdapter[DynamicQueueSettings | None]] = TypeAdapter(DynamicQueueSettings | None)
@@ -86,15 +67,6 @@ def parse_dynamic_queue(value: object, default_priority: int | None) -> DynamicQ
     if default_priority is None:
         raise ValueError("router_settings.dynamic_queue.enabled requires router_settings.default_priority")
     return settings
-
-
-def refuse_local_queue_across_workers(value: object, num_workers: str) -> None:
-    settings: Final = _SETTINGS.validate_python(value)
-    if settings is not None and settings.enabled and settings.coordination == "local" and num_workers != "1":
-        raise ValueError(
-            f"router_settings.dynamic_queue.coordination 'local' serves one process, not {num_workers} workers; "
-            "use 'redis'"
-        )
 
 
 class QueueRejectedError(Exception):
@@ -111,13 +83,7 @@ class DynamicQueueFullError(ServiceUnavailableError, QueueRejectedError):
         self.code = QUEUE_FULL_CODE
 
 
-class DynamicQueueCoordinationError(ServiceUnavailableError, QueueRejectedError):
-    def __init__(self, model: str) -> None:
-        super().__init__(message="the dynamic queue's coordination is unavailable", llm_provider="", model=model)
-        self.code = QUEUE_COORDINATION_UNAVAILABLE_CODE
-
-
-def rejection_error(rejection: Rejection, model: str) -> QueueRejectedError:
+def rejection_error(rejection: QueueTimeout | QueueFull, model: str) -> QueueRejectedError:
     match rejection:
         case QueueTimeout():
             return DynamicQueueTimeoutError(
@@ -125,8 +91,6 @@ def rejection_error(rejection: Rejection, model: str) -> QueueRejectedError:
             )
         case QueueFull():
             return DynamicQueueFullError(model)
-        case CoordinationUnavailable():
-            return DynamicQueueCoordinationError(model)
         case _:
             assert_never(rejection)
 
@@ -152,13 +116,19 @@ class Admission:
 
     attempt: Attempt
     held: contextlib.AsyncExitStack
-    router: "DynamicQueueRouter"
+    owner: "RequestQueue"
 
-    async def finish(self, outcome: Outcome | None) -> None | CoordinationUnavailable:
-        """What reporting the outcome came to: a CoordinationUnavailable means the queue never learned it."""
+    @property
+    def router(self) -> "DynamicQueueRouter":
+        return self.owner.router
+
+    async def finish(self, outcome: Outcome | None) -> bool:
+        """Whether the queue learned the outcome. When it could not, the rest of the request goes on without it."""
         reported: Final = None if outcome is None else await self.attempt.report(outcome)
         await self.held.aclose()
-        return reported
+        if isinstance(reported, CoordinationUnavailable):
+            self.owner.lose_coordination()
+        return reported is None
 
     async def went_idle(self, reads: Callable[[], "StreamReads | None"]) -> bool:
         """Whether a stream sat a whole idle bound with no read in progress and none finished while it still held its
@@ -189,7 +159,8 @@ class _Backend(QueueBackend, Protocol):
 
 class RequestQueue:
     """The queue state one request owns across its attempts and its stream's recovery. Only time spent waiting is
-    taken from its budget."""
+    taken from its budget. Once the queue's coordination fails for the request, its later attempts skip the queue,
+    so it never half-waits on a Redis that may come back; the next request tries the queue again."""
 
     def __init__(self, router: "DynamicQueueRouter", priority: int, request_id: str) -> None:
         self.router = router
@@ -198,28 +169,41 @@ class RequestQueue:
         self._deadline: Final[TotalDeadline | None] = current_total_deadline()
         self._remaining_s = router.queue_timeout_s
         self._waits = 0
+        self.coordinated = True
+
+    def lose_coordination(self) -> None:
+        self.coordinated = False
 
     def _budget_s(self) -> float:
         deadline: Final = self._deadline or current_total_deadline()
         left: Final = None if deadline is None else deadline.remaining()
         return self._remaining_s if left is None else min(self._remaining_s, left)
 
-    async def admit(self, capacity: str, model: str, cooldown_left_s: Callable[[], Awaitable[float]]) -> Admission:
-        """Raises the public error of a refused wait. ``cooldown_left_s`` keeps the wait queued, in priority order,
-        until the deployment's own cooldown ends."""
+    async def admit(
+        self, capacity: str, model: str, cooldown_left_s: Callable[[], Awaitable[float]]
+    ) -> Admission | None:
+        """The attempt's turn, or None when it goes out without the queue because coordination failed. Raises the
+        public error of a full queue or spent queue time. ``cooldown_left_s`` keeps the wait queued, in priority
+        order, until the deployment's own cooldown ends."""
+        if not self.coordinated:
+            return None
         queue: Final = self.router.queue()
         if isinstance(queue, CoordinationUnavailable):
-            raise rejection_error(queue, model)
+            self.lose_coordination()
+            return None
         self._waits += 1
         request: Final = WaitRequest(capacity, f"{self._request_id}:{self._waits}", self._priority)
-        budget: Final = self._budget_s()
-        admitted: Final = await queue.admit(request, budget, cooldown_left_s)
+        started: Final = self.router.timer.now()
+        admitted: Final = await queue.admit(request, self._budget_s(), cooldown_left_s)
+        self._remaining_s = max(self._remaining_s - (self.router.timer.now() - started), 0.0)
+        if isinstance(admitted, CoordinationUnavailable):
+            self.lose_coordination()
+            return None
         if not isinstance(admitted, Admitted):
             raise rejection_error(admitted, model)
-        self._remaining_s = max(self._remaining_s - (budget - admitted.remaining_s), 0.0)
         held: Final = contextlib.AsyncExitStack()
         attempt: Final = await held.enter_async_context(queue.attempt(request, admitted))
-        return Admission(attempt, held, self.router)
+        return Admission(attempt, held, self)
 
 
 _CURRENT: Final[ContextVar[RequestQueue | None]] = ContextVar("dynamic_queue_request", default=None)
@@ -238,21 +222,28 @@ def bound_request_queue(request_queue: RequestQueue | None) -> Generator[None, N
         _CURRENT.reset(token)
 
 
-class DynamicQueueRouter:
-    """Reads the router's Redis cache lazily, since the proxy attaches it after the router is built; with none, every
-    wait is refused rather than coordinated in one process."""
+Backends: TypeAlias = Callable[[QueueSettings], "_Backend | None"]
 
-    def __init__(
-        self,
-        settings: DynamicQueueSettings,
-        redis: Callable[[], ScriptHost | None],
-        timer: Timer | None = None,
-    ) -> None:
+
+def on_redis(redis: Callable[[], ScriptHost | None]) -> Backends:
+    """The queue on the router's Redis, read lazily since the proxy attaches it after the router is built."""
+
+    def backend(settings: QueueSettings) -> "_Backend | None":
+        host: Final = redis()
+        return None if host is None else RedisQueueBackend(host, settings)
+
+    return backend
+
+
+class DynamicQueueRouter:
+    """With no backend to coordinate on, every request goes on without the queue until one is available."""
+
+    def __init__(self, settings: DynamicQueueSettings, backends: Backends, timer: Timer | None = None) -> None:
         self.settings = settings
         self.queue_settings: Final = settings.queue_settings()
         self.queue_timeout_s: Final = settings.queue_timeout
         self.timer: Final[Timer] = timer or MonotonicTimer()
-        self._redis = redis
+        self._backends = backends
         self._triggers: Final = frozenset(settings.trigger_status_codes)
         self._built: DynamicQueue | None = None
         self._backend: _Backend | None = None
@@ -260,20 +251,12 @@ class DynamicQueueRouter:
     def queue(self) -> DynamicQueue | CoordinationUnavailable:
         if self._built is not None:
             return self._built
-        backend: Final = self._build_backend()
-        if isinstance(backend, CoordinationUnavailable):
-            return backend
+        backend: Final = self._backends(self.queue_settings)
+        if backend is None:
+            return CoordinationUnavailable(reason=REDIS_NOT_CONFIGURED)
         self._backend = backend
         self._built = DynamicQueue(backend, self.timer)
         return self._built
-
-    def _build_backend(self) -> _Backend | CoordinationUnavailable:
-        if self.settings.coordination == "local":
-            return LocalQueueBackend(self.queue_settings, clock=self.timer.now)
-        redis: Final = self._redis()
-        if redis is None:
-            return CoordinationUnavailable(reason=REDIS_NOT_CONFIGURED)
-        return RedisQueueBackend(redis, self.queue_settings)
 
     def request(self, priority: int, request_id: str) -> RequestQueue:
         return RequestQueue(self, priority, request_id)
@@ -307,24 +290,20 @@ class DynamicQueueRouter:
         return MatchingFailure(retry_after_ms=int((retry_after_s or 0.0) * 1000))
 
 
+def _deployment_id(deployment: Mapping[str, object]) -> str | None:
+    deployment_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
+    return deployment_id if isinstance(deployment_id, str) and deployment_id else None
+
+
 def capacity_of(deployment: Mapping[str, object]) -> str | None:
-    model_info: Final = as_str_mapping(deployment.get("model_info"))
-    if model_info is None:
-        return None
-    shared: Final = model_info.get(CAPACITY_ID_FIELD)
-    if isinstance(shared, str) and shared:
-        return f"shared:{shared}"
-    own: Final = model_info.get("id")
-    return f"deployment:{own}" if isinstance(own, str) and own else None
+    """Each configured deployment waits on its own queue, keyed by its id alone."""
+    deployment_id: Final = _deployment_id(deployment)
+    return None if deployment_id is None else f"deployment:{deployment_id}"
 
 
 def _capacities(records: Sequence[Mapping[str, object]]) -> Mapping[str, str]:
-    pairs: Final = ((as_str_mapping(record.get("model_info")), capacity_of(record)) for record in records)
-    return {
-        str(model_info.get("id")): capacity
-        for model_info, capacity in pairs
-        if model_info is not None and capacity is not None
-    }
+    pairs: Final = ((_deployment_id(record), capacity_of(record)) for record in records)
+    return {deployment_id: capacity for deployment_id, capacity in pairs if deployment_id and capacity}
 
 
 Records: TypeAlias = Callable[[Sequence[str]], Sequence[Mapping[str, object]]]
@@ -332,33 +311,33 @@ Records: TypeAlias = Callable[[Sequence[str]], Sequence[Mapping[str, object]]]
 
 async def congested_ids(
     ids: Sequence[str], records: Records, queues_on: Callable[[Mapping[str, object]], bool]
-) -> frozenset[str] | CoordinationUnavailable:
+) -> frozenset[str]:
     """Never busy for a deployment the request does not queue on, such as one it reaches on its caller's own
-    credentials."""
+    credentials, nor for any once the request lost the queue's coordination."""
     request_queue: Final = current_request_queue()
-    if request_queue is None or not ids:
+    if request_queue is None or not request_queue.coordinated or not ids:
         return frozenset()
     queued: Final = tuple(record for record in records(ids) if queues_on(record))
     if not queued:
         return frozenset()
-    return await request_queue.router.busy(_capacities(queued))
+    busy: Final = await request_queue.router.busy(_capacities(queued))
+    if isinstance(busy, CoordinationUnavailable):
+        request_queue.lose_coordination()
+        return frozenset()
+    return busy
 
 
 async def prefer_uncongested(
     ids: Sequence[str], records: Records, queues_on: Callable[[Mapping[str, object]], bool]
 ) -> tuple[str, ...]:
-    """Unknown congestion keeps every candidate; the admission that follows refuses the wait then."""
     busy: Final = await congested_ids(ids, records, queues_on)
-    if isinstance(busy, CoordinationUnavailable):
-        return tuple(ids)
     free: Final = tuple(deployment for deployment in ids if deployment not in busy)
     return free if free else tuple(ids)
 
 
 __all__ = [
-    "CAPACITY_ID_FIELD",
     "Admission",
-    "DynamicQueueCoordinationError",
+    "Backends",
     "DynamicQueueFullError",
     "DynamicQueueRouter",
     "DynamicQueueSettings",
@@ -371,8 +350,8 @@ __all__ = [
     "capacity_of",
     "congested_ids",
     "current_request_queue",
+    "on_redis",
     "parse_dynamic_queue",
     "prefer_uncongested",
-    "refuse_local_queue_across_workers",
     "rejection_error",
 ]

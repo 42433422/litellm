@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar, Token
 from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import TypeAdapter
 
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
         RequestRateLimiterStash,
     )
     from litellm.proxy.utils import InternalUsageCache
+    from litellm.redis.stores.rate_limits import RateLimitStore
     from litellm.rust_bridge._native import (
         NativeParallelRequestLimiter,
         NativeParallelRequestLimiterState,
@@ -362,7 +363,7 @@ class ParallelRequestLimiterNativeLogger(RustLogger):
             "call_id": _call_id(data),
             "identity": request_identity(data),
             "nested": shared is not None,
-            "policy": policy(limiter),
+            "policy": limiter_policy(limiter),
         }
         batch_limiter: Final = limiter.get_rate_limiter_for_call_type(call_type)
         if batch_limiter is not None:
@@ -553,10 +554,6 @@ def _general_setting(name: str, default: object = None) -> object:
     from litellm.proxy.proxy_server import general_settings_view
 
     return _scalar_setting(general_settings_view().get(name, default))
-
-
-def _setting(resolver: Callable[[], bool], default: Callable[[], bool], raw: Callable[[], object]) -> object:
-    return raw() if resolver is default else resolver()
 
 
 def _forced_grouping() -> object:
@@ -879,34 +876,49 @@ def usage_facts(usage: object) -> Mapping[str, int] | None:
     }
 
 
-def failure_facts(limiter: "PROXY_MaxParallelRequestsHandler_v3", source: Mapping[str, object]) -> Mapping[str, object]:
-    recovered: Final = limiter._recovered_partial_usage(source)  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
+def failure_facts(
+    source: Mapping[str, object], rate_limit_type: Literal["output", "input", "total"]
+) -> Mapping[str, object]:
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+        recovered_partial_usage,
+        recovered_partial_usage_tokens,
+        resolve_reconciled_usage,
+    )
+
+    recovered: Final = recovered_partial_usage(source)
     return {
         "call_id": _call_id(source),
-        "tpm_actual": limiter._recovered_partial_usage_tokens(source)[0],  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
-        "partial_usage": None if recovered is None else usage_facts(limiter._resolve_reconciled_usage(recovered)),  # pyright: ignore[reportPrivateUsage]  # the native settles with the limiter's usage recovery
+        "tpm_actual": recovered_partial_usage_tokens(source, rate_limit_type)[0],
+        "partial_usage": None if recovered is None else usage_facts(resolve_reconciled_usage(recovered)),
     }
 
 
-def policy(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> Mapping[str, object]:
+def policy(
+    fail_closed_resolver: Callable[[], bool] | None = None,
+    force_grouping_resolver: Callable[[], bool] | None = None,
+) -> Mapping[str, object]:
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import FAIL_CLOSED_RATE_LIMIT_ENFORCEMENT_SETTING
+
+    return {
+        "fail_closed": _general_setting(FAIL_CLOSED_RATE_LIMIT_ENFORCEMENT_SETTING)
+        if fail_closed_resolver is None
+        else fail_closed_resolver(),
+        "force_grouping": _forced_grouping() if force_grouping_resolver is None else force_grouping_resolver(),
+    }
+
+
+def limiter_policy(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> Mapping[str, object]:
     from litellm.proxy.hooks.parallel_request_limiter_v3 import (
-        FAIL_CLOSED_RATE_LIMIT_ENFORCEMENT_SETTING,
         _fail_closed_rate_limit_enforcement_from_general_settings,  # pyright: ignore[reportPrivateUsage]  # the default resolver reads the raw setting
         _force_redis_hash_tag_grouping_from_litellm_settings,  # pyright: ignore[reportPrivateUsage]  # the default resolver reads the raw setting
     )
 
-    return {
-        "fail_closed": _setting(
-            limiter._fail_closed_resolver,  # pyright: ignore[reportPrivateUsage]  # read live per call like the Python limiter
-            _fail_closed_rate_limit_enforcement_from_general_settings,
-            lambda: _general_setting(FAIL_CLOSED_RATE_LIMIT_ENFORCEMENT_SETTING),
-        ),
-        "force_grouping": _setting(
-            limiter._force_hash_tag_grouping_resolver,  # pyright: ignore[reportPrivateUsage]  # read live per call like the Python limiter
-            _force_redis_hash_tag_grouping_from_litellm_settings,
-            _forced_grouping,
-        ),
-    }
+    fail_closed: Final = limiter._fail_closed_resolver  # pyright: ignore[reportPrivateUsage]  # read live per call like the Python limiter
+    force_grouping: Final = limiter._force_hash_tag_grouping_resolver  # pyright: ignore[reportPrivateUsage]  # read live per call like the Python limiter
+    return policy(
+        None if fail_closed is _fail_closed_rate_limit_enforcement_from_general_settings else fail_closed,
+        None if force_grouping is _force_redis_hash_tag_grouping_from_litellm_settings else force_grouping,
+    )
 
 
 def _call_id(data: Mapping[str, object]) -> str | None:
@@ -914,7 +926,12 @@ def _call_id(data: Mapping[str, object]) -> str | None:
     return call_id if isinstance(call_id, str) else None
 
 
-def native_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativeParallelRequestLimiter":
+def native_engine(
+    rate_limits: "RateLimitStore",
+    window_size: int,
+    tpm_reservation_enabled: bool,
+    clock: Callable[[], datetime] = datetime.now,
+) -> "NativeParallelRequestLimiter":
     from litellm.proxy.hooks.parallel_request_limiter_v3 import (
         DEFAULT_MAX_TOKENS_ESTIMATE,
         NO_MAX_TOKENS_TPM_RESERVATION_FRACTION,
@@ -922,11 +939,10 @@ def native_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativePara
     )
     from litellm.rust_bridge._native import NativeParallelRequestLimiter
 
-    clock: Final = limiter._time_provider  # pyright: ignore[reportPrivateUsage]  # the native reads the limiter's clock
     return NativeParallelRequestLimiter(
-        limiter.rate_limits._handle,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # both limiters share one store and memory tier
-        limiter.window_size,
-        limiter.tpm_reservation_enabled,
+        rate_limits._handle,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # both limiters share one store and memory tier
+        window_size,
+        tpm_reservation_enabled,
         None if clock is datetime.now else (lambda: clock().timestamp()),
         time.monotonic,
         output_cap=(
@@ -937,10 +953,19 @@ def native_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativePara
     )
 
 
+def limiter_engine(limiter: "PROXY_MaxParallelRequestsHandler_v3") -> "NativeParallelRequestLimiter":
+    return native_engine(
+        limiter.rate_limits,
+        limiter.window_size,
+        limiter.tpm_reservation_enabled,
+        limiter._time_provider,  # pyright: ignore[reportPrivateUsage]  # the native reads the limiter's clock
+    )
+
+
 def native_parallel_request_limiter(
     limiter: "PROXY_MaxParallelRequestsHandler_v3",
 ) -> ParallelRequestLimiterNativeLogger:
-    bridge: Final = limiter.native_companion or native_engine(limiter)
+    bridge: Final = limiter.native_companion or limiter_engine(limiter)
     manifest: Final = WireManifest.model_validate_json(bridge.manifest())
     cls: Final = type(manifest.selection.name, (ParallelRequestLimiterNativeLogger,), _namespace(bridge, manifest))  # pyright: ignore[reportArgumentType]  # the bridge takes its own state type
     logger: Final = cls(bridge, limiter)
@@ -958,6 +983,8 @@ __all__ = [
     "ParallelRequestLimiterNativeLogger",
     "PreCallAuthScope",
     "failure_facts",
+    "limiter_engine",
+    "limiter_policy",
     "limiter_state",
     "mirror_rate_limit_response",
     "native_engine",

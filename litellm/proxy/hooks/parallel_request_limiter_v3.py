@@ -943,6 +943,234 @@ def _parse_output_cap_value(raw_value: object) -> int | None:
         return None
 
 
+def _apply_implicit_output_cap(
+    data: object,
+    min_configured_limit: int | None,
+    call_type: str | None,
+    configured_output_tokens: int | None = None,
+    endpoint_type: EndpointType = EndpointType.GENERIC,
+) -> None:
+    """Hard-cap generation length when the request has no explicit cap.
+
+    Guards against an unbounded response overshooting a small TPM/OTPM
+    budget before post-call reconciliation runs. Skips requests that
+    already set an explicit cap and embeddings, which have no generation
+    budget. The Responses API only honors ``max_output_tokens`` (its
+    underlying chat-completion transformation ignores ``max_tokens``), so
+    the cap must be written to that field for Responses call types.
+
+    ``configured_output_tokens`` is the operator-declared per-tenant
+    estimate; when it exceeds the safety floor, the cap is raised to that
+    value instead of clamping every tenant to the same floor.
+    """
+    base_capped_floor: Final = PROXY_MaxParallelRequestsHandler_v3.no_max_tokens_output_floor(min_configured_limit)
+    capped_floor: Final = (
+        max(base_capped_floor, RESPONSES_API_MIN_OUTPUT_TOKENS)
+        if call_type in RESPONSES_API_CALL_TYPES
+        else base_capped_floor
+    )
+    baseline_floor: Final = int(DEFAULT_MAX_TOKENS_ESTIMATE * NO_MAX_TOKENS_TPM_RESERVATION_FRACTION)
+    is_embedding: Final = _is_embedding_request(data, call_type)
+    if (
+        capped_floor >= baseline_floor
+        or _has_explicit_output_cap(data, call_type)
+        or is_embedding
+        or endpoint_type == EndpointType.DECISIONS
+        or call_type in EXTRACTION_API_CALL_TYPES
+    ):
+        return
+    PROXY_MaxParallelRequestsHandler_v3.write_implicit_output_cap(
+        data, call_type, max(capped_floor, configured_output_tokens or 0)
+    )
+
+
+def _extraction_input_text(data: Mapping[str, object]) -> str:
+    state: Final = data.get("state")
+    return f"{state if isinstance(state, str) else ''}\n{json.dumps(data.get('fields'), default=str)}"
+
+
+def _get_explicit_output_cap(data: object, call_type: str | None) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    if call_type in GOOGLE_GENAI_NATIVE_CALL_TYPES:
+        config: Final = data.get("config") if "config" in data else data.get("generationConfig")
+        google_cap_values: Final = tuple(
+            parsed
+            for field in ("maxOutputTokens", "max_output_tokens")
+            if isinstance(config, dict)
+            for parsed in (_parse_output_cap_value(config.get(field)),)
+            if parsed is not None
+        )
+        return max(google_cap_values, default=None)
+    if call_type in RESPONSES_API_CALL_TYPES:
+        responses_cap: Final = _parse_output_cap_value(data.get("max_output_tokens"))
+        if responses_cap is None:
+            return None
+        return max(RESPONSES_API_MIN_OUTPUT_TOKENS, responses_cap)
+    if call_type in EMBEDDING_API_CALL_TYPES:
+        return None
+    fields: Final = (
+        ("max_tokens", "max_completion_tokens")
+        if call_type
+        else ("max_tokens", "max_completion_tokens", "max_output_tokens")
+    )
+    output_cap_values: Final = tuple(
+        parsed for field in fields for parsed in (_parse_output_cap_value(data.get(field)),) if parsed is not None
+    )
+    return max(output_cap_values, default=None)
+
+
+def _get_total_tokens_from_usage(usage: object | None, rate_limit_type: Literal["output", "input", "total"]) -> int:
+    """
+    Get total tokens from response usage for rate limiting.
+
+    For 'input' and 'total' rate limit types, cached tokens are excluded
+    because providers like AWS Bedrock don't count cached tokens toward
+    rate limits. This aligns LiteLLM's TPM calculation with provider behavior.
+    """
+    total_tokens = 0
+    cached_tokens = 0
+
+    if usage:
+        if isinstance(usage, Usage):
+            if rate_limit_type == "output":
+                total_tokens = usage.completion_tokens or 0
+            elif rate_limit_type == "input":
+                total_tokens = usage.prompt_tokens or 0
+            elif rate_limit_type == "total":
+                total_tokens = usage.total_tokens or 0
+
+            # Get cached tokens to exclude from input/total
+            if rate_limit_type in ("input", "total"):
+                if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+
+        elif isinstance(usage, dict):
+            # Responses API usage comes as a dict
+            if rate_limit_type == "output":
+                total_tokens = usage.get("completion_tokens", 0) or 0
+            elif rate_limit_type == "input":
+                total_tokens = usage.get("prompt_tokens", 0) or 0
+            elif rate_limit_type == "total":
+                total_tokens = usage.get("total_tokens", 0) or 0
+
+            # Get cached tokens from dict
+            if rate_limit_type in ("input", "total"):
+                prompt_details: Final = usage.get("prompt_tokens_details") or {}
+                if isinstance(prompt_details, dict):
+                    cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+
+    # Subtract cached tokens for input/total (providers don't count them)
+    if cached_tokens > 0:
+        total_tokens = max(0, total_tokens - cached_tokens)
+
+    return total_tokens
+
+
+def _is_embedding_request(data: object, call_type: str | None) -> bool:
+    if call_type in EMBEDDING_API_CALL_TYPES:
+        return True
+    if call_type in RESPONSES_API_CALL_TYPES:
+        return False
+    if call_type:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("input") is not None
+
+
+def _merge_ratelimit_statuses_into_additional_headers(
+    additional_headers: dict[str, object],
+    statuses: list[RateLimitStatus],
+) -> dict[str, object]:
+    """
+    Return ``additional_headers`` extended with
+    ``x-ratelimit-{descriptor_key}-{remaining|limit}-{rate_limit_type}``
+    entries. Non-mutating so callers pick their own target dict.
+    """
+    merged: Final[dict[str, object]] = dict(additional_headers)
+    for status in statuses:
+        prefix = f"x-ratelimit-{status['descriptor_key']}"
+        merged[f"{prefix}-remaining-{status['rate_limit_type']}"] = status["limit_remaining"]
+        merged[f"{prefix}-limit-{status['rate_limit_type']}"] = status["current_limit"]
+    return merged
+
+
+def _resolve_rerank_token_usage(response_obj: object) -> tuple[int, int, bool] | None:
+    if not isinstance(response_obj, RerankResponse) or response_obj.meta is None:
+        return None
+
+    rerank_tokens: Final = response_obj.meta.get("tokens")  # pyright: ignore[reportUnknownMemberType]  # TypedDict's optional generic metadata widens get overloads
+    if rerank_tokens is not None:
+        input_tokens: Final = rerank_tokens.get("input_tokens") or 0  # pyright: ignore[reportUnknownMemberType]  # token fields are typed integers despite the generic get overload
+        output_tokens: Final = rerank_tokens.get("output_tokens") or 0  # pyright: ignore[reportUnknownMemberType]  # token fields are typed integers despite the generic get overload
+        if input_tokens or output_tokens:
+            return max(0, input_tokens), max(0, output_tokens), True
+
+    billed_units: Final = response_obj.meta.get("billed_units")  # pyright: ignore[reportUnknownMemberType]  # TypedDict's optional generic metadata widens get overloads
+    if billed_units is not None:
+        total_tokens: Final = billed_units.get("total_tokens") or 0  # pyright: ignore[reportUnknownMemberType]  # billed total is a typed integer despite the generic get overload
+        if total_tokens:
+            return max(0, total_tokens), 0, True
+    return None
+
+
+def _response_usage(
+    response_obj: object,
+) -> Usage | ResponseAPIUsage | Mapping[str, object] | None:
+    if isinstance(response_obj, (Usage, ResponseAPIUsage)):
+        return response_obj
+    if isinstance(response_obj, ExtractionResponse):
+        return get_usage_object(response_obj)
+    if isinstance(
+        response_obj,
+        (ModelResponse, EmbeddingResponse, TextCompletionResponse, BaseLiteLLMOpenAIResponseObject),
+    ):
+        usage: Final = getattr(response_obj, "usage", None)
+        return usage if isinstance(usage, (Usage, ResponseAPIUsage, dict)) else None
+    if isinstance(response_obj, dict):
+        nested_usage: Final = response_obj.get("usage")
+        if isinstance(nested_usage, (Usage, ResponseAPIUsage, dict)):
+            return nested_usage
+        return response_obj
+    return None
+
+
+def _translate_google_genai_native_request(
+    data: object,
+    call_type: str | None,
+) -> Mapping[str, object] | None:
+    contents: Final = data.get("contents") if isinstance(data, dict) else None
+    if (
+        not isinstance(data, dict)
+        or call_type not in GOOGLE_GENAI_NATIVE_CALL_TYPES
+        or not isinstance(contents, (dict, list))
+    ):
+        return None
+    from litellm.google_genai.adapters.transformation import GoogleGenAIAdapter
+
+    config: Final = data.get("config") if "config" in data else data.get("generationConfig")
+    return GoogleGenAIAdapter().translate_generate_content_to_completion(
+        model=data.get("model") if isinstance(data.get("model"), str) else "",
+        contents=contents,
+        config=config if isinstance(config, dict) else None,
+        systemInstruction=data.get("systemInstruction"),
+        system_instruction=data.get("system_instruction"),
+        tools=data.get("tools"),
+        toolConfig=data.get("toolConfig"),
+        tool_config=data.get("tool_config"),
+    )
+
+
+def _has_explicit_output_cap(data: object, call_type: str | None) -> bool:
+    """Whether the caller explicitly set an output-token cap.
+
+    Checked via ``is not None`` (not truthiness) so an explicit 0 --
+    a legitimate zero-output request -- counts as explicit.
+    """
+    return _get_explicit_output_cap(data, call_type) is not None
+
+
 class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
     def __init__(
         self,
@@ -1113,83 +1341,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             return baseline
         return min(baseline, max(1, int(min_configured_tpm_limit * NO_MAX_TOKENS_TPM_RESERVATION_FRACTION)))
 
-    @staticmethod
-    def _is_embedding_request(data: object, call_type: str | None) -> bool:
-        if call_type in EMBEDDING_API_CALL_TYPES:
-            return True
-        if call_type in RESPONSES_API_CALL_TYPES:
-            return False
-        if call_type:
-            return False
-        if not isinstance(data, dict):
-            return False
-        return data.get("input") is not None
+    _is_embedding_request = staticmethod(_is_embedding_request)
 
-    @staticmethod
-    def _translate_google_genai_native_request(
-        data: object,
-        call_type: str | None,
-    ) -> Mapping[str, object] | None:
-        contents: Final = data.get("contents") if isinstance(data, dict) else None
-        if (
-            not isinstance(data, dict)
-            or call_type not in GOOGLE_GENAI_NATIVE_CALL_TYPES
-            or not isinstance(contents, (dict, list))
-        ):
-            return None
-        from litellm.google_genai.adapters.transformation import GoogleGenAIAdapter
+    _translate_google_genai_native_request = staticmethod(_translate_google_genai_native_request)
 
-        config: Final = data.get("config") if "config" in data else data.get("generationConfig")
-        return GoogleGenAIAdapter().translate_generate_content_to_completion(
-            model=data.get("model") if isinstance(data.get("model"), str) else "",
-            contents=contents,
-            config=config if isinstance(config, dict) else None,
-            systemInstruction=data.get("systemInstruction"),
-            system_instruction=data.get("system_instruction"),
-            tools=data.get("tools"),
-            toolConfig=data.get("toolConfig"),
-            tool_config=data.get("tool_config"),
-        )
+    _get_explicit_output_cap = staticmethod(_get_explicit_output_cap)
 
-    @staticmethod
-    def _get_explicit_output_cap(data: object, call_type: str | None) -> int | None:
-        if not isinstance(data, dict):
-            return None
-        if call_type in GOOGLE_GENAI_NATIVE_CALL_TYPES:
-            config: Final = data.get("config") if "config" in data else data.get("generationConfig")
-            google_cap_values: Final = tuple(
-                parsed
-                for field in ("maxOutputTokens", "max_output_tokens")
-                if isinstance(config, dict)
-                for parsed in (_parse_output_cap_value(config.get(field)),)
-                if parsed is not None
-            )
-            return max(google_cap_values, default=None)
-        if call_type in RESPONSES_API_CALL_TYPES:
-            responses_cap: Final = _parse_output_cap_value(data.get("max_output_tokens"))
-            if responses_cap is None:
-                return None
-            return max(RESPONSES_API_MIN_OUTPUT_TOKENS, responses_cap)
-        if call_type in EMBEDDING_API_CALL_TYPES:
-            return None
-        fields: Final = (
-            ("max_tokens", "max_completion_tokens")
-            if call_type
-            else ("max_tokens", "max_completion_tokens", "max_output_tokens")
-        )
-        output_cap_values: Final = tuple(
-            parsed for field in fields for parsed in (_parse_output_cap_value(data.get(field)),) if parsed is not None
-        )
-        return max(output_cap_values, default=None)
-
-    @classmethod
-    def _has_explicit_output_cap(cls, data: object, call_type: str | None) -> bool:
-        """Whether the caller explicitly set an output-token cap.
-
-        Checked via ``is not None`` (not truthiness) so an explicit 0 --
-        a legitimate zero-output request -- counts as explicit.
-        """
-        return cls._get_explicit_output_cap(data, call_type) is not None
+    _has_explicit_output_cap = staticmethod(_has_explicit_output_cap)
 
     @staticmethod
     def get_output_candidate_count(data: object, call_type: str | None = None) -> int:
@@ -1214,46 +1372,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 continue
         return candidate_count
 
-    @staticmethod
-    def _apply_implicit_output_cap(
-        data: object,
-        min_configured_limit: int | None,
-        call_type: str | None,
-        configured_output_tokens: int | None = None,
-        endpoint_type: EndpointType = EndpointType.GENERIC,
-    ) -> None:
-        """Hard-cap generation length when the request has no explicit cap.
-
-        Guards against an unbounded response overshooting a small TPM/OTPM
-        budget before post-call reconciliation runs. Skips requests that
-        already set an explicit cap and embeddings, which have no generation
-        budget. The Responses API only honors ``max_output_tokens`` (its
-        underlying chat-completion transformation ignores ``max_tokens``), so
-        the cap must be written to that field for Responses call types.
-
-        ``configured_output_tokens`` is the operator-declared per-tenant
-        estimate; when it exceeds the safety floor, the cap is raised to that
-        value instead of clamping every tenant to the same floor.
-        """
-        base_capped_floor: Final = PROXY_MaxParallelRequestsHandler_v3.no_max_tokens_output_floor(min_configured_limit)
-        capped_floor: Final = (
-            max(base_capped_floor, RESPONSES_API_MIN_OUTPUT_TOKENS)
-            if call_type in RESPONSES_API_CALL_TYPES
-            else base_capped_floor
-        )
-        baseline_floor: Final = int(DEFAULT_MAX_TOKENS_ESTIMATE * NO_MAX_TOKENS_TPM_RESERVATION_FRACTION)
-        is_embedding: Final = PROXY_MaxParallelRequestsHandler_v3._is_embedding_request(data, call_type)
-        if (
-            capped_floor >= baseline_floor
-            or PROXY_MaxParallelRequestsHandler_v3._has_explicit_output_cap(data, call_type)
-            or is_embedding
-            or endpoint_type == EndpointType.DECISIONS
-            or call_type in EXTRACTION_API_CALL_TYPES
-        ):
-            return
-        PROXY_MaxParallelRequestsHandler_v3.write_implicit_output_cap(
-            data, call_type, max(capped_floor, configured_output_tokens or 0)
-        )
+    _apply_implicit_output_cap = staticmethod(_apply_implicit_output_cap)
 
     @staticmethod
     def implicit_output_cap_exempt(data: object, call_type: str | None, endpoint_type: EndpointType) -> bool:
@@ -1294,7 +1413,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         team_id: str | None,
         rate_limit_type: str = "total",
     ) -> int:
-        return estimate_request_tokens(
+        return request_token_estimate(
             data=data,
             model=model,
             min_configured_tpm_limit=min_configured_tpm_limit,
@@ -1305,7 +1424,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
 
     def bound_output_for_limit(self, data: object, min_configured_limit: int, call_type: str | None) -> None:
-        return bound_output_for_limit(data=data, min_configured_limit=min_configured_limit, call_type=call_type)
+        return cap_output_for_limit(data=data, min_configured_limit=min_configured_limit, call_type=call_type)
 
     def _estimate_tokens_for_request(
         self,
@@ -3820,10 +3939,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             if isinstance(part, (str, dict))
         )
 
-    @staticmethod
-    def _extraction_input_text(data: Mapping[str, object]) -> str:
-        state: Final = data.get("state")
-        return f"{state if isinstance(state, str) else ''}\n{json.dumps(data.get('fields'), default=str)}"
+    _extraction_input_text = staticmethod(_extraction_input_text)
 
     def _estimate_precise_input_tokens(
         self, data: object, model: str | None, call_type: str | None = None, team_id: str | None = None
@@ -4517,52 +4633,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 reuses_request_slot=reuses_request_slot,
             )
 
-    @staticmethod
-    def _get_total_tokens_from_usage(usage: object | None, rate_limit_type: Literal["output", "input", "total"]) -> int:
-        """
-        Get total tokens from response usage for rate limiting.
-
-        For 'input' and 'total' rate limit types, cached tokens are excluded
-        because providers like AWS Bedrock don't count cached tokens toward
-        rate limits. This aligns LiteLLM's TPM calculation with provider behavior.
-        """
-        total_tokens = 0
-        cached_tokens = 0
-
-        if usage:
-            if isinstance(usage, Usage):
-                if rate_limit_type == "output":
-                    total_tokens = usage.completion_tokens or 0
-                elif rate_limit_type == "input":
-                    total_tokens = usage.prompt_tokens or 0
-                elif rate_limit_type == "total":
-                    total_tokens = usage.total_tokens or 0
-
-                # Get cached tokens to exclude from input/total
-                if rate_limit_type in ("input", "total"):
-                    if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
-                        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
-
-            elif isinstance(usage, dict):
-                # Responses API usage comes as a dict
-                if rate_limit_type == "output":
-                    total_tokens = usage.get("completion_tokens", 0) or 0
-                elif rate_limit_type == "input":
-                    total_tokens = usage.get("prompt_tokens", 0) or 0
-                elif rate_limit_type == "total":
-                    total_tokens = usage.get("total_tokens", 0) or 0
-
-                # Get cached tokens from dict
-                if rate_limit_type in ("input", "total"):
-                    prompt_details: Final = usage.get("prompt_tokens_details") or {}
-                    if isinstance(prompt_details, dict):
-                        cached_tokens = prompt_details.get("cached_tokens", 0) or 0
-
-        # Subtract cached tokens for input/total (providers don't count them)
-        if cached_tokens > 0:
-            total_tokens = max(0, total_tokens - cached_tokens)
-
-        return total_tokens
+    _get_total_tokens_from_usage = staticmethod(_get_total_tokens_from_usage)
 
     @staticmethod
     def _aggregate_only_total_tokens(usage: Usage | ResponseAPIUsage | Mapping[str, object] | None) -> int:
@@ -4593,26 +4664,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             return 0
         return total_tokens
 
-    @staticmethod
-    def _response_usage(
-        response_obj: object,
-    ) -> Usage | ResponseAPIUsage | Mapping[str, object] | None:
-        if isinstance(response_obj, (Usage, ResponseAPIUsage)):
-            return response_obj
-        if isinstance(response_obj, ExtractionResponse):
-            return get_usage_object(response_obj)
-        if isinstance(
-            response_obj,
-            (ModelResponse, EmbeddingResponse, TextCompletionResponse, BaseLiteLLMOpenAIResponseObject),
-        ):
-            usage: Final = getattr(response_obj, "usage", None)
-            return usage if isinstance(usage, (Usage, ResponseAPIUsage, dict)) else None
-        if isinstance(response_obj, dict):
-            nested_usage: Final = response_obj.get("usage")
-            if isinstance(nested_usage, (Usage, ResponseAPIUsage, dict)):
-                return nested_usage
-            return response_obj
-        return None
+    _response_usage = staticmethod(_response_usage)
 
     async def _execute_token_increment_script(self, pipeline_operations: Sequence[CounterIncrement]) -> None:
         """
@@ -4728,41 +4780,9 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
     def get_rate_limit_type(self) -> Literal["output", "input", "total"]:
         return token_rate_limit_type()
 
-    @staticmethod
-    def _merge_ratelimit_statuses_into_additional_headers(
-        additional_headers: dict[str, object],
-        statuses: list[RateLimitStatus],
-    ) -> dict[str, object]:
-        """
-        Return ``additional_headers`` extended with
-        ``x-ratelimit-{descriptor_key}-{remaining|limit}-{rate_limit_type}``
-        entries. Non-mutating so callers pick their own target dict.
-        """
-        merged: Final[dict[str, object]] = dict(additional_headers)
-        for status in statuses:
-            prefix = f"x-ratelimit-{status['descriptor_key']}"
-            merged[f"{prefix}-remaining-{status['rate_limit_type']}"] = status["limit_remaining"]
-            merged[f"{prefix}-limit-{status['rate_limit_type']}"] = status["current_limit"]
-        return merged
+    _merge_ratelimit_statuses_into_additional_headers = staticmethod(_merge_ratelimit_statuses_into_additional_headers)
 
-    @staticmethod
-    def _resolve_rerank_token_usage(response_obj: object) -> tuple[int, int, bool] | None:
-        if not isinstance(response_obj, RerankResponse) or response_obj.meta is None:
-            return None
-
-        rerank_tokens: Final = response_obj.meta.get("tokens")  # pyright: ignore[reportUnknownMemberType]  # TypedDict's optional generic metadata widens get overloads
-        if rerank_tokens is not None:
-            input_tokens: Final = rerank_tokens.get("input_tokens") or 0  # pyright: ignore[reportUnknownMemberType]  # token fields are typed integers despite the generic get overload
-            output_tokens: Final = rerank_tokens.get("output_tokens") or 0  # pyright: ignore[reportUnknownMemberType]  # token fields are typed integers despite the generic get overload
-            if input_tokens or output_tokens:
-                return max(0, input_tokens), max(0, output_tokens), True
-
-        billed_units: Final = response_obj.meta.get("billed_units")  # pyright: ignore[reportUnknownMemberType]  # TypedDict's optional generic metadata widens get overloads
-        if billed_units is not None:
-            total_tokens: Final = billed_units.get("total_tokens") or 0  # pyright: ignore[reportUnknownMemberType]  # billed total is a typed integer despite the generic get overload
-            if total_tokens:
-                return max(0, total_tokens), 0, True
-        return None
+    _resolve_rerank_token_usage = staticmethod(_resolve_rerank_token_usage)
 
     def _resolve_reconciled_usage(self, response_obj: object) -> _ReconciledUsage | None:
         return resolve_reconciled_usage(response_obj=response_obj)
@@ -5927,7 +5947,7 @@ def estimate_input_and_output_tokens(
     if not isinstance(data, dict) or request_data is None:
         return 0, 0
     request_model: Final = request_data.get("model")
-    translated_data: Final = PROXY_MaxParallelRequestsHandler_v3._translate_google_genai_native_request(data, call_type)
+    translated_data: Final = _translate_google_genai_native_request(data, call_type)
     estimable_data: Final = translated_data if translated_data is not None else request_data
     selected_fields: Final[tuple[object | None, object | None, object | None]] = (
         (None, None, estimable_data.get("input"))
@@ -5936,9 +5956,7 @@ def estimate_input_and_output_tokens(
         if call_type in TEXT_COMPLETION_API_CALL_TYPES
         else (
             None,
-            PROXY_MaxParallelRequestsHandler_v3._extraction_input_text(
-                _REQUEST_RATE_LIMIT_DATA.validate_python(estimable_data)
-            ),
+            _extraction_input_text(_REQUEST_RATE_LIMIT_DATA.validate_python(estimable_data)),
             None,
         )
         if call_type in EXTRACTION_API_CALL_TYPES
@@ -5998,11 +6016,8 @@ def estimate_input_and_output_tokens(
         max(1, total_chars // DEFAULT_CHARS_PER_TOKEN) if total_chars > 0 else 0
     ) + media_tokens
 
-    explicit_max_tokens: Final = PROXY_MaxParallelRequestsHandler_v3._get_explicit_output_cap(data, call_type)
-    generates_no_output: Final = (
-        PROXY_MaxParallelRequestsHandler_v3._is_embedding_request(data, call_type)
-        or call_type in EXTRACTION_API_CALL_TYPES
-    )
+    explicit_max_tokens: Final = _get_explicit_output_cap(data, call_type)
+    generates_no_output: Final = _is_embedding_request(data, call_type) or call_type in EXTRACTION_API_CALL_TYPES
 
     base_output_floor: Final = PROXY_MaxParallelRequestsHandler_v3.no_max_tokens_output_floor(min_configured_tpm_limit)
     output_floor: Final = (
@@ -6075,7 +6090,7 @@ def estimate_tokens_for_request(
     return total_estimated
 
 
-def estimate_request_tokens(
+def request_token_estimate(
     data: object,
     model: str,
     min_configured_tpm_limit: int,
@@ -6104,11 +6119,9 @@ def estimate_request_tokens(
     return output_budget if rate_limit_type == "output" else estimated_input
 
 
-def bound_output_for_limit(data: object, min_configured_limit: int, call_type: str | None) -> None:
+def cap_output_for_limit(data: object, min_configured_limit: int, call_type: str | None) -> None:
     """Cap a request without an explicit output cap the way this limiter does for its own small TPM limits."""
-    PROXY_MaxParallelRequestsHandler_v3._apply_implicit_output_cap(
-        data=data, min_configured_limit=min_configured_limit, call_type=call_type
-    )
+    _apply_implicit_output_cap(data=data, min_configured_limit=min_configured_limit, call_type=call_type)
 
 
 def token_rate_limit_type() -> Literal["output", "input", "total"]:
@@ -6140,11 +6153,11 @@ def resolve_reconciled_usage(response_obj: object) -> _ReconciledUsage | None:
     """The prompt, completion, and cache-read token counts a response reports, else None
     when it reports no usage at all. Cache-read tokens stay inside ``prompt_tokens`` here;
     each consumer decides what they cost it."""
-    rerank_usage: Final = PROXY_MaxParallelRequestsHandler_v3._resolve_rerank_token_usage(response_obj)
+    rerank_usage: Final = _resolve_rerank_token_usage(response_obj)
     if rerank_usage is not None:
         return _ReconciledUsage(prompt_tokens=rerank_usage[0], completion_tokens=rerank_usage[1], cached_tokens=0)
 
-    usage: Final = PROXY_MaxParallelRequestsHandler_v3._response_usage(response_obj)
+    usage: Final = _response_usage(response_obj)
 
     if isinstance(usage, Usage):
         prompt_tokens: Final = usage.prompt_tokens or 0
@@ -6228,7 +6241,7 @@ def recovered_partial_usage_tokens(
         return 0, 0, 0
     billable_input, completion_tokens, _ = resolve_io_token_reconcile_usage(usage)
     return (
-        PROXY_MaxParallelRequestsHandler_v3._get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type),
+        _get_total_tokens_from_usage(usage=usage, rate_limit_type=rate_limit_type),
         billable_input,
         completion_tokens,
     )
@@ -6401,7 +6414,7 @@ async def limiter_post_call_success(
         if litellm_proxy_rate_limit_response is not None and response_has_hidden_params(response):
             additional_headers: Final = ensure_response_additional_headers(response)
             additional_headers.update(
-                PROXY_MaxParallelRequestsHandler_v3._merge_ratelimit_statuses_into_additional_headers(
+                _merge_ratelimit_statuses_into_additional_headers(
                     additional_headers={},
                     statuses=litellm_proxy_rate_limit_response["statuses"],
                 )

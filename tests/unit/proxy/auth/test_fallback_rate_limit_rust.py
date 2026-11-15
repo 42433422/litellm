@@ -14,11 +14,6 @@ PRIMARY: Final = {"model_name": "primary", "litellm_params": {"model": "openai/g
 FALLBACK: Final = {"model_name": "fallback", "litellm_params": {"model": "openai/gpt-4o", "api_key": "k"}}
 
 
-@pytest.fixture(autouse=True)
-def _native_parallel_request_limiter(monkeypatch):
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
-
-
 def _router() -> Router:
     return Router(model_list=[PRIMARY, FALLBACK], fallbacks=[{"primary": ["fallback"]}])
 

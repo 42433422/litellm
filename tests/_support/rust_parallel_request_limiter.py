@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Final
 
-import pytest
 from pydantic import TypeAdapter
 
 from litellm.caching.caching import DualCache
@@ -32,7 +31,6 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
 from litellm.proxy.hooks.parallel_request_limiter_v3 import get_request_stash as _live_request_stash
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import (
-    NATIVE_PARALLEL_REQUEST_LIMITER_ENV,
     ParallelRequestLimiterNativeLogger,
     PreCallAuthScope,
     native_parallel_request_limiter,
@@ -126,9 +124,7 @@ def rate_limit_descriptors() -> list[RateLimitDescriptor] | None:
 
 class RustParallelRequestLimiter(_PROXY_MaxParallelRequestsHandler_v3):
     def __init__(self, *args: object, **kwargs: object) -> None:
-        with pytest.MonkeyPatch.context() as flag:
-            flag.setenv(NATIVE_PARALLEL_REQUEST_LIMITER_ENV, "true")
-            super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # the replicas pass the limiter's own arguments
+        super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # the replicas pass the limiter's own arguments
         assert self.native_companion is not None
         _NATIVES.append(self.native_companion)
         self.native_logger: Final[ParallelRequestLimiterNativeLogger] = native_parallel_request_limiter(self)

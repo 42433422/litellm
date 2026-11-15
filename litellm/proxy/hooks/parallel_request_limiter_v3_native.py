@@ -2,7 +2,6 @@ import builtins
 import dataclasses
 import functools
 import math
-import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar, Token
@@ -75,7 +74,6 @@ if TYPE_CHECKING:
         NativeRequestRedis,
     )
 
-NATIVE_PARALLEL_REQUEST_LIMITER_ENV: Final = "LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER"
 RATE_LIMITED_KIND: Final = "proxy_rate_limit"
 UNVERIFIABLE_KIND: Final = "rate_limit_unverifiable"
 PTU_SHARE_EXCEEDED_KIND: Final = "ptu_share_exceeded"
@@ -124,10 +122,6 @@ class PreCallAuthScope:
 def _member(source: object, name: str) -> object:
     value: Final[object] = getattr(source, name, None)
     return value
-
-
-def native_parallel_request_limiter_enabled() -> bool:
-    return os.getenv(NATIVE_PARALLEL_REQUEST_LIMITER_ENV, "false").strip().lower() == "true"
 
 
 def _rate_limited(wire: WireAbort) -> Exception:
@@ -978,7 +972,6 @@ def native_parallel_request_limiter(
 
 
 __all__ = [
-    "NATIVE_PARALLEL_REQUEST_LIMITER_ENV",
     "NativeBatchEnqueuedTokenStore",
     "ParallelRequestLimiterNativeLogger",
     "PreCallAuthScope",
@@ -989,7 +982,6 @@ __all__ = [
     "mirror_rate_limit_response",
     "native_engine",
     "native_parallel_request_limiter",
-    "native_parallel_request_limiter_enabled",
     "policy",
     "post_call_request",
     "pre_call_request",

@@ -216,12 +216,10 @@ def _dynamic(monkeypatch: pytest.MonkeyPatch, clock: Clock, port: int | None) ->
     )
     monkeypatch.setattr("litellm.callbacks", ["dynamic_rate_limiter_v3"])
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     handler: Final = _PROXY_DynamicRateLimitHandlerV3(
         DualCache() if port is None else DualCache(redis_cache=RedisCache(host="127.0.0.1", port=port)),
         time_provider=clock.now,
     )
-    monkeypatch.delenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER")
     assert handler.v3_limiter.native_companion is not None
     handler.update_variables(llm_router=router)
     return handler
@@ -1013,18 +1011,15 @@ async def test_mcp_tool_calls_are_limited_natively_like_python(
 
 
 @pytest.mark.asyncio
-async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine_when_the_flag_is_on(
+async def test_the_dynamic_limiters_private_limiter_runs_on_the_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
         _PROXY_DynamicRateLimitHandlerV3,  # pyright: ignore[reportPrivateUsage]  # the class has no public alias
     )
 
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     handler: Final = _PROXY_DynamicRateLimitHandlerV3(DualCache())
     assert handler.v3_limiter.native_companion is not None
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "false")
-    assert _PROXY_DynamicRateLimitHandlerV3(DualCache()).v3_limiter.native_companion is None
 
 
 def _with_dynamic(
@@ -1583,7 +1578,6 @@ async def test_auth_descriptors_from_rust_limit_requests_like_python(
 
 
 async def _through_proxy_logging(monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     monkeypatch.setattr(litellm, "callbacks", [])
     proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test
@@ -1638,7 +1632,6 @@ async def test_the_real_dispatcher_registers_one_native_and_limits_like_python(
 
 
 async def _capped_through_proxy_logging(monkeypatch: pytest.MonkeyPatch) -> object:
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     monkeypatch.setattr(litellm, "callbacks", [])
     proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test
@@ -1667,7 +1660,6 @@ class _Unprintable:
 
 
 async def _refused_through_proxy_logging(monkeypatch: pytest.MonkeyPatch, member: str) -> object:
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
     monkeypatch.setattr(litellm, "callbacks", [])
     proxy_logging: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
     proxy_logging._add_proxy_hooks()  # pyright: ignore[reportPrivateUsage]  # the startup registration under test

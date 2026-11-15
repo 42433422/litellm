@@ -3,7 +3,6 @@ Unit Tests for the max parallel request limiter v3 for the proxy
 """
 
 import asyncio
-import logging
 import time
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
@@ -18,16 +17,12 @@ import litellm
 from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
-from litellm.exceptions import ServiceUnavailableError
 from litellm.litellm_core_utils.model_latest_aliases import get_model_latest_aliases
 from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
 from litellm.litellm_core_utils.routing_common_utils import resolve_model_group_alias
-from litellm.litellm_core_utils.total_deadline import TotalTimeoutExpired, total_deadline
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
-    PARALLEL_REQUEST_SLOT_TTL_SECONDS,
-    ParallelSlotAcquisition,
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitDescriptor,
     RateLimitedModel,
@@ -42,18 +37,15 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROXY_MaxParallelRequestsHandler_v3 as _PROXY_MaxParallelRequestsHandler,
 )
 from litellm.proxy.spend_tracking.input_tokens import models_counted_for
-from litellm.proxy.utils import InternalUsageCache, ProxyLogging, hash_token
+from litellm.proxy.utils import InternalUsageCache, hash_token
 from litellm.redis.stores.rate_limits import (
     CounterIncrement,
     CounterKind,
     LocalValue,
     RateLimitCounter,
     RateLimitEntry,
-    RateLimitGauge,
     RateLimitScope,
-    RateLimitStore,
 )
-from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.mcp import MCPTransport
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
 from litellm.types.utils import (
@@ -64,8 +56,7 @@ from litellm.types.utils import (
     TextCompletionResponse,
     Usage,
 )
-from tests._support.clock_loops import AutojumpClockLoop
-from tests.unit.redis.stores.fake_rate_limits import FakeRateLimits, scope_key
+from tests.unit.redis.stores.fake_rate_limits import scope_key
 
 
 class TimeController:
@@ -98,19 +89,14 @@ def _increment_of(operation: ReservationOperation) -> CounterIncrement:
     return operation if isinstance(operation, CounterIncrement) else operation.increment
 
 
-def _capture_token_increments(fakes: FakeRateLimits) -> list[dict[str, object]]:
-    """Answers the TTL-preserving token increment script and records main's ``(key, increment_value, ttl)``."""
-    captured: Final[list[dict[str, object]]] = []
-
-    async def token_increment(keys: list[str], args: list[float]) -> list[float]:
-        amounts: Final = args[::2]
-        captured.extend(
-            {"key": key, "increment_value": amount, "ttl": ttl} for key, amount, ttl in zip(keys, amounts, args[1::2])
-        )
-        return amounts
-
-    fakes.token_increment_script = token_increment
-    return captured
+def _token_counters(handler: _PROXY_MaxParallelRequestsHandler, *scopes: tuple[str, str]) -> list[dict[str, object]]:
+    counters: Final = tuple(RateLimitScope(key, value).counter("tokens") for key, value in scopes)
+    values: Final = handler.rate_limits.local(counters)
+    return [
+        {"key": scope_key(counter.scope, "tokens"), "increment_value": value}
+        for counter, value in zip(counters, values)
+        if value
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -189,42 +175,10 @@ async def test_sliding_window_rate_limit_v3(monkeypatch, time_controller):
     _api_key = hash_token(_api_key)
     user_api_key_dict = UserAPIKeyAuth(api_key=_api_key, rpm_limit=3)
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
         time_provider=time_controller.now,
-        rate_limit_store=fakes.store(),
     )
-
-    # Mock the batch_rate_limiter_script to simulate window expiry and use correct key construction
-    window_starts: dict[str, int] = {}
-    request_counts: dict[str, int] = {}
-
-    async def mock_batch_rate_limiter(*args, **kwargs):
-        keys = kwargs.get("keys") if kwargs else args[0]
-        args_list = kwargs.get("args") if kwargs else args[1]
-        now = args_list[0]
-        window_size = args_list[1]
-        results = []
-        for i in range(0, len(keys), 2):  # Fixed: should be 2, not 3
-            window_key = keys[i]
-            counter_key = keys[i + 1]
-            # Simulate window expiry
-            prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
-            if prev_window is None or (now - prev_window) >= window_size:
-                # Window expired, reset
-                window_starts[window_key] = now
-                new_counter = 1
-                request_counts[counter_key] = new_counter
-            else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
-            results.append(now)
-            results.append(new_counter)
-        return results
-
-    fakes.batch_rate_limiter_script = mock_batch_rate_limiter
 
     # First request should succeed
     await parallel_request_handler.async_pre_call_hook(
@@ -261,97 +215,6 @@ async def test_sliding_window_rate_limit_v3(monkeypatch, time_controller):
     await parallel_request_handler.async_pre_call_hook(
         user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
     )
-
-
-@pytest.mark.asyncio
-async def test_rate_limiter_script_return_values_v3(monkeypatch, time_controller):
-    """
-    Test that the rate limiter script returns both counter and window values correctly
-    """
-    monkeypatch.setenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", "2")
-    _api_key = "sk-98765"
-    _api_key = hash_token(_api_key)
-    user_api_key_dict = UserAPIKeyAuth(api_key=_api_key, rpm_limit=3)
-    local_cache = DualCache()
-    fakes = FakeRateLimits()
-    parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(local_cache),
-        time_provider=time_controller.now,
-        rate_limit_store=fakes.store(),
-    )
-
-    # Mock the batch_rate_limiter_script to simulate window expiry and use correct key construction
-    window_starts: dict[str, int] = {}
-    request_counts: dict[str, int] = {}
-
-    async def mock_batch_rate_limiter(*args, **kwargs):
-        keys = kwargs.get("keys") if kwargs else args[0]
-        args_list = kwargs.get("args") if kwargs else args[1]
-        now = args_list[0]
-        window_size = args_list[1]
-        results = []
-        for i in range(0, len(keys), 2):  # Fixed: should be 2, not 3
-            window_key = keys[i]
-            counter_key = keys[i + 1]
-            # Simulate window expiry
-            prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
-            if prev_window is None or (now - prev_window) >= window_size:
-                # Window expired, reset
-                window_starts[window_key] = now
-                new_counter = 1
-                request_counts[counter_key] = new_counter
-            else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
-            results.append(now)
-            results.append(new_counter)
-        return results
-
-    fakes.batch_rate_limiter_script = mock_batch_rate_limiter
-
-    # Make first request
-    await parallel_request_handler.async_pre_call_hook(
-        user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
-    )
-
-    # Verify both counter and window values are stored in cache
-    counter_key = _counter("api_key", _api_key, "requests")
-    window_key = counter_key.window
-
-    window_value = _local(parallel_request_handler, window_key)
-    counter_value = _local(parallel_request_handler, counter_key)
-
-    assert window_value is not None, "Window value should be stored in cache"
-    assert counter_value is not None, "Counter value should be stored in cache"
-    assert counter_value == 1, "Counter should be 1 after first request"
-
-    # Make second request
-    await parallel_request_handler.async_pre_call_hook(
-        user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
-    )
-
-    # Verify counter increased but window stayed same
-    new_window_value = _local(parallel_request_handler, window_key)
-    new_counter_value = _local(parallel_request_handler, counter_key)
-
-    assert new_window_value == window_value, "Window value should not change within window"
-    assert new_counter_value == 2, "Counter should be 2 after second request"
-
-    # Wait for window to expire
-    time_controller.advance(3)
-
-    # Make request after window expiry
-    await parallel_request_handler.async_pre_call_hook(
-        user_api_key_dict=user_api_key_dict, cache=local_cache, data={}, call_type=""
-    )
-
-    # Verify new window and reset counter
-    final_window_value = _local(parallel_request_handler, window_key)
-    final_counter_value = _local(parallel_request_handler, counter_key)
-
-    assert final_window_value != window_value, "Window value should change after expiry"
-    assert final_counter_value == 1, "Counter should reset to 1 after window expiry"
 
 
 @pytest.mark.parametrize(
@@ -415,43 +278,11 @@ async def test_normal_router_call_tpm_v3(monkeypatch, rate_limit_object, time_co
             metadata={"model_tpm_limit": {"azure-model": 10}},
         )
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
         time_provider=time_controller.now,
-        rate_limit_store=fakes.store(),
     )
 
-    # Mock the batch_rate_limiter_script to simulate window expiry and use correct key construction
-    window_starts: dict[str, int] = {}
-    request_counts: dict[str, int] = {}
-
-    async def mock_batch_rate_limiter(*args, **kwargs):
-        print(f"args: {args}, kwargs: {kwargs}")
-        keys = kwargs.get("keys") if kwargs else args[0]
-        args_list = kwargs.get("args") if kwargs else args[1]
-        now = args_list[0]
-        window_size = args_list[1]
-        results = []
-        for i in range(0, len(keys), 2):  # Fixed: should be 2, not 3
-            window_key = keys[i]
-            counter_key = keys[i + 1]
-            # Simulate window expiry
-            prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
-            if prev_window is None or (now - prev_window) >= window_size:
-                # Window expired, reset
-                window_starts[window_key] = now
-                new_counter = 1
-                request_counts[counter_key] = new_counter
-            else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
-            results.append(now)
-            results.append(new_counter)
-        return results
-
-    fakes.batch_rate_limiter_script = mock_batch_rate_limiter
     monkeypatch.setattr(litellm, "callbacks", [parallel_request_handler])
 
     # Helper to get the correct value for key construction
@@ -564,10 +395,8 @@ async def test_token_rate_limit_type_respected_v3(monkeypatch, token_rate_limit_
     _api_key = hash_token(_api_key)
     user_api_key_dict = UserAPIKeyAuth(api_key=_api_key, tpm_limit=100)
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
     )
 
     # Mock the get_rate_limit_type method directly since it imports general_settings internally
@@ -601,9 +430,6 @@ async def test_token_rate_limit_type_respected_v3(monkeypatch, token_rate_limit_
         "model": "gpt-3.5-turbo",
     }
 
-    # Mock the pipeline increment method to capture the operations
-    captured_operations = _capture_token_increments(fakes)
-
     # Call the success event handler
     await parallel_request_handler.async_log_success_event(
         kwargs=mock_kwargs,
@@ -611,6 +437,7 @@ async def test_token_rate_limit_type_respected_v3(monkeypatch, token_rate_limit_
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key))
 
     # Verify that the correct token count was used based on the rate limit type
     assert len(captured_operations) == 1, (
@@ -659,10 +486,8 @@ async def test_async_log_success_event_counts_non_chat_response_tokens(monkeypat
     monkeypatch.setenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", "60")
 
     _api_key = hash_token("sk-98765")
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(DualCache()),
-        rate_limit_store=fakes.store(),
     )
     monkeypatch.setattr(parallel_request_handler, "get_rate_limit_type", lambda: "total")
 
@@ -671,158 +496,20 @@ async def test_async_log_success_event_counts_non_chat_response_tokens(monkeypat
         "model": response_obj.model,
     }
 
-    captured_operations = _capture_token_increments(fakes)
-
     await parallel_request_handler.async_log_success_event(
         kwargs=mock_kwargs,
         response_obj=response_obj,
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key))
 
     tpm_operation = next((op for op in captured_operations if op["key"].endswith(":tokens")), None)
     assert tpm_operation is not None, "Should have a TPM increment operation"
     assert tpm_operation["increment_value"] == 50
 
 
-@pytest.mark.asyncio
-async def test_parallel_gauge_uses_atomic_redis_script_v3():
-    """
-    With Redis available, gauge admission goes through the atomic
-    check-and-acquire script (limit, slot TTL, and this request's slot id as
-    args), the returned in-flight count is mirrored into the local cache,
-    and an over-limit script result maps to a 429 without occupying a slot.
-    """
-    local_cache = DualCache()
-    fakes = FakeRateLimits()
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
-    )
-    _api_key = hash_token("sk-98765")
-    user_api_key_dict = UserAPIKeyAuth(api_key=_api_key, max_parallel_requests=5)
-    counter_key = RateLimitScope("api_key", _api_key).gauge
-
-    captured_calls = []
-
-    async def fake_acquire(keys, args):
-        captured_calls.append((list(keys), list(args)))
-        return [0, 3]
-
-    fakes.parallel_acquire_script = fake_acquire
-
-    data: dict[str, Any] = {"model": "gpt-3.5-turbo"}
-    await handler.async_pre_call_hook(
-        user_api_key_dict=user_api_key_dict,
-        cache=local_cache,
-        data=data,
-        call_type="",
-    )
-    stashed_acquisition = get_request_stash().parallel_slot
-    assert stashed_acquisition is not None
-    stashed_slot_id = stashed_acquisition["slot_id"]
-    assert isinstance(stashed_slot_id, str) and stashed_slot_id
-    assert stashed_acquisition["gauges"] == (counter_key.scope,)
-    assert captured_calls == [
-        ([f"{{api_key:{_api_key}}}:max_parallel_requests"], [5, PARALLEL_REQUEST_SLOT_TTL_SECONDS, stashed_slot_id])
-    ]
-    assert _local(handler, counter_key) == 3
-    gauge_statuses = [
-        s
-        for s in get_request_stash().rate_limit_response["statuses"]
-        if s["rate_limit_type"] == "max_parallel_requests"
-    ]
-    assert gauge_statuses == [
-        {
-            "code": "OK",
-            "current_limit": 5,
-            "limit_remaining": 2,
-            "rate_limit_type": "max_parallel_requests",
-            "descriptor_key": "api_key",
-        }
-    ]
-
-    async def fake_acquire_over_limit(keys, args):
-        return [1, 1, 5, 5]
-
-    fakes.parallel_acquire_script = fake_acquire_over_limit
-
-    with pytest.raises(HTTPException) as exc_info:
-        await handler.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=local_cache,
-            data={"model": "gpt-3.5-turbo"},
-            call_type="",
-        )
-    assert exc_info.value.status_code == 429
-    assert "max_parallel_requests" in exc_info.value.detail
-
-
-@pytest.mark.asyncio
-async def test_async_increment_tokens_fallback_behavior():
-    """
-    Without Redis there is no TTL-preserving script, so the increment lands in memory.
-    """
-    fakes = FakeRateLimits(connected=False)
-    parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()), rate_limit_store=fakes.store()
-    )
-    counter = _counter("test", "fallback_key")
-
-    await parallel_request_handler.async_increment_tokens_with_ttl_preservation(
-        pipeline_operations=[CounterIncrement(counter, 10.0, 60)]
-    )
-
-    assert _local(parallel_request_handler, counter) == 10.0
-    assert fakes.redis_increments == []
-
-
-@pytest.mark.asyncio
-async def test_async_increment_tokens_falls_back_to_the_pipeline_when_the_script_fails():
-    async def failing_script(keys: list[str], args: list[object]) -> object:
-        raise ConnectionError(_CONNECTION_REFUSED)
-
-    fakes = FakeRateLimits(token_increment_script=failing_script)
-    parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()), rate_limit_store=fakes.store()
-    )
-    counter = _counter("test", "fallback_key")
-
-    await parallel_request_handler.async_increment_tokens_with_ttl_preservation(
-        pipeline_operations=[CounterIncrement(counter, 10.0, 60)]
-    )
-
-    assert fakes.redis_increments == [("{test:fallback_key}:tokens", 10.0, 60)]
-    assert _local(parallel_request_handler, counter) == 10.0
-
-
 # Redis Cluster Compatibility Tests
-@pytest.mark.asyncio
-async def test_execute_redis_batch_rate_limiter_script_cluster_compatibility():
-    """
-    Each slot group runs its own batch script call, a group whose call fails falls back to the
-    in-memory window, and the values come back in the caller's counter order.
-    """
-    from unittest.mock import AsyncMock
-
-    mock_script = AsyncMock(side_effect=[Exception("EVALSHA - all keys must map to the same key slot"), [1234, 2]])
-    fakes = FakeRateLimits(batch_rate_limiter_script=mock_script)
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()),
-        force_hash_tag_grouping_resolver=lambda: True,
-        rate_limit_store=fakes.store(),
-    )
-
-    results = await handler._execute_redis_batch_rate_limiter_script(
-        counters=[_counter("api_key", "sk-123", "requests"), _counter("user", "user-456", "requests")],
-        now_int=1234,
-    )
-
-    assert results == [("1234", 1), ("1234", 2)]
-    assert [call.kwargs["keys"] for call in mock_script.call_args_list] == [
-        ["{api_key:sk-123}:window", "{api_key:sk-123}:requests"],
-        ["{user:user-456}:window", "{user:user-456}:requests"],
-    ]
 
 
 @pytest.mark.asyncio
@@ -943,10 +630,8 @@ async def test_async_log_success_event_with_dict_usage(monkeypatch, token_rate_l
     _api_key = "sk-98765"
     _api_key = hash_token(_api_key)
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
     )
 
     # Mock the get_rate_limit_type method
@@ -979,9 +664,6 @@ async def test_async_log_success_event_with_dict_usage(monkeypatch, token_rate_l
         "model": "gpt-3.5-turbo",
     }
 
-    # Mock the pipeline increment method to capture the operations
-    captured_operations = _capture_token_increments(fakes)
-
     # Call the success event handler
     await parallel_request_handler.async_log_success_event(
         kwargs=mock_kwargs,
@@ -989,6 +671,7 @@ async def test_async_log_success_event_with_dict_usage(monkeypatch, token_rate_l
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key))
 
     # Find the TPM increment operation
     tpm_operation = None
@@ -1023,10 +706,8 @@ async def test_async_log_success_event_with_dict_usage_missing_fields(monkeypatc
     _api_key = "sk-98765"
     _api_key = hash_token(_api_key)
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
     )
 
     # Mock the get_rate_limit_type method
@@ -1059,9 +740,6 @@ async def test_async_log_success_event_with_dict_usage_missing_fields(monkeypatc
         "model": "gpt-3.5-turbo",
     }
 
-    # Mock the pipeline increment method to capture the operations
-    captured_operations = _capture_token_increments(fakes)
-
     # Call the success event handler - should not raise exception
     await parallel_request_handler.async_log_success_event(
         kwargs=mock_kwargs,
@@ -1069,40 +747,12 @@ async def test_async_log_success_event_with_dict_usage_missing_fields(monkeypatc
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key))
 
     # When total_tokens resolves to 0 (missing fields) and there's no reservation,
     # the reconciliation delta is 0 — no TPM increment should be emitted.
     tpm_ops = [op for op in captured_operations if op["key"].endswith(":tokens")]
     assert tpm_ops == [], f"Expected no TPM ops when usage is empty, got: {tpm_ops}"
-
-
-@pytest.mark.asyncio
-async def test_execute_token_increment_script_cluster_compatibility():
-    """
-    Token increments run one script call per slot group, each with an (increment, ttl) pair per key.
-    """
-    from unittest.mock import AsyncMock
-
-    mock_script = AsyncMock(return_value=[0.0, 0.0])
-    fakes = FakeRateLimits(token_increment_script=mock_script)
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()),
-        force_hash_tag_grouping_resolver=lambda: True,
-        rate_limit_store=fakes.store(),
-    )
-
-    await handler._execute_token_increment_script(
-        [
-            CounterIncrement(_counter("api_key", "sk-123"), 100, 60),
-            CounterIncrement(_counter("api_key", "sk-123", "requests"), 1, 60),
-            CounterIncrement(_counter("user", "user-456"), 50, 60),
-        ]
-    )
-
-    assert [(call.kwargs["keys"], call.kwargs["args"]) for call in mock_script.call_args_list] == [
-        (["{api_key:sk-123}:tokens", "{api_key:sk-123}:requests"], [100, 60, 1, 60]),
-        (["{user:user-456}:tokens"], [50, 60]),
-    ]
 
 
 @pytest.mark.asyncio
@@ -1117,10 +767,8 @@ async def test_agent_rate_limit_tpm_increment_on_success(monkeypatch):
     _session_id = "sess_tpm_test"
 
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
     )
 
     def mock_get_rate_limit_type():
@@ -1152,13 +800,14 @@ async def test_agent_rate_limit_tpm_increment_on_success(monkeypatch):
         "model": "gpt-4",
     }
 
-    captured_operations = _capture_token_increments(fakes)
-
     await parallel_request_handler.async_log_success_event(
         kwargs=mock_kwargs,
         response_obj=mock_response,
         start_time=datetime.now(),
         end_time=datetime.now(),
+    )
+    captured_operations = _token_counters(
+        parallel_request_handler, ("agent", _agent_id), ("agent_session", f"{_agent_id}:{_session_id}")
     )
 
     agent_tpm_op = None
@@ -1196,11 +845,9 @@ async def test_agent_rate_limit_429_on_over_limit(monkeypatch, time_controller):
     )
 
     local_cache = DualCache()
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(local_cache),
         time_provider=time_controller.now,
-        rate_limit_store=fakes.store(),
     )
 
     mock_agent = AgentResponse(
@@ -1209,33 +856,6 @@ async def test_agent_rate_limit_429_on_over_limit(monkeypatch, time_controller):
         agent_card_params={"name": "Rate Limited Agent"},
         rpm_limit=2,
     )
-
-    window_starts: dict[str, int] = {}
-    request_counts: dict[str, int] = {}
-
-    async def mock_batch_rate_limiter(*args, **kwargs):
-        keys = kwargs.get("keys") if kwargs else args[0]
-        args_list = kwargs.get("args") if kwargs else args[1]
-        now = args_list[0]
-        window_size = args_list[1]
-        results = []
-        for i in range(0, len(keys), 2):
-            window_key = keys[i]
-            counter_key = keys[i + 1]
-            prev_window = window_starts.get(window_key)
-            prev_counter = request_counts.get(counter_key, 0)
-            if prev_window is None or (now - prev_window) >= window_size:
-                window_starts[window_key] = now
-                new_counter = 1
-                request_counts[counter_key] = new_counter
-            else:
-                new_counter = prev_counter + 1
-                request_counts[counter_key] = new_counter
-            results.append(now)
-            results.append(new_counter)
-        return results
-
-    fakes.batch_rate_limiter_script = mock_batch_rate_limiter
 
     with patch(
         "litellm.proxy.agent_endpoints.agent_registry.global_agent_registry.get_agent_by_id",
@@ -1530,191 +1150,6 @@ def test_get_key_mcp_rpm_limit_precedence():
     assert get_team_mcp_rpm_limit(none_set) is None
 
 
-def _seed_max_parallel_requests_slots(
-    handler: _PROXY_MaxParallelRequestsHandler, gauge: RateLimitGauge, slot_ids: list[str]
-) -> None:
-    handler.rate_limits.set_local(
-        gauge, {slot_id: time.time() for slot_id in slot_ids}, PARALLEL_REQUEST_SLOT_TTL_SECONDS
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("release_from", ["post_call", "stream_cleanup"])
-async def test_concurrent_success_callbacks_release_parallel_slot_once_when_redis_fails(release_from: str) -> None:
-    from unittest.mock import AsyncMock
-
-    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-
-    api_key = hash_token("sk-concurrent-release")
-    local_cache = DualCache()
-    fakes = FakeRateLimits()
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
-    )
-    user_api_key_dict = UserAPIKeyAuth(api_key=api_key, max_parallel_requests=2)
-    call_id = "concurrent-release-owner"
-    parallel_key = RateLimitScope("api_key", api_key).gauge
-    release_started = asyncio.Event()
-    allow_redis_failure = asyncio.Event()
-
-    async def failing_release(keys: Sequence[str], args: Sequence[object]) -> list[int]:
-        release_started.set()
-        await allow_redis_failure.wait()
-        raise ConnectionError("redis unavailable")
-
-    release_script = AsyncMock(side_effect=failing_release)
-    fakes.parallel_release_script = release_script
-    handler.rate_limits.set_local(parallel_key, 2, None)
-    stash = get_or_create_request_stash()
-    stash.owner_litellm_call_id = call_id
-    stash.parallel_slot = ParallelSlotAcquisition(
-        slot_id="slot-concurrent-release",
-        gauges=(parallel_key.scope,),
-    )
-    data = {"litellm_call_id": call_id}
-    logger: Final = ProxyLogging(user_api_key_cache=local_cache)
-    logger.proxy_hook_mapping["parallel_request_limiter"] = handler
-
-    post_call_task = asyncio.create_task(
-        ProxyBaseLLMRequestProcessing.finalize_streaming_generator_cleanup(
-            request=None,
-            request_data=data,
-            response=None,
-            stream_completed=True,
-            user_api_key_dict=user_api_key_dict,
-            proxy_logging_obj=logger,
-        )
-        if release_from == "stream_cleanup"
-        else handler.async_post_call_success_hook(
-            data=data,
-            user_api_key_dict=user_api_key_dict,
-            response=ResponsesAPIResponse(
-                id="resp_concurrent_release",
-                created_at=0,
-                model="gpt-4o-mini",
-                object="response",
-                output=[],
-                status="completed",
-            ),
-        )
-    )
-    await asyncio.wait_for(release_started.wait(), timeout=5)
-    logging_task = asyncio.create_task(
-        handler.async_log_success_event(
-            kwargs=data,
-            response_obj=None,
-            start_time=None,
-            end_time=None,
-        )
-    )
-    allow_redis_failure.set()
-    await asyncio.wait_for(
-        asyncio.gather(post_call_task, logging_task),
-        timeout=5,
-    )
-
-    assert release_script.await_count == 1
-    assert _local(handler, parallel_key) == 1
-    assert stash.parallel_slot is None
-
-
-@pytest.mark.asyncio
-async def test_read_only_gauge_check_counts_without_acquiring_v3():
-    """
-    read_only callers (e.g. the context-compaction pre-check) must observe
-    the in-flight count via the count script without registering a slot, and
-    a count-script failure must degrade to the local mirror instead of
-    raising.
-    """
-    _api_key = hash_token("sk-98765")
-    local_cache = DualCache()
-    fakes = FakeRateLimits()
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
-    )
-    counter_key = RateLimitScope("api_key", _api_key).gauge
-    descriptors = [
-        {
-            "key": "api_key",
-            "value": _api_key,
-            "rate_limit": {"max_parallel_requests": 5},
-        }
-    ]
-
-    captured_calls = []
-
-    async def fake_count(keys, args):
-        captured_calls.append((list(keys), list(args)))
-        return [3]
-
-    fakes.parallel_count_script = fake_count
-
-    response = await handler.should_rate_limit(descriptors=descriptors, read_only=True)
-    assert captured_calls == [([f"{{api_key:{_api_key}}}:max_parallel_requests"], [PARALLEL_REQUEST_SLOT_TTL_SECONDS])]
-    assert response["overall_code"] == "OK"
-    assert response["statuses"] == [
-        {
-            "code": "OK",
-            "current_limit": 5,
-            "limit_remaining": 2,
-            "rate_limit_type": "max_parallel_requests",
-            "descriptor_key": "api_key",
-        }
-    ]
-    assert _local(handler, counter_key) is None
-
-    async def failing_count(keys, args):
-        raise ConnectionError("redis unavailable")
-
-    fakes.parallel_count_script = failing_count
-    _seed_max_parallel_requests_slots(handler, counter_key, ["s1", "s2", "s3", "s4", "s5"])
-    response = await handler.should_rate_limit(descriptors=descriptors, read_only=True)
-    assert response["overall_code"] == "OVER_LIMIT"
-    assert response["statuses"][0]["rate_limit_type"] == "max_parallel_requests"
-
-
-@pytest.mark.asyncio
-async def test_redis_release_script_updates_local_mirror_v3():
-    """
-    With Redis available, releases go through the release script with this
-    request's slot id per gauge key, and the returned in-flight counts are
-    mirrored into the local cache so the local first-pass check stays fresh.
-    """
-    _api_key = hash_token("sk-98765")
-    local_cache = DualCache()
-    fakes = FakeRateLimits()
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
-    )
-    counter_key = RateLimitScope("api_key", _api_key).gauge
-
-    captured_calls = []
-
-    async def fake_release(keys, args):
-        captured_calls.append((list(keys), list(args)))
-        return [2]
-
-    fakes.parallel_release_script = fake_release
-
-    get_or_create_request_stash().parallel_slot = ParallelSlotAcquisition(
-        slot_id="slot-redis-test",
-        gauges=(counter_key.scope,),
-    )
-    await handler.async_log_failure_event(
-        kwargs={
-            "standard_logging_object": {"metadata": {"user_api_key_hash": _api_key}},
-        },
-        response_obj=None,
-        start_time=None,
-        end_time=None,
-    )
-    assert captured_calls == [([f"{{api_key:{_api_key}}}:max_parallel_requests"], ["slot-redis-test"])]
-    assert _local(handler, counter_key) == 2
-
-
 @pytest.mark.asyncio
 async def test_tpm_over_limit_rejection_releases_parallel_slot_v3(monkeypatch):
     """
@@ -1755,63 +1190,6 @@ async def test_tpm_over_limit_rejection_releases_parallel_slot_v3(monkeypatch):
         )
     assert exc_info.value.status_code == 429
     assert handler._gauge_in_flight_from_cache_value(_local(handler, counter_key)) == 0
-
-
-@pytest.mark.asyncio
-async def test_in_memory_fallback_respects_mirrored_redis_count_v3():
-    """
-    When Redis scripting fails after having worked, the local cache holds the
-    integer in-flight count mirrored from the last successful script call.
-    The in-memory fallback must treat that count as real occupancy (and
-    release must decrement it, floored at 0), not start over from an empty
-    registry, which would double the admitted concurrency during a Redis
-    outage.
-    """
-    _api_key = hash_token("sk-98765")
-    local_cache = DualCache()
-    fakes = FakeRateLimits()
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(local_cache),
-        rate_limit_store=fakes.store(),
-    )
-    user_api_key_dict = UserAPIKeyAuth(api_key=_api_key, max_parallel_requests=5)
-    counter_key = RateLimitScope("api_key", _api_key).gauge
-
-    async def failing_script(keys, args):
-        raise ConnectionError("redis unavailable")
-
-    fakes.parallel_acquire_script = failing_script
-    fakes.parallel_release_script = failing_script
-
-    handler.rate_limits.set_local(counter_key, 5, None)
-    with pytest.raises(HTTPException) as exc_info:
-        await handler.async_pre_call_hook(
-            user_api_key_dict=user_api_key_dict,
-            cache=local_cache,
-            data={"model": "gpt-3.5-turbo"},
-            call_type="",
-        )
-    assert exc_info.value.status_code == 429
-
-    handler.rate_limits.set_local(counter_key, 4, None)
-    admitted_data: dict[str, Any] = {"model": "gpt-3.5-turbo"}
-    await handler.async_pre_call_hook(
-        user_api_key_dict=user_api_key_dict,
-        cache=local_cache,
-        data=admitted_data,
-        call_type="",
-    )
-    assert _local(handler, counter_key) == 5
-
-    await handler.async_log_failure_event(
-        kwargs={
-            "standard_logging_object": {"metadata": {"user_api_key_hash": _api_key}},
-        },
-        response_obj=None,
-        start_time=None,
-        end_time=None,
-    )
-    assert _local(handler, counter_key) == 4
 
 
 def test_tpm_reservation_enabled_by_default(monkeypatch):
@@ -2013,14 +1391,10 @@ async def test_async_log_success_event_counts_passthrough_reported_tokens(monkey
     monkeypatch.setenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", "60")
 
     _api_key = hash_token("sk-passthrough")
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(DualCache()),
-        rate_limit_store=fakes.store(),
     )
     monkeypatch.setattr(parallel_request_handler, "get_rate_limit_type", lambda: "total")
-
-    captured_operations = _capture_token_increments(fakes)
 
     await parallel_request_handler.async_log_success_event(
         kwargs={
@@ -2033,6 +1407,7 @@ async def test_async_log_success_event_counts_passthrough_reported_tokens(monkey
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key), ("team", "team-fil"))
 
     token_operations = [op for op in captured_operations if op["key"].endswith(":tokens")]
     assert token_operations, "pass-through usage should charge the TPM counter"
@@ -2054,14 +1429,10 @@ async def test_aggregate_only_usage_charges_tpm_under_every_limit_type(monkeypat
     monkeypatch.setenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", "60")
 
     _api_key = hash_token("sk-aggregate-only")
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(DualCache()),
-        rate_limit_store=fakes.store(),
     )
     monkeypatch.setattr(parallel_request_handler, "get_rate_limit_type", lambda: rate_limit_type)
-
-    captured_operations = _capture_token_increments(fakes)
 
     await parallel_request_handler.async_log_success_event(
         kwargs={
@@ -2072,6 +1443,7 @@ async def test_aggregate_only_usage_charges_tpm_under_every_limit_type(monkeypat
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key))
 
     token_operations = [op for op in captured_operations if op["key"].endswith(":tokens")]
     assert token_operations, f"aggregate usage should charge TPM under {rate_limit_type}"
@@ -2084,14 +1456,10 @@ async def test_split_usage_still_respects_the_configured_limit_type(monkeypatch)
     monkeypatch.setenv("LITELLM_RATE_LIMIT_WINDOW_SIZE", "60")
 
     _api_key = hash_token("sk-split-usage")
-    fakes = FakeRateLimits()
     parallel_request_handler = _PROXY_MaxParallelRequestsHandler(
         internal_usage_cache=InternalUsageCache(DualCache()),
-        rate_limit_store=fakes.store(),
     )
     monkeypatch.setattr(parallel_request_handler, "get_rate_limit_type", lambda: "output")
-
-    captured_operations = _capture_token_increments(fakes)
 
     await parallel_request_handler.async_log_success_event(
         kwargs={"standard_logging_object": {"metadata": {"user_api_key_hash": _api_key}}},
@@ -2102,6 +1470,7 @@ async def test_split_usage_still_respects_the_configured_limit_type(monkeypatch)
         start_time=datetime.now(),
         end_time=datetime.now(),
     )
+    captured_operations = _token_counters(parallel_request_handler, ("api_key", _api_key))
 
     token_operations = [op for op in captured_operations if op["key"].endswith(":tokens")]
     assert token_operations
@@ -2231,391 +1600,11 @@ _SCRIPT_NAMES: Final = (
 _CONNECTION_REFUSED: Final = "Error 61 connecting to 127.0.0.1:6379. Connection refused."
 
 
-def _raising_redis(error: Exception) -> FakeRateLimits:
-    async def refused(keys: list[str], args: list[object]) -> object:
-        raise error
-
-    return FakeRateLimits(**{name: refused for name in _SCRIPT_NAMES})
-
-
-def _open_breaker_redis() -> FakeRateLimits:
-    from litellm.caching.redis_cache import RedisCircuitBreakerOpenError
-
-    return _raising_redis(RedisCircuitBreakerOpenError("Redis circuit breaker is open"))
-
-
-def _unreachable_redis() -> FakeRateLimits:
-    return _raising_redis(ConnectionError(_CONNECTION_REFUSED))
-
-
-@pytest.mark.asyncio
-async def test_an_open_circuit_breaker_falls_back_to_the_pipeline_without_a_warning(caplog):
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()), rate_limit_store=_open_breaker_redis().store()
-    )
-    counter: Final = _counter("quiet", "key")
-
-    with caplog.at_level(logging.DEBUG, logger="LiteLLM Proxy"):
-        await handler.async_increment_tokens_with_ttl_preservation(
-            pipeline_operations=[CounterIncrement(counter, 10.0, 60)]
-        )
-
-    assert _local(handler, counter) == 10.0
-    assert [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING] == []
-
-
-@pytest.mark.asyncio
-async def test_an_open_circuit_breaker_reads_the_sliding_window_locally_without_a_warning(caplog):
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()), rate_limit_store=_open_breaker_redis().store()
-    )
-    now: Final = int(time.time())
-
-    with caplog.at_level(logging.DEBUG, logger="LiteLLM Proxy"):
-        values = await handler._execute_redis_batch_rate_limiter_script(
-            [_counter("quiet", "window", "requests")], now_int=now
-        )
-
-    assert values == [(str(now), 1)]
-    assert [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING] == []
-    assert any("circuit breaker is open" in record.getMessage() for record in caplog.records)
-
-
-class _ScriptedRedis:
-    def __init__(
-        self,
-        failing_script: str | None = None,
-        failing_batch_call: int | None = None,
-        stored_counter_value: int = 0,
-    ):
-        self.failing_script = failing_script
-        self.failing_batch_call = failing_batch_call
-        self.stored_counter_value = stored_counter_value
-        self.released_slots: list[tuple[list[str], list[str]]] = []
-        self.batch_calls = 0
-        self.batch_call_keys: list[list[str]] = []
-        self.batch_call_args: list[list[object]] = []
-        self.guarded_increments: list[tuple[list[str], list[object]]] = []
-        self.fakes: Final = FakeRateLimits(**{name: self._script(name) for name in _SCRIPT_NAMES})
-
-    @property
-    def increments(self) -> list[tuple[str, float]]:
-        return [(key, amount) for key, amount, _ttl in self.fakes.redis_increments]
-
-    def store(self) -> RateLimitStore:
-        return self.fakes.store()
-
-    def _script(self, name: str):
-        async def run(keys: list[str], args: list[object]) -> object:
-            if name == self.failing_script:
-                raise ConnectionError(_CONNECTION_REFUSED)
-            if name == "window_guarded_token_increment_script":
-                self.guarded_increments.append((list(keys), list(args)))
-                return [1, 0] * (len(keys) // 2)
-            if name == "batch_rate_limiter_script":
-                self.batch_calls += 1
-                self.batch_call_keys.append(list(keys))
-                self.batch_call_args.append(list(args))
-                if self.batch_calls == self.failing_batch_call:
-                    raise ConnectionError(_CONNECTION_REFUSED)
-                return [args[0], self.batch_calls] * (len(keys) // 2)
-            if name == "batch_counter_read_script":
-                return [int(time.time()) if key.endswith(":window") else self.stored_counter_value for key in keys]
-            if name == "parallel_count_script":
-                return [0 for _ in keys]
-            if name == "parallel_acquire_script":
-                return [0, *[1 for _ in keys]]
-            if name == "parallel_release_script":
-                self.released_slots.append((list(keys), list(args)))
-                return [0 for _ in keys]
-            raise AssertionError(f"unexpected script: {name}")
-
-        return run
-
-
-def _handler_with_redis(
-    redis: _ScriptedRedis | FakeRateLimits,
-    fail_closed: bool | None = None,
-    force_hash_tag_grouping: bool | None = None,
-):
-    internal_usage_cache = InternalUsageCache(DualCache())
-    store: Final = redis.store()
-    if fail_closed is None and force_hash_tag_grouping is None:
-        return PROXY_MaxParallelRequestsHandler_v3(internal_usage_cache=internal_usage_cache, rate_limit_store=store)
-    if fail_closed is None:
-        return PROXY_MaxParallelRequestsHandler_v3(
-            internal_usage_cache=internal_usage_cache,
-            force_hash_tag_grouping_resolver=lambda: force_hash_tag_grouping,
-            rate_limit_store=store,
-        )
-    if force_hash_tag_grouping is None:
-        return PROXY_MaxParallelRequestsHandler_v3(
-            internal_usage_cache=internal_usage_cache,
-            fail_closed_resolver=lambda: fail_closed,
-            rate_limit_store=store,
-        )
-    return PROXY_MaxParallelRequestsHandler_v3(
-        internal_usage_cache=internal_usage_cache,
-        fail_closed_resolver=lambda: fail_closed,
-        force_hash_tag_grouping_resolver=lambda: force_hash_tag_grouping,
-        rate_limit_store=store,
-    )
-
-
 _GROUPING_COUNTERS: Final = (
     _counter("api_key", "sk-abc", "requests"),
     _counter("team", "t1", "requests"),
     _counter("end_user", "u28551", "requests"),
 )
-
-
-@pytest.mark.parametrize("force_hash_tag_grouping", [True, False], ids=["forced", "default"])
-@pytest.mark.asyncio
-async def test_redis_batch_rate_limiter_respects_hash_tag_grouping_opt_in(force_hash_tag_grouping: bool):
-    redis: Final = _ScriptedRedis()
-    handler: Final = _handler_with_redis(redis, force_hash_tag_grouping=force_hash_tag_grouping)
-    keys: Final = [
-        "{api_key:sk-abc}:window",
-        "{api_key:sk-abc}:requests",
-        "{team:t1}:window",
-        "{team:t1}:requests",
-        "{end_user:u28551}:window",
-        "{end_user:u28551}:requests",
-    ]
-
-    await handler._execute_redis_batch_rate_limiter_script(counters=_GROUPING_COUNTERS, now_int=1234)
-
-    expected_calls: Final = (
-        [
-            [
-                "{api_key:sk-abc}:window",
-                "{api_key:sk-abc}:requests",
-                "{end_user:u28551}:window",
-                "{end_user:u28551}:requests",
-            ],
-            ["{team:t1}:window", "{team:t1}:requests"],
-        ]
-        if force_hash_tag_grouping
-        else [keys]
-    )
-    assert redis.batch_call_keys == expected_calls
-
-
-@pytest.mark.asyncio
-async def test_redis_batch_rate_limiter_returns_values_in_caller_order():
-    redis: Final = _ScriptedRedis()
-    handler: Final = _handler_with_redis(redis, force_hash_tag_grouping=True)
-    now: Final = 1234
-
-    results: Final = await handler._execute_redis_batch_rate_limiter_script(counters=_GROUPING_COUNTERS, now_int=now)
-
-    assert results == [(str(now), 1), (str(now), 2), (str(now), 1)]
-
-
-async def _admit(handler, auth, data=None):
-    await handler.async_pre_call_hook(
-        user_api_key_dict=auth,
-        cache=handler.internal_usage_cache.dual_cache,
-        data=data if data is not None else {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
-        call_type="acompletion",
-    )
-
-
-def test_a_total_timeout_never_interrupts_a_token_reservation_so_the_failure_path_can_refund_it() -> None:
-    async def reserve_outlasting_the_budget(keys: list[str], args: list[object]) -> list[object]:
-        await asyncio.sleep(120)
-        return [0, *[value for index in range(0, len(args), 4) for value in (0, args[index + 1])]]
-
-    async def admit_under_a_total_timeout() -> tuple[bool, int]:
-        redis: Final = FakeRateLimits(check_and_increment_by_n_script=reserve_outlasting_the_budget)
-        handler: Final = _handler_with_redis(redis)
-        auth: Final = UserAPIKeyAuth(api_key=hash_token("sk-total-timeout-reservation"), tpm_limit=1000)
-        stash: Final = get_or_create_request_stash()
-        try:
-            async with total_deadline(60, from_body=True):
-                await _admit(handler, auth)
-                await asyncio.sleep(3600)
-        except TotalTimeoutExpired:
-            return True, stash.reserved_tokens
-        return False, stash.reserved_tokens
-
-    loop: Final = AutojumpClockLoop()
-    try:
-        expired, reserved = loop.run_until_complete(admit_under_a_total_timeout())
-    finally:
-        loop.close()
-
-    assert expired
-    assert reserved > 0
-
-
-async def _read_only_check(handler, auth):
-    descriptors = handler.create_rate_limit_descriptors(
-        user_api_key_dict=auth,
-        data={"model": "test-model"},
-        rpm_limit_type=None,
-        tpm_limit_type=None,
-        model_has_failures=False,
-    )
-    return await handler.should_rate_limit(descriptors=descriptors, read_only=True)
-
-
-@pytest.mark.asyncio
-async def test_fail_closed_is_a_no_op_while_redis_answers():
-    handler = _handler_with_redis(_ScriptedRedis(), fail_closed=True)
-    auth = UserAPIKeyAuth(api_key=hash_token("sk-fail-closed-healthy"), rpm_limit=2)
-
-    await _admit(handler, auth)
-    await _admit(handler, auth)
-    with pytest.raises(ProxyRateLimitError) as exc:
-        await _admit(handler, auth)
-
-    assert exc.value.status_code == 429
-
-
-@pytest.mark.asyncio
-async def test_fail_closed_tpm_rejection_releases_the_parallel_slot_it_acquired():
-    redis = _ScriptedRedis(failing_script="check_and_increment_by_n_script")
-    handler = _handler_with_redis(redis, fail_closed=True)
-    auth = UserAPIKeyAuth(api_key=hash_token("sk-fail-closed-slot"), max_parallel_requests=1, tpm_limit=1000)
-    data = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
-
-    with pytest.raises(HTTPException) as exc:
-        await _admit(handler, auth, data)
-    assert exc.value.status_code == 503
-    acquired = get_or_create_request_stash().parallel_slot
-    assert acquired is not None
-
-    await handler.async_post_call_failure_hook(request_data=data, original_exception=exc.value, user_api_key_dict=auth)
-
-    assert redis.released_slots == [
-        (
-            [scope_key(gauge, "max_parallel_requests") for gauge in acquired["gauges"]],
-            [acquired["slot_id"]],
-        )
-    ]
-    assert get_or_create_request_stash().parallel_slot is None
-
-
-@pytest.mark.parametrize("stored_counter_value, expected_code", [(1, "OK"), (2, "OVER_LIMIT"), (3, "OVER_LIMIT")])
-@pytest.mark.asyncio
-async def test_read_only_check_reports_the_redis_counters_without_incrementing_them(
-    stored_counter_value, expected_code
-):
-    redis = _ScriptedRedis(stored_counter_value=stored_counter_value)
-    auth = UserAPIKeyAuth(api_key=hash_token("sk-read-only-counters"), rpm_limit=2)
-
-    response = await _read_only_check(_handler_with_redis(redis, fail_closed=True), auth)
-
-    assert response["overall_code"] == expected_code
-    assert redis.batch_calls == 0
-    assert redis.increments == []
-
-
-@pytest.mark.parametrize("fail_closed", [True, False], ids=["fail_closed", "fail_open"])
-@pytest.mark.asyncio
-async def test_batch_increment_refunds_counters_already_applied_when_a_later_cluster_slot_fails(fail_closed):
-    redis = _ScriptedRedis(failing_batch_call=2)
-    handler = _handler_with_redis(redis, fail_closed=fail_closed, force_hash_tag_grouping=True)
-    auth = UserAPIKeyAuth(
-        api_key=hash_token("sk-cluster-partial"), rpm_limit=5, user_id="cluster-user", user_rpm_limit=5
-    )
-
-    if fail_closed:
-        with pytest.raises(HTTPException) as exc:
-            await _admit(handler, auth)
-        assert exc.value.status_code == 503
-    else:
-        await _admit(handler, auth)
-
-    assert len(redis.batch_call_keys) == 2
-    applied_keys = redis.batch_call_keys[0]
-    assert applied_keys
-    window_start_at_increment = str(redis.batch_call_args[0][0])
-    expected_refunds = [
-        ([applied_keys[offset], applied_keys[offset + 1]], [window_start_at_increment, -1, 0])
-        for offset in range(0, len(applied_keys), 2)
-    ]
-    assert redis.guarded_increments == (expected_refunds if fail_closed else [])
-    assert redis.increments == []
-
-
-@pytest.mark.parametrize("fail_closed", [True, False], ids=["fail_closed", "fail_open"])
-@pytest.mark.asyncio
-async def test_batch_increment_refunds_pipelined_groups_declared_after_the_one_that_failed(fail_closed):
-    from litellm.caching.redis_batch import request_redis_batch_scope
-
-    redis = _ScriptedRedis()
-    handler = _handler_with_redis(redis, fail_closed=fail_closed, force_hash_tag_grouping=True)
-    now = int(time.time())
-    counters = (_counter("a", "1", "requests"), _counter("b", "1", "requests"))
-    groups = {"a": ["{a:1}:window", "{a:1}:requests"], "b": ["{b:1}:window", "{b:1}:requests"]}
-
-    async def batch(keys: list[str], args: list[object]) -> list[object]:
-        if keys == groups["a"]:
-            raise ConnectionError(_CONNECTION_REFUSED)
-        return [now, 1]
-
-    redis.fakes.batch_rate_limiter_script = batch
-
-    with request_redis_batch_scope():
-        if fail_closed:
-            with pytest.raises(HTTPException) as exc:
-                await handler._execute_redis_batch_rate_limiter_script(counters=counters, now_int=now)
-            assert exc.value.status_code == 503
-        else:
-            await handler._execute_redis_batch_rate_limiter_script(counters=counters, now_int=now)
-
-    assert redis.guarded_increments == ([(groups["b"], [str(now), -1, 0])] if fail_closed else [])
-
-
-class _DelayedCapacityRedis:
-    def __init__(self):
-        self.acquired = asyncio.Event()
-        self.finish_admission = asyncio.Event()
-        self.releasing = asyncio.Event()
-        self.finish_release = asyncio.Event()
-        self.fakes: Final = FakeRateLimits(parallel_acquire_script=self._acquire, parallel_release_script=self._release)
-
-    async def _acquire(self, keys: list[str], args: list[object]) -> list[int]:
-        self.acquired.set()
-        await self.finish_admission.wait()
-        return [0, *[1 for _ in keys]]
-
-    async def _release(self, keys: list[str], args: list[object]) -> list[int]:
-        self.releasing.set()
-        await self.finish_release.wait()
-        return [0 for _ in keys]
-
-
-@pytest.mark.asyncio
-async def test_request_capacity_finishes_admission_and_release_despite_repeated_cancel():
-    cache = _DelayedCapacityRedis()
-    handler = _PROXY_MaxParallelRequestsHandler(
-        internal_usage_cache=InternalUsageCache(DualCache()), rate_limit_store=cache.fakes.store()
-    )
-    auth = UserAPIKeyAuth(api_key=hash_token("sk-count-cancel-admission"), max_parallel_requests=1)
-
-    async def provider():
-        async with handler.request_capacity(auth, "test-model"):
-            pytest.fail("cancelled admission entered provider body")
-
-    task = asyncio.create_task(provider())
-    await asyncio.wait_for(cache.acquired.wait(), timeout=2)
-    task.cancel()
-    await asyncio.sleep(0)
-    cache.finish_admission.set()
-    await asyncio.wait_for(cache.releasing.wait(), timeout=2)
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    cache.finish_release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=2)
-    async with handler.request_capacity(auth, "test-model"):
-        pass
 
 
 @pytest.mark.parametrize(

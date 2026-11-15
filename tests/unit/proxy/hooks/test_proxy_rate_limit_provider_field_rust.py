@@ -9,11 +9,6 @@ from litellm.proxy.utils import InternalUsageCache, hash_token
 from tests._support.rust_parallel_request_limiter import PROXY_MaxParallelRequestsHandler_v3
 
 
-@pytest.fixture(autouse=True)
-def _native_parallel_request_limiter(monkeypatch):
-    monkeypatch.setenv("LITELLM_NATIVE_PARALLEL_REQUEST_LIMITER", "true")
-
-
 async def _over_limit(handler: PROXY_MaxParallelRequestsHandler_v3, model: str | None) -> None:
     auth = UserAPIKeyAuth(api_key=hash_token("sk-provider-field"), rpm_limit=1)
     body = {} if model is None else {"model": model}

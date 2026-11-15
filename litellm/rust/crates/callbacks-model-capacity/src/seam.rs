@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use litellm_callbacks_parallel_request_limiter::Ctx;
+use litellm_redis_store::RequestRedis;
 
 use crate::{
     error::{CapacityError, Raised},
@@ -42,7 +43,11 @@ pub trait V3Limiter: Send + Sync {
         skip_parallel_check: bool,
         ctx: Ctx<'a>,
     ) -> SeamFuture<'a, LimiterResponse>;
-    fn apply<'a>(&'a self, operations: &'a [ReservationOp]) -> SeamFuture<'a, ()>;
+    fn apply<'a>(
+        &'a self,
+        operations: &'a [ReservationOp],
+        redis: Option<&'a RequestRedis>,
+    ) -> SeamFuture<'a, ()>;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -71,22 +76,76 @@ pub struct ShareGauge {
     pub borrowed_tokens: i64,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fact<T> {
+    Ok(T),
+    Raised(Raised),
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Facts {
+    #[serde(default)]
+    pub settings: Option<Fact<Settings>>,
+    #[serde(default)]
+    pub group: Option<Fact<Option<GroupInfo>>>,
+    #[serde(default)]
+    pub borrowing: Option<Fact<Option<BorrowingLimits>>>,
+    #[serde(default)]
+    pub call_type: Option<Fact<Option<String>>>,
+}
+
+fn known<T: Clone>(fact: Option<&Fact<T>>, method: &'static str) -> Result<T, CapacityError> {
+    match fact {
+        Some(Fact::Ok(value)) => Ok(value.clone()),
+        Some(Fact::Raised(raised)) => Err(CapacityError::Raised(raised.clone())),
+        None => Err(CapacityError::Shape {
+            method,
+            detail: "the host passed no such fact".into(),
+        }),
+    }
+}
+
+impl Facts {
+    pub fn settings(&self) -> Result<Settings, CapacityError> {
+        known(self.settings.as_ref(), "settings")
+    }
+
+    pub fn group(&self) -> Result<Option<GroupInfo>, CapacityError> {
+        known(self.group.as_ref(), "group")
+    }
+
+    pub fn borrowing(&self) -> Result<Option<BorrowingLimits>, CapacityError> {
+        known(self.borrowing.as_ref(), "borrowing_limits")
+    }
+
+    pub fn call_type(&self) -> Result<Option<String>, CapacityError> {
+        known(self.call_type.as_ref(), "stash_call_type")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Touched {
+    Members(Vec<(String, Value)>),
+    Pending(u64),
+}
+
 pub trait CapacityHost: Send + Sync {
-    fn settings(&self) -> SeamFuture<'_, Settings>;
-    fn group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<GroupInfo>>;
-    fn touch<'a>(
-        &'a self,
-        model: &'a str,
-        member: &'a str,
-        priority_class: &'a Value,
+    fn touch(
+        &self,
+        model: &str,
+        member: &str,
+        priority_class: &Value,
         window: i64,
-    ) -> SeamFuture<'a, Vec<(String, Value)>>;
+    ) -> Result<Touched, CapacityError>;
+    fn touched(&self, pending: u64) -> SeamFuture<'_, Vec<(String, Value)>>;
     fn metrics_enabled(&self) -> SeamFuture<'_, bool>;
     fn throttled<'a>(&'a self, event: &'a Throttle) -> SeamFuture<'a, ()>;
     fn set_share<'a>(&'a self, gauge: &'a ShareGauge) -> SeamFuture<'a, ()>;
-    fn unlicensed_priority(&self) -> SeamFuture<'_, ()>;
-    fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()>;
-    fn borrowing_limits<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<BorrowingLimits>>;
+    fn unlicensed_priority(&self) -> Result<(), CapacityError>;
+    fn log(&self, level: &'static str, message: &str) -> Result<(), CapacityError>;
     fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String>;
     fn estimate_tokens<'a>(
         &'a self,
@@ -94,8 +153,6 @@ pub trait CapacityHost: Send + Sync {
         model: &'a str,
         call_type: Option<&'a str>,
     ) -> SeamFuture<'a, Estimate>;
-    fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()>;
-    fn stash_call_type(&self) -> SeamFuture<'_, Option<String>>;
     fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()>;
 }
 
@@ -108,6 +165,21 @@ enum Reply {
 
 pub trait Delegate: Send + Sync + 'static {
     fn call(&self, method: &'static str, args: Value) -> BoxFuture<'static, Result<Value, String>>;
+    fn call_now(&self, method: &'static str, args: Value) -> Result<Value, String>;
+}
+
+fn answered<T: DeserializeOwned>(method: &'static str, raw: Value) -> Result<T, CapacityError> {
+    let reply: Reply = serde_json::from_value(raw).map_err(|error| CapacityError::Shape {
+        method,
+        detail: error.to_string(),
+    })?;
+    match reply {
+        Reply::Ok(value) => serde_json::from_value(value).map_err(|error| CapacityError::Shape {
+            method,
+            detail: error.to_string(),
+        }),
+        Reply::Raised(raised) => Err(CapacityError::Raised(raised)),
+    }
 }
 
 pub struct Delegated<D>(pub D);
@@ -123,44 +195,39 @@ impl<D: Delegate> Delegated<D> {
             let raw = pending
                 .await
                 .map_err(|detail| CapacityError::Shape { method, detail })?;
-            let reply: Reply =
-                serde_json::from_value(raw).map_err(|error| CapacityError::Shape {
-                    method,
-                    detail: error.to_string(),
-                })?;
-            match reply {
-                Reply::Ok(value) => {
-                    serde_json::from_value(value).map_err(|error| CapacityError::Shape {
-                        method,
-                        detail: error.to_string(),
-                    })
-                }
-                Reply::Raised(raised) => Err(CapacityError::Raised(raised)),
-            }
+            answered(method, raw)
         })
+    }
+
+    fn invoke_now<T: DeserializeOwned>(
+        &self,
+        method: &'static str,
+        args: Value,
+    ) -> Result<T, CapacityError> {
+        let raw = self
+            .0
+            .call_now(method, args)
+            .map_err(|detail| CapacityError::Shape { method, detail })?;
+        answered(method, raw)
     }
 }
 
 impl<D: Delegate> CapacityHost for Delegated<D> {
-    fn settings(&self) -> SeamFuture<'_, Settings> {
-        self.invoke("settings", json!({}))
-    }
-
-    fn group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<GroupInfo>> {
-        self.invoke("group", json!({"model": model}))
-    }
-
-    fn touch<'a>(
-        &'a self,
-        model: &'a str,
-        member: &'a str,
-        priority_class: &'a Value,
+    fn touch(
+        &self,
+        model: &str,
+        member: &str,
+        priority_class: &Value,
         window: i64,
-    ) -> SeamFuture<'a, Vec<(String, Value)>> {
-        self.invoke(
+    ) -> Result<Touched, CapacityError> {
+        self.invoke_now(
             "touch",
             json!({"model": model, "member": member, "priority_class": priority_class, "window": window}),
         )
+    }
+
+    fn touched(&self, pending: u64) -> SeamFuture<'_, Vec<(String, Value)>> {
+        self.invoke("touched", json!({"pending": pending}))
     }
 
     fn metrics_enabled(&self) -> SeamFuture<'_, bool> {
@@ -175,16 +242,12 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
         self.invoke("set_share", json!(gauge))
     }
 
-    fn unlicensed_priority(&self) -> SeamFuture<'_, ()> {
-        self.invoke("unlicensed_priority", json!({}))
+    fn unlicensed_priority(&self) -> Result<(), CapacityError> {
+        self.invoke_now("unlicensed_priority", json!({}))
     }
 
-    fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()> {
-        self.invoke("log", json!({"level": level, "message": message}))
-    }
-
-    fn borrowing_limits<'a>(&'a self, model: &'a str) -> SeamFuture<'a, Option<BorrowingLimits>> {
-        self.invoke("borrowing_limits", json!({"model": model}))
+    fn log(&self, level: &'static str, message: &str) -> Result<(), CapacityError> {
+        self.invoke_now("log", json!({"level": level, "message": message}))
     }
 
     fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String> {
@@ -201,17 +264,6 @@ impl<D: Delegate> CapacityHost for Delegated<D> {
             "estimate_tokens",
             json!({"tpm_share": tpm_share, "model": model, "call_type": call_type}),
         )
-    }
-
-    fn cap_output<'a>(&'a self, tpm_share: i64, call_type: Option<&'a str>) -> SeamFuture<'a, ()> {
-        self.invoke(
-            "cap_output",
-            json!({"tpm_share": tpm_share, "call_type": call_type}),
-        )
-    }
-
-    fn stash_call_type(&self) -> SeamFuture<'_, Option<String>> {
-        self.invoke("stash_call_type", json!({}))
     }
 
     fn post_call_success<'a>(&'a self, headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {

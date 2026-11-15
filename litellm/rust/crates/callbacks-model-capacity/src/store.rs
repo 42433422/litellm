@@ -6,9 +6,10 @@ use litellm_callbacks_parallel_request_limiter::{
 };
 use litellm_redis_client::{CallTag, current_tag, tagged};
 use litellm_redis_store::{
-    Error as StoreError, Number as StoreNumber, Send as RedisSend,
+    Error as StoreError, Number as StoreNumber, RequestRedis, Send as RedisSend,
     rate_limits::{
-        Counter as StoreCounter, Entry, Increment as StoreIncrement, Kind, Local, Scope,
+        Counter as StoreCounter, Entry, GuardedIncrement, Increment as StoreIncrement, Kind, Local,
+        Scope,
     },
 };
 use serde_json::{Number, Value};
@@ -184,9 +185,57 @@ fn operation(operation: &ReservationOp) -> Op {
     }
 }
 
+fn guarded_failure(counter: &StoreCounter) -> String {
+    let kind: &'static str = counter.kind.into();
+    format!(
+        "Window-guarded token adjustment failed for RateLimitCounter(scope=RateLimitScope(descriptor_key={}, descriptor_value={}), kind={})",
+        pyfmt::str_repr(&counter.scope.descriptor),
+        pyfmt::str_repr(&counter.scope.value),
+        pyfmt::str_repr(kind)
+    )
+}
+
 impl StoreLimiter {
     pub fn new(engine: Engine, relabel: Option<Relabel>) -> Self {
         Self { engine, relabel }
+    }
+
+    async fn batched(&self, operations: &[Op], request: &RequestRedis) {
+        let store = self.engine.store();
+        let plain: Vec<StoreIncrement> = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Op::Plain(increment) => Some(increment.clone()),
+                Op::Guarded(_) => None,
+            })
+            .collect();
+        if !plain.is_empty() {
+            store.increment_many_post_call(request, &plain);
+        }
+        let mut local = Vec::new();
+        for operation in operations {
+            let Op::Guarded(guarded) = operation else {
+                continue;
+            };
+            if guarded.backend == Backend::Local {
+                local.push(operation.clone());
+                continue;
+            }
+            let increment = &guarded.increment;
+            store.guarded_increment_post_call(
+                request,
+                GuardedIncrement {
+                    counter: increment.counter.clone(),
+                    expected_window_start: guarded.expected_window_start.clone(),
+                    amount: increment.amount,
+                    ttl: increment.ttl,
+                },
+                guarded_failure(&increment.counter),
+            );
+        }
+        if !local.is_empty() {
+            self.engine.reservation_aware(&local).await;
+        }
     }
 
     async fn labelled<F: Future>(&self, call_type: &'static str, operation: F) -> F::Output {
@@ -289,10 +338,17 @@ impl V3Limiter for StoreLimiter {
         })
     }
 
-    fn apply<'a>(&'a self, operations: &'a [ReservationOp]) -> SeamFuture<'a, ()> {
+    fn apply<'a>(
+        &'a self,
+        operations: &'a [ReservationOp],
+        redis: Option<&'a RequestRedis>,
+    ) -> SeamFuture<'a, ()> {
         Box::pin(async move {
             let operations: Vec<Op> = operations.iter().map(operation).collect();
-            self.engine.reservation_aware(&operations).await;
+            match redis.filter(|_| self.engine.has_redis()) {
+                Some(request) => self.batched(&operations, request).await,
+                None => self.engine.reservation_aware(&operations).await,
+            }
             Ok(())
         })
     }

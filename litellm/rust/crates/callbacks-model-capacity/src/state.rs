@@ -28,6 +28,7 @@ pub struct Stash {
     pub cap_reserved_tokens: i64,
     pub cap_reserved_window: Option<Window>,
     pub fallback_holds: Vec<(String, Arc<Hold>)>,
+    pub output_cap: Option<(i64, Option<String>)>,
 }
 
 impl Stash {

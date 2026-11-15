@@ -1,15 +1,14 @@
 import asyncio
 import logging
 import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, nullcontext
-from contextvars import ContextVar
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from contextlib import nullcontext
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import count
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
-from weakref import WeakKeyDictionary
+from typing import TYPE_CHECKING, Final, cast
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -56,7 +55,7 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     request_stash_for_callback,
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3_native import policy as limiter_policy
-from litellm.proxy.hooks.parallel_request_limiter_v3_native import pre_call_request
+from litellm.proxy.hooks.parallel_request_limiter_v3_native import post_call_request, pre_call_request
 from litellm.proxy.hooks.priority_class_share import ActiveTeamRegistry
 from litellm.proxy.hooks.rate_limiter_utils import resolve_llm_provider_for_rate_limit
 from litellm.proxy.request_auth_context import REQUEST_AUTH
@@ -68,7 +67,7 @@ from litellm.types.utils import PriorityReservationSettings
 
 if TYPE_CHECKING:
     from litellm.integrations.prometheus import PrometheusLogger
-    from litellm.rust_bridge._native import NativeModelCapacity, NativeModelCapacityState
+    from litellm.rust_bridge._native import NativeModelCapacity, NativeModelCapacityState, NativeRequestRedis
 
 UNLICENSED_PRIORITY_MESSAGE: Final = (
     "PREMIUM FEATURE: Reserving tpm/rpm by priority is a premium feature. Please add a 'LITELLM_LICENSE' to your "
@@ -81,6 +80,7 @@ RERAISE_KIND: Final = "model_capacity_reraise"
 _TOKENS: Final = count(1)
 _LOG_LEVELS: Final = MappingProxyType({"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO})
 _TARGETED_HOOKS: Final = frozenset({Hook.pre_call, Hook.post_call_success, Hook.post_call_failure})
+_SETTLING_HOOKS: Final = frozenset({Hook.post_call_failure.value, Hook.attempt_ended.value})
 
 
 @dataclass(slots=True)
@@ -92,24 +92,52 @@ class LiveRequest:
     kwargs: Mapping[str, object] | None = None
     state: "NativeModelCapacityState | None" = None
     raised: dict[int, BaseException] = field(default_factory=dict)  # mutable-ok: exceptions the seam re-raises
+    suspended: dict[int, "_Suspended"] = field(default_factory=dict)  # mutable-ok: host calls Rust resumes
 
 
 _LIVE: Final[ContextVar[LiveRequest | None]] = ContextVar("native_model_capacity_live", default=None)
 
 
-_ADMISSIONS: Final[WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]] = WeakKeyDictionary()
+@dataclass(frozen=True, slots=True)
+class _Suspended:
+    coroutine: Coroutine[object, object, object]
+    yielded: object
+    context: Context
 
 
-def _admission(limiter: PROXY_MaxParallelRequestsHandler_v3) -> AbstractAsyncContextManager[object]:
-    if limiter.rate_limits.has_redis:
-        return nullcontext()
-    loop: Final = asyncio.get_running_loop()
-    lock: Final = _ADMISSIONS.get(loop)
-    if lock is not None:
-        return lock
-    created: Final = asyncio.Lock()
-    _ADMISSIONS[loop] = created
-    return created
+def _step(
+    coroutine: Coroutine[object, object, object], context: Context, value: object, error: BaseException | None
+) -> tuple[bool, object]:
+    try:
+        yielded: Final = context.run(coroutine.send, value) if error is None else context.run(coroutine.throw, error)
+    except StopIteration as stop:
+        finished: object = stop.value  # pyright: ignore[reportAny]  # the value the host coroutine returned
+        return True, finished
+    return False, yielded
+
+
+async def _finish(suspended: _Suspended) -> object:
+    out: object = suspended.yielded
+    while True:
+        value: object = None
+        error: BaseException | None = None
+        try:
+            if isinstance(out, asyncio.Future):
+                value = await cast("asyncio.Future[object]", out)
+            else:
+                await asyncio.sleep(0)
+        except BaseException as caught:  # noqa: BLE001  # the suspended call sees what its await raised, as under a task
+            error = caught
+        finished, out = _step(suspended.coroutine, suspended.context, value, error)
+        if finished:
+            return out
+
+
+def _members(members: object) -> list[list[object]]:
+    found: Final = as_str_mapping(members)
+    if found is None:
+        raise TypeError(f"the active team registry answered {type(members).__name__}")
+    return [[member, priority_class] for member, priority_class in found.items()]
 
 
 def _live() -> LiveRequest:
@@ -256,6 +284,18 @@ def _seam(
     return call
 
 
+def _seam_now(
+    method: Callable[["CapacityDelegate", Mapping[str, object]], object],
+) -> Callable[["CapacityDelegate", object], Mapping[str, object]]:
+    def call(self: "CapacityDelegate", args: object) -> Mapping[str, object]:
+        try:
+            return {"ok": method(self, _ARGS.validate_python(args))}
+        except Exception as error:  # noqa: BLE001  # Rust decides which errors fail open and which re-raise
+            return _raised(error)
+
+    return call
+
+
 class CapacityDelegate:
     def __init__(
         self,
@@ -277,8 +317,17 @@ class CapacityDelegate:
             raise ValueError("the request carries no key auth")
         return auth
 
-    @_seam
-    async def settings(self, _args: Mapping[str, object]) -> object:
+    def facts(self, model: str | None, *, call_type: bool = False) -> Mapping[str, object]:
+        found: Final[dict[str, object]] = {"settings": self.settings({})}  # mutable-ok: built once per call
+        if model is not None:
+            found["group"] = self.group({"model": model})
+            found["borrowing"] = self.borrowing_limits({"model": model})
+        if call_type:
+            found["call_type"] = self.stash_call_type({})
+        return found
+
+    @_seam_now
+    def settings(self, _args: Mapping[str, object]) -> object:
         settings: Final = litellm.priority_reservation_settings or PriorityReservationSettings()
         reservation: Final = litellm.priority_reservation
         return {
@@ -295,8 +344,8 @@ class CapacityDelegate:
             "policy": limiter_policy(self.v3_limiter),
         }
 
-    @_seam
-    async def group(self, args: Mapping[str, object]) -> object:
+    @_seam_now
+    def group(self, args: Mapping[str, object]) -> object:
         group: Final = self._router().registry().group(str(args["model"]))
         if group is None:
             return None
@@ -307,8 +356,8 @@ class CapacityDelegate:
             "output_cost_per_token": group.output_cost_per_token,
         }
 
-    @_seam
-    async def borrowing_limits(self, args: Mapping[str, object]) -> object:
+    @_seam_now
+    def borrowing_limits(self, args: Mapping[str, object]) -> object:
         model: Final = str(args["model"])
         rate_limited: Final = self.v3_limiter.rate_limited_model(model) or RateLimitedModel(
             requested=model, group=model
@@ -358,15 +407,11 @@ class CapacityDelegate:
             return {"kind": "failed"}
         return {"kind": "tokens", "tokens": estimate}
 
-    @_seam
-    async def cap_output(self, args: Mapping[str, object]) -> object:
-        data: Final = _live().data
-        call_type: Final = args["call_type"] if isinstance(args["call_type"], str) else None
-        self.v3_limiter.bound_output_for_limit(data, int(str(args["tpm_share"])), call_type)
-        return None
+    def cap_output(self, data: object, tpm_share: int, call_type: str | None) -> None:
+        self.v3_limiter.bound_output_for_limit(data, tpm_share, call_type)
 
-    @_seam
-    async def stash_call_type(self, _args: Mapping[str, object]) -> object:
+    @_seam_now
+    def stash_call_type(self, _args: Mapping[str, object]) -> object:
         return get_or_create_request_stash().call_type
 
     @_seam
@@ -384,15 +429,25 @@ class CapacityDelegate:
             additional_headers[name] = value  # pyright: ignore[reportArgumentType]  # the priority value as the handler set it
         return None
 
-    @_seam
-    async def touch(self, args: Mapping[str, object]) -> object:
-        members: Final = await self.active_teams.touch(
+    @_seam_now
+    def touch(self, args: Mapping[str, object]) -> object:
+        context: Final = copy_context()
+        coroutine: Final = self.active_teams.touch(
             str(args["model"]),
             str(args["member"]),
             args["priority_class"],  # pyright: ignore[reportArgumentType]  # the class as the handler passes it, a reserved priority of any type
             int(str(args["window"])),
         )
-        return [[member, priority_class] for member, priority_class in members.items()]
+        finished, out = _step(coroutine, context, None, None)
+        if finished:
+            return {"members": _members(out)}
+        token: Final = next(_TOKENS)
+        _live().suspended[token] = _Suspended(coroutine, out, context)
+        return {"pending": token}
+
+    @_seam
+    async def touched(self, args: Mapping[str, object]) -> object:
+        return _members(await _finish(_live().suspended.pop(int(str(args["pending"])))))
 
     @_seam
     async def metrics_enabled(self, _args: Mapping[str, object]) -> object:
@@ -416,15 +471,15 @@ class CapacityDelegate:
                 verbose_proxy_logger.warning("Dynamic rate limiter throttle metric failed: %s", metrics_error)
         return None
 
-    @_seam
-    async def log(self, args: Mapping[str, object]) -> object:
+    @_seam_now
+    def log(self, args: Mapping[str, object]) -> object:
         from litellm._logging import verbose_proxy_logger
 
         verbose_proxy_logger.log(_LOG_LEVELS[str(args["level"])], str(args["message"]))
         return None
 
-    @_seam
-    async def unlicensed_priority(self, _args: Mapping[str, object]) -> object:
+    @_seam_now
+    def unlicensed_priority(self, _args: Mapping[str, object]) -> object:
         from litellm._logging import verbose_proxy_logger
 
         verbose_proxy_logger.error(UNLICENSED_PRIORITY_MESSAGE)
@@ -512,6 +567,8 @@ def _native_answer(answer: Mapping[str, object], live: LiveRequest) -> Mapping[s
 class _StashedNative:
     capacity: "NativeModelCapacity"
     callback: RustHandle
+    delegate: CapacityDelegate
+    rate_limits: RateLimitStore
 
     def manifest(self) -> str:
         return self.callback.manifest()
@@ -523,8 +580,23 @@ class _StashedNative:
         self, hook: str, fields: Mapping[str, object], call: Mapping[str, object] | None, _state: object, /
     ) -> Awaitable[object]:
         live: Final = _LIVE.get()
-        request: Final = pre_call_request() if hook == Hook.pre_call.value else None
-        return self.capacity.handle(hook, fields, call, None if live is None else live.state, request=request)
+        pre_call: Final = hook == Hook.pre_call.value
+        model: Final = fields.get(Field.model.value) if pre_call else None
+        return self.capacity.handle(
+            hook,
+            fields,
+            call,
+            None if live is None else live.state,
+            self.delegate.facts(model if isinstance(model, str) else None),
+            request=self._request(hook),
+        )
+
+    def _request(self, hook: str) -> "NativeRequestRedis | None":
+        if hook == Hook.pre_call.value:
+            return pre_call_request()
+        if hook in _SETTLING_HOOKS and self.rate_limits.has_redis:
+            return post_call_request()
+        return None
 
 
 def _request_stash(hook: Hook, data: Mapping[str, object] | None) -> RequestRateLimiterStash | None:
@@ -581,7 +653,7 @@ class NativeDynamicRateLimiter(RustLogger):
             v3_limiter.tpm_reservation_enabled,
             None if time_provider is None else (lambda: time_provider().timestamp()),
         )
-        native: Final = _StashedNative(capacity, capacity.callback())
+        native: Final = _StashedNative(capacity, capacity.callback(), delegate, store)
         manifest: Final = WireManifest.model_validate_json(native.manifest())
         logger: Final = object.__new__(type(manifest.selection.name, (cls,), _namespace(native, manifest)))
         RustLogger.__init__(logger, native, PROJECTIONS)
@@ -649,10 +721,24 @@ class NativeDynamicRateLimiter(RustLogger):
                     return None
                 if hook is not Hook.pre_call:
                     return await super().run_rust(hook, reads, view, ctx)
-                async with _admission(self.v3_limiter):
-                    return await super().run_rust(hook, reads, view, ctx)
+                return self._capped(await super().run_rust(hook, reads, view, ctx), live)
         finally:
             _LIVE.reset(token)
+
+    def _capped(self, verdict: Patch | Abort | None, live: LiveRequest) -> Patch | Abort | None:
+        cap: Final = None if live.state is None else live.state.take_output_cap()
+        if cap is None:
+            return verdict
+        try:
+            self.delegate.cap_output(live.data, *cap)
+        except HTTPException:
+            raise
+        except Exception as error:  # noqa: BLE001  # Python allows the request when capping its output fails
+            from litellm._logging import verbose_proxy_logger
+
+            verbose_proxy_logger.error("Error in dynamic rate limiter: %s, allowing request", error)
+            return None
+        return verdict
 
     async def async_post_call_failure_hook(
         self,
@@ -678,10 +764,14 @@ class NativeDynamicRateLimiter(RustLogger):
         live: Final = LiveRequest(data={**request_data, "model": model}, auth=user_api_key_dict, state=state)
         token: Final = _LIVE.set(live)
         try:
-            async with _admission(self.v3_limiter):
-                answer: Final = await self.capacity.fallback_target_allowed(
-                    state, key_inputs(user_api_key_dict), model, commit, request=pre_call_request()
-                )
+            answer: Final = await self.capacity.fallback_target_allowed(
+                state,
+                key_inputs(user_api_key_dict),
+                model,
+                commit,
+                self.delegate.facts(model, call_type=True),
+                request=pre_call_request(),
+            )
         finally:
             _LIVE.reset(token)
         return _native_answer(answer, live).get("allowed") is True
@@ -695,10 +785,13 @@ class NativeDynamicRateLimiter(RustLogger):
         live: Final = LiveRequest(auth=user_api_key_dict, state=state)
         token: Final = _LIVE.set(live)
         try:
-            async with _admission(self.v3_limiter):
-                answer: Final = await self.capacity.enforce_frame(
-                    state, key_inputs(user_api_key_dict), requested_model, request=pre_call_request()
-                )
+            answer: Final = await self.capacity.enforce_frame(
+                state,
+                key_inputs(user_api_key_dict),
+                requested_model,
+                self.delegate.facts(requested_model),
+                request=pre_call_request(),
+            )
         finally:
             _LIVE.reset(token)
         if answer.get("unverifiable") is True:

@@ -16,6 +16,7 @@ import litellm
 from litellm import DualCache, Router
 from litellm._internal_context import current_service_target
 from litellm._logging import verbose_proxy_logger
+from litellm.caching.redis_batch import flush_post_call_redis_batches, request_redis_batch_scope
 from litellm.caching.redis_cache import RedisCache
 from litellm.constants import RESPONSES_WEBSOCKET_CALL_ID_METADATA_KEY
 from litellm.integrations.custom_logger import CustomLogger
@@ -2318,3 +2319,40 @@ async def test_saturation_is_read_from_redis_on_every_check_like_main(  # test-q
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _recorded_scenario(monkeypatch, "test_saturation_is_read_from_redis_on_every_check_like_main")
+
+
+async def test_a_settlement_rides_the_requests_post_call_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LITELLM_LICENSE", "test-license-key")
+    monkeypatch.setattr(litellm, "priority_reservation", {"interactive": 0.6, "batch": 0.4})
+    monkeypatch.setattr(
+        litellm,
+        "priority_reservation_settings",
+        PriorityReservationSettings(
+            saturation_threshold=0.0, team_model_limit_borrows_idle_capacity_from_other_teams=True
+        ),
+    )
+    router: Final = _router(("batched", 1000, 100))
+    auth: Final = UserAPIKeyAuth(
+        api_key="sk-batched", team_id="team-a", team_metadata={"model_tpm_limit": {"batched": 100}}
+    )
+    with fake_redis(emulate=True) as redis:
+        handler: Final = _native_handler(DualCache(redis_cache=RedisCache(host="127.0.0.1", port=redis.port)))
+        handler.update_variables(llm_router=router)
+        with request_redis_batch_scope():
+            await _native_pre_call(handler, auth, {"model": "batched", "max_tokens": 10})
+            before: Final = redis.trips
+            await handler.async_log_success_event(
+                kwargs={
+                    "litellm_params": {"metadata": {"model_group": "batched"}},
+                    "standard_logging_object": {
+                        "metadata": {"user_api_key_team_id": "team-a", "user_api_key_auth_metadata": {}}
+                    },
+                },
+                response_obj=ModelResponse(usage=Usage(prompt_tokens=7, completion_tokens=0, total_tokens=7)),
+                start_time=datetime.now(),
+                end_time=datetime.now(),
+            )
+            held: Final = redis.trips - before
+            await flush_post_call_redis_batches()
+            sent: Final = redis.trips - before
+    assert (held, sent) == (0, 1), (held, sent)

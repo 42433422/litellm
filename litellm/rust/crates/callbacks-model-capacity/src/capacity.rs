@@ -18,7 +18,7 @@ use crate::{
     },
     pyfmt,
     refusal::{Context, Refusal},
-    seam::{CapacityHost, Estimate, Published, Throttle, V3Limiter},
+    seam::{CapacityHost, Estimate, Facts, Published, Throttle, Touched, V3Limiter},
     state::{Hold, SharedStash},
 };
 
@@ -106,6 +106,7 @@ pub struct Request<'a> {
     pub stash: &'a SharedStash,
     pub fallback: SaturationFallback,
     pub redis: Option<&'a RequestRedis>,
+    pub facts: &'a Facts,
 }
 
 impl Request<'_> {
@@ -314,7 +315,7 @@ impl Engine {
                     "Error checking saturation for {model}: {}",
                     error.python_message()
                 );
-                let _ = self.host.log("error", &message).await;
+                let _ = self.host.log("error", &message);
                 0.0
             }
         }
@@ -355,7 +356,7 @@ impl Engine {
                     "Saturation read failed in Redis, using this worker's copy: {}",
                     error.python_message()
                 );
-                let _ = self.host.log("warning", &message).await;
+                let _ = self.host.log("warning", &message);
                 self.limiter.read_local_counter(counter)?
             }
         };
@@ -389,11 +390,15 @@ impl Engine {
             .key
             .team_text()
             .map_or_else(|| pool_member(&class), |team| team_member(&team));
-        let members = match self
+        let touched = match self
             .host
             .touch(model, &member, &class, settings.window_size)
-            .await
         {
+            Ok(Touched::Members(members)) => Ok(members),
+            Ok(Touched::Pending(pending)) => self.host.touched(pending).await,
+            Err(error) => Err(error),
+        };
+        let members = match touched {
             Ok(members) => members,
             Err(error) if error.is_registry_unavailable() => {
                 let message = format!(
@@ -401,7 +406,7 @@ impl Engine {
                     python_optional(request.key.team_text().as_deref()),
                     error.python_message()
                 );
-                let _ = self.host.log("warning", &message).await;
+                let _ = self.host.log("warning", &message);
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -431,7 +436,7 @@ impl Engine {
         let weights = normalized_weights(settings, group)?;
         let allocated = allocation(settings, model, request.priority(), &weights, group)?;
         if allocated.unlicensed {
-            self.host.unlicensed_priority().await?;
+            self.host.unlicensed_priority()?;
         }
         let weight = share.map_or(allocated.weight, |share| share.fraction);
         let floor = if share.is_some() { 1 } else { 0 };
@@ -459,12 +464,11 @@ impl Engine {
         }])
     }
 
-    pub async fn borrowing_share(
+    pub fn borrowing_share(
         &self,
         request: &Request<'_>,
-        model: &str,
     ) -> Result<Option<BorrowingShare>, CapacityError> {
-        let Some(limits) = self.host.borrowing_limits(model).await? else {
+        let Some(limits) = request.facts.borrowing()? else {
             return Ok(None);
         };
         if limits.tpm.is_none() && limits.rpm.is_none() {
@@ -545,7 +549,7 @@ impl Engine {
             let message = format!(
                 "router_settings.fallback_on_saturation={invalid} is not a boolean, treating it as disabled"
             );
-            let _ = self.host.log("warning", &message).await;
+            let _ = self.host.log("warning", &message);
         }
         fallback.enabled && fallback.armed
     }
@@ -573,7 +577,7 @@ impl Engine {
                 .cloned();
             stash.priority = request.priority_value();
         }
-        let team_share = self.borrowing_share(request, model).await?;
+        let team_share = self.borrowing_share(request)?;
         let enforced_team = team_share
             .as_ref()
             .and_then(|share| share.enforced(enforce_priority))
@@ -662,7 +666,8 @@ impl Engine {
             && team_reservation != 0
             && settings.rate_limit_type != crate::model::TokenRateLimitType::Input
         {
-            self.host.cap_output(tpm_share, request.call_type).await?;
+            request.stash.lock().output_cap =
+                Some((tpm_share, request.call_type.map(str::to_owned)));
         }
         let mut published = Published {
             overall_code: atomic.overall_code,
@@ -718,7 +723,7 @@ impl Engine {
                     "Error in dynamic rate limiter: {}, allowing request",
                     error.python_message()
                 );
-                let _ = self.host.log("error", &message).await;
+                let _ = self.host.log("error", &message);
                 PreCall::Allow(None)
             }
         }
@@ -753,7 +758,7 @@ impl Engine {
         model: &str,
         connection: Option<&SharedStash>,
     ) -> Result<Frame, CapacityError> {
-        let Some(group) = self.host.group(model).await? else {
+        let Some(group) = request.facts.group()? else {
             return Ok(Frame::Allow);
         };
         let settings = request.settings;
@@ -773,7 +778,7 @@ impl Engine {
         if let (Some(stash), Some(frame_share)) = (connection, frame_share) {
             stash.lock().priority_class_share = Some(frame_share);
         }
-        let borrowing = self.borrowing_share(request, model).await?;
+        let borrowing = self.borrowing_share(request)?;
         if share_descriptors.is_empty() && borrowing.is_none() {
             return Ok(Frame::Allow);
         }
@@ -843,8 +848,8 @@ impl Engine {
         model: &str,
         commit: bool,
     ) -> Result<bool, CapacityError> {
-        let team_share = self.borrowing_share(request, model).await?;
-        let group = self.host.group(model).await?;
+        let team_share = self.borrowing_share(request)?;
+        let group = request.facts.group()?;
         let (Some(team_share), Some(group)) = (team_share, group) else {
             return Ok(true);
         };
@@ -855,7 +860,7 @@ impl Engine {
             .cloned();
         let cap = team_share.ceiling.clone();
         let reservation = if enforced.is_some() || cap.is_some() {
-            let call_type = self.host.stash_call_type().await?;
+            let call_type = request.facts.call_type()?;
             self.token_reservation(&team_share.share, model, call_type.as_deref())
                 .await?
         } else {
@@ -962,6 +967,7 @@ impl Engine {
         settlement: &Settlement<'_>,
         priority: Option<&str>,
         total_tokens: i64,
+        redis: Option<&RequestRedis>,
     ) -> Result<(), CapacityError> {
         let ttl = settings.window_size;
         let group = settlement.model_group;
@@ -983,7 +989,7 @@ impl Engine {
         };
         let Some(model_group) = group.filter(|group| group.truthy) else {
             if !team_tokens.is_empty() {
-                self.limiter.apply(&team_tokens).await?;
+                self.limiter.apply(&team_tokens, redis).await?;
             }
             return Ok(());
         };
@@ -1025,7 +1031,7 @@ impl Engine {
         }
         operations.extend(team_tokens);
         if !operations.is_empty() {
-            self.limiter.apply(&operations).await?;
+            self.limiter.apply(&operations, redis).await?;
             self.record_team_share(
                 settings,
                 stash,
@@ -1044,6 +1050,7 @@ impl Engine {
         stash: &SharedStash,
         failed_group: Option<&LoggedGroup>,
         used: i64,
+        redis: Option<&RequestRedis>,
     ) -> Result<Option<Arc<Hold>>, CapacityError> {
         let ttl = settings.window_size;
         let (refund, failed_hold) = {
@@ -1079,7 +1086,7 @@ impl Engine {
             (refund, failed_hold)
         };
         if !refund.is_empty() {
-            self.limiter.apply(&refund).await?;
+            self.limiter.apply(&refund, redis).await?;
         }
         Ok(failed_hold)
     }
@@ -1088,6 +1095,7 @@ impl Engine {
         &self,
         settings: &Settings,
         stash: &SharedStash,
+        redis: Option<&RequestRedis>,
     ) -> Result<(), CapacityError> {
         let refund = {
             let mut stash = stash.lock();
@@ -1098,7 +1106,7 @@ impl Engine {
         if refund.is_empty() {
             return Ok(());
         }
-        self.limiter.apply(&refund).await
+        self.limiter.apply(&refund, redis).await
     }
 
     pub async fn record_team_share(
@@ -1117,7 +1125,7 @@ impl Engine {
                 "Dynamic rate limiter share metrics failed: {}",
                 error.python_message()
             );
-            let _ = self.host.log("warning", &message).await;
+            let _ = self.host.log("warning", &message);
         }
     }
 
@@ -1242,7 +1250,7 @@ mod tests {
 
     use crate::{
         model::{Status, TokenRateLimitType},
-        seam::{SeamFuture, ShareGauge},
+        seam::{Fact, SeamFuture, ShareGauge},
         state::Stash,
     };
 
@@ -1307,14 +1315,17 @@ mod tests {
             Box::pin(async move { Ok(answer("OK", Vec::new())) })
         }
 
-        fn apply<'a>(&'a self, _operations: &'a [ReservationOp]) -> SeamFuture<'a, ()> {
+        fn apply<'a>(
+            &'a self,
+            _operations: &'a [ReservationOp],
+            _redis: Option<&'a RequestRedis>,
+        ) -> SeamFuture<'a, ()> {
             Box::pin(async move { Ok(()) })
         }
     }
 
     #[derive(Default)]
     struct FakeHost {
-        group: Option<GroupInfo>,
         logged: Mutex<Vec<(String, String)>>,
     }
 
@@ -1323,21 +1334,17 @@ mod tests {
     }
 
     impl CapacityHost for FakeHost {
-        fn settings(&self) -> SeamFuture<'_, Settings> {
-            done(settings(json!(null)))
-        }
-
-        fn group<'a>(&'a self, _model: &'a str) -> SeamFuture<'a, Option<GroupInfo>> {
-            done(self.group.clone())
-        }
-
-        fn touch<'a>(
-            &'a self,
-            _model: &'a str,
-            _member: &'a str,
-            _priority_class: &'a Value,
+        fn touch(
+            &self,
+            _model: &str,
+            _member: &str,
+            _priority_class: &Value,
             _window: i64,
-        ) -> SeamFuture<'a, Vec<(String, Value)>> {
+        ) -> Result<Touched, CapacityError> {
+            Ok(Touched::Members(Vec::new()))
+        }
+
+        fn touched(&self, _pending: u64) -> SeamFuture<'_, Vec<(String, Value)>> {
             done(Vec::new())
         }
 
@@ -1353,22 +1360,15 @@ mod tests {
             done(())
         }
 
-        fn unlicensed_priority(&self) -> SeamFuture<'_, ()> {
-            done(())
+        fn unlicensed_priority(&self) -> Result<(), CapacityError> {
+            Ok(())
         }
 
-        fn log<'a>(&'a self, level: &'static str, message: &'a str) -> SeamFuture<'a, ()> {
+        fn log(&self, level: &'static str, message: &str) -> Result<(), CapacityError> {
             self.logged
                 .lock()
                 .push((level.to_owned(), message.to_owned()));
-            done(())
-        }
-
-        fn borrowing_limits<'a>(
-            &'a self,
-            _model: &'a str,
-        ) -> SeamFuture<'a, Option<BorrowingLimits>> {
-            done(None)
+            Ok(())
         }
 
         fn model_group<'a>(&'a self, model: &'a str) -> SeamFuture<'a, String> {
@@ -1382,18 +1382,6 @@ mod tests {
             _call_type: Option<&'a str>,
         ) -> SeamFuture<'a, Estimate> {
             done(Estimate::NoBody)
-        }
-
-        fn cap_output<'a>(
-            &'a self,
-            _tpm_share: i64,
-            _call_type: Option<&'a str>,
-        ) -> SeamFuture<'a, ()> {
-            done(())
-        }
-
-        fn stash_call_type(&self) -> SeamFuture<'_, Option<String>> {
-            done(None)
         }
 
         fn post_call_success<'a>(&'a self, _headers: &'a [(String, Value)]) -> SeamFuture<'a, ()> {
@@ -1456,6 +1444,10 @@ mod tests {
             ..KeyFacts::default()
         };
         let stash: SharedStash = Arc::new(Mutex::new(Stash::default()));
+        let facts = Facts {
+            borrowing: Some(Fact::Ok(None)),
+            ..Facts::default()
+        };
         let request = Request {
             key: &key,
             call_type: None,
@@ -1467,6 +1459,7 @@ mod tests {
                 armed: false,
             },
             redis: None,
+            facts: &facts,
         };
         engine.pre_call(&request, model, group).await
     }
@@ -1601,10 +1594,7 @@ mod tests {
             None,
             answer("OVER_LIMIT", vec![unknown]),
         ));
-        let host = Arc::new(FakeHost {
-            group: Some(model_group.clone()),
-            ..FakeHost::default()
-        });
+        let host = Arc::new(FakeHost::default());
         let PreCall::Refuse(refusal) = pre_call(
             &engine(&limiter, &host),
             &settings(json!(60)),

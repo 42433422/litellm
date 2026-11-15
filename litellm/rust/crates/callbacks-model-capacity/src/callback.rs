@@ -15,7 +15,7 @@ use crate::{
     error::CapacityError,
     model::{KeyFacts, KeyGaps, LoggedGroup, UsageTokens},
     refusal::{reraise, unverifiable},
-    seam::{CapacityHost, V3Limiter},
+    seam::{CapacityHost, Facts, V3Limiter},
     state::SharedStash,
 };
 
@@ -91,6 +91,12 @@ fn logged_team(identity: Option<&LoggedKeyIdentity>) -> Option<LoggedTeam> {
         team_alias,
         priority,
     })
+}
+
+#[derive(Clone, Copy)]
+struct Host<'a> {
+    redis: Option<&'a RequestRedis>,
+    facts: &'a Facts,
 }
 
 pub struct ModelCapacity {
@@ -183,6 +189,7 @@ impl ModelCapacity {
         input: &HookInput,
         stash: Option<&SharedStash>,
         redis: Option<&RequestRedis>,
+        facts: &Facts,
     ) -> HookOutput {
         let Some(Value::String(model)) = input.fields.raw(Field::Model)?.cloned() else {
             return Ok(None);
@@ -190,12 +197,12 @@ impl ModelCapacity {
         let key = key_facts(input)?;
         let fallback = saturation_fallback(input.fields.get::<typed::LimiterRequest>()?);
         let stash = stash.cloned().unwrap_or_default();
-        let group = match self.engine.host.group(&model).await {
+        let group = match facts.group() {
             Ok(Some(group)) => group,
             Ok(None) => return Ok(None),
             Err(error) => return raise(error),
         };
-        let settings = match self.engine.host.settings().await {
+        let settings = match facts.settings() {
             Ok(settings) => settings,
             Err(error) => return raise(error),
         };
@@ -207,6 +214,7 @@ impl ModelCapacity {
             stash: &stash,
             fallback,
             redis,
+            facts,
         };
         match self.engine.pre_call(&request, &model, &group).await {
             PreCall::Allow(None) => Ok(None),
@@ -227,22 +235,33 @@ impl ModelCapacity {
         Ok(None)
     }
 
-    async fn post_call_failure(&self, stash: Option<&SharedStash>) -> HookOutput {
+    async fn post_call_failure(
+        &self,
+        stash: Option<&SharedStash>,
+        redis: Option<&RequestRedis>,
+        facts: &Facts,
+    ) -> HookOutput {
         let Some(stash) = stash else {
             return Ok(None);
         };
-        let released = match self.engine.host.settings().await {
-            Ok(settings) => self.engine.release_admission(&settings, stash).await,
+        let released = match facts.settings() {
+            Ok(settings) => self.engine.release_admission(&settings, stash, redis).await,
             Err(error) => Err(error),
         };
         if let Err(error) = released {
             let message = format!("{FAILURE_HOOK_ERROR}: {}", error.python_message());
-            let _ = self.engine.host.log("error", &message).await;
+            let _ = self.engine.host.log("error", &message);
         }
         Ok(None)
     }
 
-    async fn attempt_ended(&self, input: &HookInput, stash: Option<&SharedStash>) -> HookOutput {
+    async fn attempt_ended(
+        &self,
+        input: &HookInput,
+        stash: Option<&SharedStash>,
+        redis: Option<&RequestRedis>,
+        facts: &Facts,
+    ) -> HookOutput {
         if input
             .call
             .as_ref()
@@ -258,20 +277,21 @@ impl ModelCapacity {
         let identity = input.fields.get::<typed::LoggedKeyIdentity>()?;
         let usage = input.fields.get::<typed::Usage>()?;
         let stash = stash.cloned();
+        let host = Host { redis, facts };
         match outcome {
             Outcome::Failure => {
                 let used = UsageTokens::failed(usage.as_ref());
-                self.failure(&gaps, group, identity.as_ref(), used, stash)
+                self.failure(&gaps, group, identity.as_ref(), used, stash, host)
                     .await
             }
             Outcome::Success => {
                 let used = UsageTokens::delivered(usage.as_ref());
                 if let Err(error) = self
-                    .success(&gaps, group, identity.as_ref(), used, stash)
+                    .success(&gaps, group, identity.as_ref(), used, stash, host)
                     .await
                 {
                     let message = format!("Error in dynamic rate limiter success event: {error}");
-                    let _ = self.engine.host.log("error", &message).await;
+                    let _ = self.engine.host.log("error", &message);
                 }
                 Ok(None)
             }
@@ -286,6 +306,7 @@ impl ModelCapacity {
         identity: Option<&LoggedKeyIdentity>,
         used: Option<UsageTokens>,
         stash: Option<SharedStash>,
+        host: Host<'_>,
     ) -> Result<(), String> {
         let team = match (logged_team(identity), &gaps.settlement_error) {
             (Some(team), None) => team,
@@ -293,11 +314,9 @@ impl ModelCapacity {
             (None, None) => return Ok(()),
         };
         let group = group?;
-        let settings = self
-            .engine
-            .host
+        let settings = host
+            .facts
             .settings()
-            .await
             .map_err(|error| error.python_message())?;
         let total = UsageTokens::settled(used.as_ref(), settings.rate_limit_type);
         let settlement = Settlement {
@@ -312,6 +331,7 @@ impl ModelCapacity {
                 &settlement,
                 team.priority.as_deref(),
                 total,
+                host.redis,
             )
             .await
             .map_err(|error| error.python_message())
@@ -324,6 +344,7 @@ impl ModelCapacity {
         identity: Option<&LoggedKeyIdentity>,
         used: Option<UsageTokens>,
         stash: Option<SharedStash>,
+        host: Host<'_>,
     ) -> HookOutput {
         let Some(stash) = stash else {
             return Ok(None);
@@ -331,13 +352,13 @@ impl ModelCapacity {
         let Ok(group) = group else {
             return Ok(None);
         };
-        let Ok(settings) = self.engine.host.settings().await else {
+        let Ok(settings) = host.facts.settings() else {
             return Ok(None);
         };
         let used = UsageTokens::settled(used.as_ref(), settings.rate_limit_type);
         let Ok(hold) = self
             .engine
-            .settle_failure(&settings, &stash, group.as_ref(), used)
+            .settle_failure(&settings, &stash, group.as_ref(), used, host.redis)
             .await
         else {
             return Ok(None);
@@ -367,12 +388,13 @@ impl ModelCapacity {
         input: &HookInput,
         state: Option<&SharedStash>,
         redis: Option<&RequestRedis>,
+        facts: &Facts,
     ) -> HookOutput {
         match input.hook {
-            Hook::PreCall => self.pre_call(input, state, redis).await,
+            Hook::PreCall => self.pre_call(input, state, redis, facts).await,
             Hook::PostCallSuccess => self.post_call_success(input).await,
-            Hook::PostCallFailure => self.post_call_failure(state).await,
-            Hook::AttemptEnded => self.attempt_ended(input, state).await,
+            Hook::PostCallFailure => self.post_call_failure(state, redis, facts).await,
+            Hook::AttemptEnded => self.attempt_ended(input, state, redis, facts).await,
             _ => Ok(None),
         }
     }
@@ -388,8 +410,9 @@ impl ModelCapacity {
         model: &str,
         commit: bool,
         redis: Option<&RequestRedis>,
+        facts: &Facts,
     ) -> Result<bool, CapacityError> {
-        let settings = self.engine.host.settings().await?;
+        let settings = facts.settings()?;
         let request = Request {
             key,
             call_type: None,
@@ -397,6 +420,7 @@ impl ModelCapacity {
             stash,
             fallback: SaturationFallback::default(),
             redis,
+            facts,
         };
         self.engine
             .fallback_target_allowed(&request, model, commit)
@@ -409,9 +433,10 @@ impl ModelCapacity {
         key: &KeyFacts,
         model: &str,
         redis: Option<&RequestRedis>,
+        facts: &Facts,
     ) -> Result<Frame, CapacityError> {
         let stash = connection.cloned().unwrap_or_default();
-        let settings = self.engine.host.settings().await?;
+        let settings = facts.settings()?;
         let request = Request {
             key,
             call_type: None,
@@ -419,6 +444,7 @@ impl ModelCapacity {
             stash: &stash,
             fallback: SaturationFallback::default(),
             redis,
+            facts,
         };
         self.engine.enforce_frame(&request, model, connection).await
     }
@@ -436,7 +462,10 @@ impl Callback for ModelCapacity {
         input: &'a HookInput,
         state: Option<&'a SharedStash>,
     ) -> BoxFuture<'a, HookOutput> {
-        Box::pin(self.handle_with(input, state, None))
+        Box::pin(async move {
+            self.handle_with(input, state, None, &Facts::default())
+                .await
+        })
     }
 }
 

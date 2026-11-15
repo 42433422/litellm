@@ -673,6 +673,7 @@ def amessages(
 @final
 class NativeModelCapacityState:
     def __new__(cls, _uninstantiable: Never, /) -> Never: ...
+    def take_output_cap(self) -> tuple[int, str | None] | None: ...
 
 @final
 class NativeModelCapacity:
@@ -692,6 +693,7 @@ class NativeModelCapacity:
         fields: Mapping[str, object],
         call: Mapping[str, object] | None,
         state: NativeModelCapacityState | None,
+        facts: Mapping[str, object],
         /,
         request: NativeRequestRedis | None = None,
     ) -> Future[object]: ...
@@ -702,6 +704,7 @@ class NativeModelCapacity:
         key: Mapping[str, object],
         model: str,
         commit: bool,
+        facts: Mapping[str, object],
         request: NativeRequestRedis | None = None,
     ) -> Future[dict[str, object]]: ...
     def enforce_frame(
@@ -709,6 +712,7 @@ class NativeModelCapacity:
         connection: NativeModelCapacityState | None,
         key: Mapping[str, object],
         model: str,
+        facts: Mapping[str, object],
         request: NativeRequestRedis | None = None,
     ) -> Future[dict[str, object]]: ...
 

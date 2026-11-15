@@ -55,7 +55,7 @@ where
     )
 }
 
-fn limiter_admission<'py, T, F>(
+pub(crate) fn limiter_admission<'py, T, F>(
     py: Python<'py>,
     in_memory: bool,
     operation: F,

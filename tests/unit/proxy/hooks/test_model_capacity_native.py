@@ -1755,9 +1755,7 @@ async def test_saturation_is_read_from_redis_on_every_check_like_python(
             [("model_saturation_check", "shared"), ("priority_model", "shared:high")],
             redis=redis,
         )
-    seen: Final = [("redis", key.removeprefix("{").split(":")[0], 60) for key in redis.read_keys()] + [
-        ("memory", "RateLimitCounter", None)
-    ] * 4
+    seen: Final = [("redis", key.removeprefix("{").split(":")[0], 60) for key in redis.read_keys()]
     golden.check(seen)
     assert [read for read in seen if read[0] == "redis"] == [("redis", "model_saturation_check", 60)] * 3, seen
     assert _refusal_prefixes(native) == ["Priority-based rate limit exceeded"], native

@@ -3991,6 +3991,7 @@ dependencies = [
  "litellm-inference-messages",
  "litellm-llms",
  "litellm-model-catalog",
+ "litellm-model-catalog-refresh",
  "litellm-redis-client",
  "litellm-redis-connect",
  "litellm-redis-resolve",
@@ -4066,6 +4067,7 @@ dependencies = [
 name = "litellm-gateway-inference"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -4088,6 +4090,7 @@ dependencies = [
  "litellm-inference-transcription",
  "litellm-llms",
  "litellm-llms-types",
+ "litellm-model-catalog",
  "litellm-router-core",
  "litellm-router-types",
  "litellm-secret-value",

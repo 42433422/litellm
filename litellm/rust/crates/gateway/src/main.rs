@@ -63,7 +63,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let level = settings.log_level();
     Logger::new(StderrSink { level }).install_global()?;
     let config = Config::load(settings.litellm_config)?;
-    let inference = litellm_gateway::build_inference(&config).await?;
+    let (inference, models) = litellm_gateway::build_serving(&config).await?;
+    tokio::spawn(models.run(inference.clone(), None));
     let _redis =
         litellm_gateway::build_redis(&config, &inference.resources.pool, &inference.http).await?;
     let ui = match std::env::var_os("LITELLM_UI_PATH") {
@@ -141,9 +142,13 @@ async fn in_front_of_python(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn Error>> {
     let config = Config::load(config)?;
-    let inference = match litellm_gateway::build_inference(&config).await {
+    let inference = match litellm_gateway::build_serving(&config).await {
         Err(litellm_gateway::Error::RouterConfig(refused)) => Err(refused),
-        built => Ok(built?),
+        built => {
+            let (inference, models) = built?;
+            tokio::spawn(models.run(inference.clone(), None));
+            Ok(inference)
+        }
     };
     let env = |name: &str| std::env::var(name).ok();
     litellm_gateway_forward::run_app(

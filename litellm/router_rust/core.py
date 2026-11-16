@@ -3049,12 +3049,14 @@ class RustCore(
 
     async def _retry_backoff(self, driver: "_Driver", step: Mapping[str, object]) -> None:
         """A retry after a congesting failure the dynamic queue took waits there, behind the provider's retry-after
-        and in priority order, so it spends queue time instead of this backoff."""
-        if driver.queue_holds_retry():
-            return
+        and in priority order, so it spends queue time instead of this backoff, which stays owed in case the retry
+        goes out without the queue."""
         if (outlasted := _error_outlasting_total_timeout(driver, _sleep_seconds(step))) is not None:
             driver.close_route_phase()
             raise outlasted
+        if driver.queue_holds_retry():
+            driver.owe_backoff(_sleep_seconds(step))
+            return
         await self._host.sleep(_sleep_seconds(step))
 
     async def _run_steps(
@@ -4543,6 +4545,7 @@ class _Driver:
         )
         self._queue_rejection: QueueRejectedError | None = None
         self._queued_retry = False
+        self._owed_until: float | None = None
         # The retry counts an exhausted retry loop stamps on the pick error its level then raises.
         self._pending_stamps: Final[dict[int, tuple[object, object]]] = {}  # mutable-ok: filled as the call runs
         # Each level's current hop's first failure, once it retries: the error its retry loop raises
@@ -5336,12 +5339,29 @@ class _Driver:
         self._queued_retry = False
         return held
 
+    def owe_backoff(self, seconds: float) -> None:
+        request_queue: Final = current_request_queue()
+        self._owed_until = None if request_queue is None else request_queue.router.timer.now() + seconds
+
+    async def _serve_owed_backoff(self) -> None:
+        """What is left of the backoff the queue took over, for an attempt that goes out without the queue."""
+        request_queue: Final = current_request_queue()
+        if self._owed_until is None or request_queue is None:
+            return
+        left_s: Final = self._owed_until - request_queue.router.timer.now()
+        self._owed_until = None
+        if left_s > 0:
+            await self._core._host.sleep(left_s)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+
     async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
         self._queued_retry = False
-        if self._passthrough is not None and not step.get("deployment_id"):
-            return await self._passthrough_attempt(step)
-        with routed_attempt() as attempt:
-            return await self._routed_attempt(step, attempt)
+        try:
+            if self._passthrough is not None and not step.get("deployment_id"):
+                return await self._passthrough_attempt(step)
+            with routed_attempt() as attempt:
+                return await self._routed_attempt(step, attempt)
+        finally:
+            self._owed_until = None
 
     def _release(
         self, call: AttemptCall, attempt: RoutedAttempt, *, refund_io_tokens: bool
@@ -5364,10 +5384,15 @@ class _Driver:
         self, step: Mapping[str, object], deployment: Mapping[str, object], call: "AttemptCall"
     ) -> Admission | None:
         request_queue: Final = current_request_queue()
-        if request_queue is None or self._plan.sync or self._plan.kind not in ("chat", "text"):
-            return None
         capacity: Final = capacity_of(deployment)
-        if capacity is None or not self._core.queues_on(self._attempt_request(step))(deployment):
+        if (
+            request_queue is None
+            or self._plan.sync
+            or self._plan.kind not in ("chat", "text")
+            or capacity is None
+            or not self._core.queues_on(self._attempt_request(step))(deployment)
+        ):
+            await self._serve_owed_backoff()
             return None
         own_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
         admitted: Final = await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
@@ -5377,6 +5402,7 @@ class _Driver:
             raise self._core._failure_error(  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
                 {"error_kind": "no_healthy_deployments"}, call.model_name, None, request=self._request
             )
+        await self._serve_owed_backoff()
         return None
 
     def _attempt_request(self, step: Mapping[str, object]) -> Mapping[str, object]:

@@ -58,17 +58,21 @@ _T = TypeVar("_T")
 
 
 class _ProviderAnswered(Exception):
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, retry_after: int | None = None) -> None:
         super().__init__("upstream failure")
         self.message = "upstream failure"
         self.status_code = status_code
         self.request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
-        self.response = httpx.Response(status_code=status_code, request=self.request, text="upstream failure")
+        headers: Final = {} if retry_after is None else {"retry-after": str(retry_after)}
+        self.response = httpx.Response(
+            status_code=status_code, request=self.request, text="upstream failure", headers=headers
+        )
 
 
-def _provider_error(status_code: int) -> Exception:
+def _provider_error(status_code: int, retry_after: int | None = None) -> Exception:
     try:
-        exception_type(model="m", original_exception=_ProviderAnswered(status_code), custom_llm_provider="openai")
+        answered: Final = _ProviderAnswered(status_code, retry_after)
+        exception_type(model="m", original_exception=answered, custom_llm_provider="openai")
     except Exception as mapped:  # noqa: BLE001  # the mapped error is the value under test
         return mapped
     raise AssertionError("exception_type always raises for a provider error")
@@ -657,12 +661,12 @@ class _QueueHost(_RecordsBackoffs):
         return DynamicQueueRouter(settings, self._backends, timer=self._timer)
 
 
-def _retrying_router(host: _RecordsBackoffs, *, queued: bool = True) -> litellm.Router:
+def _retrying_router(host: _RecordsBackoffs, *, queued: bool = True, queue_timeout: float = 0.5) -> litellm.Router:
     arguments: Final = router_arguments(
         model_list=[{"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "only"}}],
         default_priority=0,
         num_retries=1,
-        dynamic_queue={"enabled": queued, "max_waiting": 8, "queue_timeout": 0.5},
+        dynamic_queue={"enabled": queued, "max_waiting": 8, "queue_timeout": queue_timeout},
     )
     return litellm.Router.from_config(build_router_config(arguments), host)
 
@@ -1069,3 +1073,135 @@ async def test_an_empty_api_key_field_still_waits_in_its_configured_deployments_
     )
 
     assert isinstance(waited, DynamicQueueTimeoutError)
+
+
+class _BacksOffForever(_QueueHost):
+    """Records each retry backoff, then never ends it, so a test can cancel the request inside it."""
+
+    def __init__(self, timer: ManualTimer, backends: Backends) -> None:
+        super().__init__(timer, backends)
+        self.backing_off = asyncio.Event()
+
+    def sleep(self, seconds: float) -> Awaitable[None]:
+        self.backoffs.append(seconds)
+        self.backing_off.set()
+        return asyncio.Event().wait()
+
+
+def _losing_redis(timer: ManualTimer) -> tuple[Backends, "list[_LosesRedis]"]:
+    built: Final[list[_LosesRedis]] = []  # mutable-ok: the one backend the router builds, kept to cut it off
+
+    def backend(settings: QueueSettings) -> _LosesRedis:
+        built.append(_LosesRedis(settings, timer))
+        return built[-1]
+
+    return backend, built
+
+
+RETRY_AFTER_S: Final = 20
+
+
+async def _queued_retry_losing_redis_at(
+    host: _QueueHost, timer: ManualTimer, built: "list[_LosesRedis]", at: float
+) -> object:
+    """A 429 whose retry waits in the queue until the queue's Redis is lost under it at ``at``, then the outcome."""
+    router: Final = _retrying_router(host, queue_timeout=30)
+    waiting: Final = asyncio.create_task(
+        router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S))
+    )
+    try:
+        while timer.at < at - 0.25:
+            await timer.parked(waiting)
+            timer.advance(0.25)
+        await timer.parked(waiting)
+        built[0].reachable = False
+        timer.advance(0.25)
+        return (await asyncio.wait_for(asyncio.gather(waiting, return_exceptions=True), 10))[0]
+    finally:
+        await _reap(waiting)
+
+
+async def _ordinary_backoffs() -> list[float]:
+    """The backoffs the same request takes on the same router without the queue."""
+    unqueued: Final = _RecordsBackoffs()
+    with pytest.raises(litellm.RateLimitError):
+        _ = await _retrying_router(unqueued, queued=False).acompletion(
+            model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S)
+        )
+    return unqueued.backoffs
+
+
+@pytest.mark.parametrize("lost_after_the_backoff", [False, True], ids=["part_left", "all_served_in_the_queue"])
+async def test_a_queued_retry_whose_queue_is_lost_waits_only_what_is_left_of_its_ordinary_backoff(
+    lost_after_the_backoff: bool,
+) -> None:
+    ordinary: Final = await _ordinary_backoffs()
+    assert ordinary[0] > 2.25 and ordinary[0] % 0.25 == 0, ordinary
+    lost_at: Final = ordinary[0] if lost_after_the_backoff else 2.25
+    timer: Final = ManualTimer()
+    backends, built = _losing_redis(timer)
+    host: Final = _QueueHost(timer, backends)
+
+    outcome: Final = await _queued_retry_losing_redis_at(host, timer, built, lost_at)
+
+    owed: Final = () if lost_after_the_backoff else (pytest.approx(ordinary[0] - lost_at),)
+    assert isinstance(outcome, litellm.RateLimitError)
+    assert host.backoffs == [*owed, *ordinary[1:]]
+
+
+async def test_cancelling_a_queued_retry_during_what_is_left_of_its_backoff_cancels_the_request() -> None:
+    timer: Final = ManualTimer()
+    backends, built = _losing_redis(timer)
+    host: Final = _BacksOffForever(timer, backends)
+    cancelling: Final = asyncio.create_task(_queued_retry_losing_redis_at(host, timer, built, 2.25))
+    try:
+        await asyncio.wait_for(host.backing_off.wait(), 10)
+        _ = cancelling.cancel()
+        outcome: Final = await asyncio.wait_for(asyncio.gather(cancelling, return_exceptions=True), 10)
+    finally:
+        await _reap(cancelling)
+
+    assert isinstance(outcome[0], asyncio.CancelledError)
+    assert len(host.backoffs) == 1
+
+
+async def test_a_queued_retry_whose_backoff_outlasts_the_total_timeout_ends_at_once_with_the_providers_error() -> None:
+    timer: Final = ManualTimer()
+    host: Final = _QueueHost(timer)
+    router: Final = _retrying_router(host, queue_timeout=30)
+
+    with pytest.raises(litellm.RateLimitError) as raised:
+        async with total_deadline(10.0, from_body=True, clock=timer.now):
+            _ = await router.acompletion(
+                model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S)
+            )
+
+    assert raised.value.status_code == 429
+    assert host.backoffs == []
+    assert timer.at == 0.0
+
+
+async def test_a_retry_the_queue_admits_on_a_healthy_alternative_takes_no_backoff() -> None:
+    timer: Final = ManualTimer()
+    host: Final = _QueueHost(timer)
+    router: Final = litellm.Router.from_config(
+        build_router_config(
+            router_arguments(
+                model_list=[
+                    {"model_name": "group", "litellm_params": {"model": f"openai/{name}"}, "model_info": {"id": name}}
+                    for name in ("a", "b")
+                ],
+                default_priority=0,
+                num_retries=1,
+                disable_cooldowns=True,
+                dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 30},
+            )
+        ),
+        host,
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
+
+    assert host.backoffs == []
+    assert timer.at == 0.0

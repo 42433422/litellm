@@ -4095,6 +4095,7 @@ dependencies = [
  "litellm-router-types",
  "litellm-secret-value",
  "litellm-secrets",
+ "litellm-token-counter",
  "rstest",
  "serde",
  "serde_json",

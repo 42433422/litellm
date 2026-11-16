@@ -9,13 +9,13 @@ queue's Redis cannot be reached, the request goes on as it would without the que
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Annotated, Final, Protocol, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter
-from typing_extensions import assert_never
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model_validator
+from typing_extensions import Self, assert_never
 
 from litellm.exceptions import ServiceUnavailableError, Timeout
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
@@ -41,6 +41,7 @@ from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, ScriptHo
 
 QUEUE_FULL_CODE: Final = "queue_full"
 REDIS_NOT_CONFIGURED: Final = "redis_not_configured"
+MAX_WAITING_LIMIT: Final = 64
 
 _HttpErrorStatus: TypeAlias = Annotated[StrictInt, Field(ge=400, le=599)]
 
@@ -51,10 +52,21 @@ class DynamicQueueSettings(BaseModel):
     enabled: bool = False
     trigger_status_codes: tuple[_HttpErrorStatus, ...] = (429, 529)
     queue_timeout: float = Field(default=30.0, gt=0)
-    max_waiting: int = Field(default=1_000, gt=0)
+    max_waiting: StrictInt | None = Field(default=None, gt=0, le=MAX_WAITING_LIMIT)
+
+    @model_validator(mode="after")
+    def _an_enabled_queue_names_its_size(self) -> Self:
+        """Every admission scans its deployment's whole queue in one Redis call, so its size is the operator's
+        explicit choice, never a default."""
+        if self.enabled and self.max_waiting is None:
+            raise ValueError(
+                "router_settings.dynamic_queue.enabled requires max_waiting, "
+                f"a whole number from 1 to {MAX_WAITING_LIMIT}"
+            )
+        return self
 
     def queue_settings(self) -> QueueSettings:
-        return QueueSettings(max_waiting=self.max_waiting)
+        return QueueSettings(max_waiting=self.max_waiting or 0)
 
 
 _SETTINGS: Final[TypeAdapter[DynamicQueueSettings | None]] = TypeAdapter(DynamicQueueSettings | None)
@@ -98,8 +110,8 @@ def rejection_error(rejection: QueueTimeout | QueueFull, model: str) -> QueueRej
 _T: Final = TypeVar("_T")
 
 
-async def _within(timer: Timer, seconds: float, call: Coroutine[object, object, _T]) -> _T | None:
-    work: Final = asyncio.create_task(call)
+async def _within(timer: Timer, seconds: float, call: Awaitable[_T]) -> _T | None:
+    work: Final = asyncio.ensure_future(call)
     guard: Final = asyncio.create_task(timer.sleep(seconds))
     try:
         _ = await asyncio.wait((work, guard), return_when=asyncio.FIRST_COMPLETED)
@@ -148,6 +160,14 @@ class Admission:
 
 
 @dataclass(frozen=True, slots=True)
+class WithoutQueue:
+    """The attempt goes on without the queue because its coordination failed. ``still_cooling`` when the deployment's
+    own cooldown is confirmed active, so the attempt must not go out on it."""
+
+    still_cooling: bool
+
+
+@dataclass(frozen=True, slots=True)
 class StreamReads:
     done: int
     in_progress: bool
@@ -181,16 +201,16 @@ class RequestQueue:
 
     async def admit(
         self, capacity: str, model: str, cooldown_left_s: Callable[[], Awaitable[float]]
-    ) -> Admission | None:
-        """The attempt's turn, or None when it goes out without the queue because coordination failed. Raises the
-        public error of a full queue or spent queue time. ``cooldown_left_s`` keeps the wait queued, in priority
-        order, until the deployment's own cooldown ends."""
+    ) -> Admission | WithoutQueue:
+        """The attempt's turn, or WithoutQueue when coordination failed. Raises the public error of a full queue or
+        spent queue time. ``cooldown_left_s`` keeps the wait queued, in priority order, until the deployment's own
+        cooldown ends."""
         if not self.coordinated:
-            return None
+            return await self._without_queue(cooldown_left_s)
         queue: Final = self.router.queue()
         if isinstance(queue, CoordinationUnavailable):
             self.lose_coordination()
-            return None
+            return await self._without_queue(cooldown_left_s)
         self._waits += 1
         request: Final = WaitRequest(capacity, f"{self._request_id}:{self._waits}", self._priority)
         started: Final = self.router.timer.now()
@@ -198,12 +218,18 @@ class RequestQueue:
         self._remaining_s = max(self._remaining_s - (self.router.timer.now() - started), 0.0)
         if isinstance(admitted, CoordinationUnavailable):
             self.lose_coordination()
-            return None
+            return await self._without_queue(cooldown_left_s)
         if not isinstance(admitted, Admitted):
             raise rejection_error(admitted, model)
         held: Final = contextlib.AsyncExitStack()
         attempt: Final = await held.enter_async_context(queue.attempt(request, admitted))
         return Admission(attempt, held, self)
+
+    async def _without_queue(self, cooldown_left_s: Callable[[], Awaitable[float]]) -> WithoutQueue:
+        """A lookup that does not answer within the queue's operation limit confirms no cooldown."""
+        bound_s: Final = self.router.queue_settings.operation_timeout_ms / 1000
+        left: Final = await _within(self.router.timer, bound_s, cooldown_left_s())
+        return WithoutQueue(still_cooling=left is not None and left > 0)
 
 
 _CURRENT: Final[ContextVar[RequestQueue | None]] = ContextVar("dynamic_queue_request", default=None)
@@ -336,6 +362,7 @@ async def prefer_uncongested(
 
 
 __all__ = [
+    "MAX_WAITING_LIMIT",
     "Admission",
     "Backends",
     "DynamicQueueFullError",
@@ -346,6 +373,7 @@ __all__ = [
     "Records",
     "RequestQueue",
     "StreamReads",
+    "WithoutQueue",
     "bound_request_queue",
     "capacity_of",
     "congested_ids",

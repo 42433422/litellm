@@ -24,6 +24,7 @@ from litellm.router_utils.dynamic_queue import (
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, _keys
+from litellm.router_utils.dynamic_queue_router import MAX_WAITING_LIMIT
 
 FAR: Final = 1_000_000
 
@@ -546,6 +547,26 @@ async def test_a_ready_waiter_behind_more_cooling_waiters_than_one_sweep_still_g
 
     ready: Final = await second.admit(WaitRequest(capacity, "ready", 9), FAR)
 
+    assert isinstance(ready, Probe)
+
+
+@pytest.mark.asyncio
+async def test_a_queue_at_the_largest_supported_size_still_probes_its_last_ready_waiter_and_refuses_one_more(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, max_waiting=MAX_WAITING_LIMIT, liveness_ms=FAR)
+    await _congest(first, capacity)
+    for index in range(MAX_WAITING_LIMIT - 1):
+        reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
+        assert reply == Waiting(), (index, reply)
+    assert await second.admit(WaitRequest(capacity, "ready", 9), FAR) == Waiting()
+
+    one_more: Final = await first.admit(WaitRequest(capacity, "one-more", 0), FAR)
+    clock.ms = 1_000
+    ready: Final = await second.poll(capacity, "ready")
+
+    assert isinstance(one_more, QueueFull)
     assert isinstance(ready, Probe)
 
 

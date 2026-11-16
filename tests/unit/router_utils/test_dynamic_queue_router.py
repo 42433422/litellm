@@ -23,6 +23,7 @@ from litellm.router_utils.dynamic_queue import (
     MatchingFailure,
     OtherFailure,
     Outcome,
+    PassThrough,
     PollReply,
     QueueFull,
     QueueSettings,
@@ -31,12 +32,14 @@ from litellm.router_utils.dynamic_queue import (
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_router import (
+    MAX_WAITING_LIMIT,
     QUEUE_FULL_CODE,
     Admission,
     Backends,
     DynamicQueueRouter,
     DynamicQueueSettings,
     DynamicQueueTimeoutError,
+    WithoutQueue,
     bound_request_queue,
     capacity_of,
     congested_ids,
@@ -49,7 +52,8 @@ from litellm.types.router import RouterRateLimitError
 from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _finished, _reap
 from tests.unit.router_utils.test_dynamic_queue_redis import UnreachableRedis
 
-ENABLED: Final = DynamicQueueSettings(enabled=True)
+ENABLED: Final = DynamicQueueSettings(enabled=True, max_waiting=8)
+_SIZED: Final = {"enabled": True, "max_waiting": 8}
 _T = TypeVar("_T")
 
 
@@ -119,22 +123,22 @@ async def _waited(timer: ManualTimer, call: Coroutine[object, object, _T], step:
 async def _congest(router: DynamicQueueRouter, capacity: str, retry_after_ms: int) -> None:
     request_queue: Final = router.request(priority=0, request_id=f"congest-{capacity}")
     admission: Final = await request_queue.admit(capacity, "m", _no_cooldown)
-    assert admission is not None
+    assert isinstance(admission, Admission)
     assert await admission.finish(MatchingFailure(retry_after_ms=retry_after_ms)) is True
 
 
 def test_enabling_the_queue_needs_a_default_priority() -> None:
     with pytest.raises(ValueError, match="default_priority"):
-        parse_dynamic_queue({"enabled": True}, None)
+        parse_dynamic_queue({"enabled": True, "max_waiting": 8}, None)
 
-    assert parse_dynamic_queue({"enabled": True}, -3) == DynamicQueueSettings(enabled=True)
+    assert parse_dynamic_queue({"enabled": True, "max_waiting": 8}, -3) == ENABLED
     assert parse_dynamic_queue({"enabled": False}, None) is None
     assert parse_dynamic_queue(None, 0) is None
 
 
 def test_an_unknown_dynamic_queue_key_is_refused() -> None:
     with pytest.raises(ValidationError):
-        parse_dynamic_queue({"enabled": True, "queue_timeot": 5}, 0)
+        parse_dynamic_queue({"enabled": True, "max_waiting": 8, "queue_timeot": 5}, 0)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +151,10 @@ def test_an_unknown_dynamic_queue_key_is_refused() -> None:
         {"queue_timeout": float("inf")},
         {"queue_timeout": float("nan")},
         {"max_waiting": 0},
+        {"max_waiting": 65},
+        {"max_waiting": "8"},
+        {"max_waiting": True},
+        {"max_waiting": 8.0},
         {"coordination": "local"},
         {"recovery_successes": 3},
         {"initial_backoff": 0.5},
@@ -159,6 +167,10 @@ def test_an_unknown_dynamic_queue_key_is_refused() -> None:
         "endless_queue",
         "nan_queue",
         "no_room",
+        "past_the_supported_limit",
+        "text_size",
+        "bool_size",
+        "float_size",
         "coordination_is_not_a_setting",
         "recovery_is_not_a_setting",
         "backoff_is_not_a_setting",
@@ -166,7 +178,27 @@ def test_an_unknown_dynamic_queue_key_is_refused() -> None:
 )
 def test_an_invalid_or_internal_dynamic_queue_setting_is_refused(block: Mapping[str, object]) -> None:
     with pytest.raises(ValidationError):
-        parse_dynamic_queue({"enabled": True, **block}, 0)
+        parse_dynamic_queue({"enabled": True, "max_waiting": 8, **block}, 0)
+
+
+def test_an_enabled_queue_without_its_size_is_refused_and_a_disabled_one_needs_none() -> None:
+    with pytest.raises(ValidationError, match="requires max_waiting"):
+        parse_dynamic_queue({"enabled": True}, 0)
+
+    assert parse_dynamic_queue({"enabled": False}, 0) is None
+    assert parse_dynamic_queue({}, 0) is None
+
+
+@pytest.mark.parametrize("size", [1, MAX_WAITING_LIMIT])
+def test_a_queue_size_from_one_up_to_the_supported_limit_is_the_queues_capacity(size: int) -> None:
+    settings: Final = parse_dynamic_queue({"enabled": True, "max_waiting": size}, 0)
+
+    assert settings is not None and settings.queue_settings().max_waiting == size
+
+
+def test_a_router_enabling_the_queue_without_its_size_fails_to_build() -> None:
+    with pytest.raises(ValueError, match="requires max_waiting"):
+        litellm.Router(model_list=_model_list(), default_priority=0, dynamic_queue={"enabled": True})
 
 
 def test_the_queue_limits_an_operator_sets_drive_the_queue_with_internal_recovery_defaults() -> None:
@@ -192,7 +224,8 @@ def test_the_queue_limits_an_operator_sets_drive_the_queue_with_internal_recover
 def test_only_a_provider_answering_with_a_trigger_status_congests(
     triggers: tuple[int, ...], status_code: int, congests: bool
 ) -> None:
-    router: Final = _router(ManualTimer(), DynamicQueueSettings(enabled=True, trigger_status_codes=triggers))
+    settings: Final = DynamicQueueSettings(enabled=True, max_waiting=8, trigger_status_codes=triggers)
+    router: Final = _router(ManualTimer(), settings)
 
     outcome: Final = router.outcome_of(_provider_error(status_code), None)
 
@@ -237,7 +270,7 @@ async def test_a_wait_stays_queued_until_its_deployments_own_cooldown_ends(
 
 async def test_a_wait_whose_cooldown_outlasts_the_queue_time_times_out_without_holding_the_probe() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=3.0))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=3.0))
     await _congest(router, "cap", retry_after_ms=0)
     cooling: Final = _cooling_until(timer, 60.0)
 
@@ -253,11 +286,11 @@ async def test_a_wait_whose_cooldown_outlasts_the_queue_time_times_out_without_h
 
 async def test_attempts_a_healthy_capacity_admits_cost_none_of_the_requests_queue_time() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=3.0))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=3.0))
     request_queue: Final = router.request(priority=0, request_id="r")
     for _ in range(3):
         healthy = await request_queue.admit("cap", "m", _no_cooldown)
-        assert healthy is not None
+        assert isinstance(healthy, Admission)
         timer.advance(1.0)
         _ = await healthy.finish(None)
     await _congest(router, "cap", retry_after_ms=60_000)
@@ -270,11 +303,11 @@ async def test_attempts_a_healthy_capacity_admits_cost_none_of_the_requests_queu
 
 async def test_a_wait_through_a_recovery_drain_is_spent_from_the_requests_queue_time() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=3.0), successes=1)
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=3.0), successes=1)
     await _congest(router, "cap", retry_after_ms=1_000)
     timer.advance(1.0)
     probe: Final = await router.request(0, "probe").admit("cap", "m", _no_cooldown)
-    assert probe is not None
+    assert isinstance(probe, Admission)
     held: Final = asyncio.create_task(router.request(0, "held").admit("cap", "m", _no_cooldown))
     try:
         await timer.parked(held)
@@ -284,7 +317,7 @@ async def test_a_wait_through_a_recovery_drain_is_spent_from_the_requests_queue_
         assert isinstance(drained, Admission)
         await drained.finish(None)
         released: Final = await _finished(held)
-        assert released is not None
+        assert isinstance(released, Admission)
         _ = await released.finish(None)
     finally:
         await _reap(held)
@@ -298,7 +331,7 @@ async def test_a_wait_through_a_recovery_drain_is_spent_from_the_requests_queue_
 
 async def test_queue_time_is_spent_once_across_every_wait_of_one_request() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=3.0))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=3.0))
     await _congest(router, "cap", retry_after_ms=1_000)
     request_queue: Final = router.request(priority=0, request_id="r")
 
@@ -314,7 +347,7 @@ async def test_queue_time_is_spent_once_across_every_wait_of_one_request() -> No
 
 async def test_a_wait_never_outlasts_the_requests_total_timeout() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=7_200))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=7_200))
     await _congest(router, "cap", retry_after_ms=10_000_000)
 
     async with total_deadline(3_600, from_body=True, clock=timer.now):
@@ -327,7 +360,7 @@ async def test_a_wait_never_outlasts_the_requests_total_timeout() -> None:
 
 async def test_a_wait_after_the_requests_own_context_ended_still_ends_at_its_total_timeout() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=7_200))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=7_200))
     await _congest(router, "cap", retry_after_ms=10_000_000)
     async with total_deadline(3_600, from_body=True, clock=timer.now):
         request_queue: Final = router.request(priority=0, request_id="r")
@@ -350,7 +383,7 @@ async def test_congestion_the_queue_cannot_read_leaves_every_candidate_and_the_r
 
     assert preferred == ("d1", "d2")
     assert busy == frozenset()
-    assert admitted is None
+    assert admitted == WithoutQueue(still_cooling=False)
 
 
 async def test_a_request_with_no_queue_backend_goes_on_without_the_queue_and_a_later_one_queues_again() -> None:
@@ -364,8 +397,8 @@ async def test_a_request_with_no_queue_backend_goes_on_without_the_queue_and_a_l
     still_without: Final = await first.admit("deployment:d1", "m", _no_cooldown)
     queued: Final = await router.request(priority=0, request_id="later").admit("deployment:d1", "m", _no_cooldown)
 
-    assert without_queue is None
-    assert still_without is None
+    assert without_queue == WithoutQueue(still_cooling=False)
+    assert still_without == WithoutQueue(still_cooling=False)
     assert isinstance(queued, Admission)
     assert await queued.finish(Succeeded()) is True
 
@@ -386,14 +419,14 @@ async def test_a_report_the_queue_cannot_take_takes_the_rest_of_the_request_off_
     )
     request_queue: Final = router.request(priority=0, request_id="r")
     admission: Final = await request_queue.admit("deployment:d1", "m", _no_cooldown)
-    assert admission is not None
+    assert isinstance(admission, Admission)
 
     learned: Final = await admission.finish(MatchingFailure())
     retried: Final = await request_queue.admit("deployment:d1", "m", _no_cooldown)
 
     assert learned is False
     assert request_queue.coordinated is False
-    assert retried is None
+    assert retried == WithoutQueue(still_cooling=False)
 
 
 def test_a_full_queue_answers_503_queue_full_and_running_out_of_time_is_the_usual_timeout() -> None:
@@ -474,13 +507,13 @@ def _model_list() -> list[dict[str, object]]:
 
 def test_a_router_enabling_the_queue_without_a_default_priority_fails_to_build() -> None:
     with pytest.raises(ValueError, match="default_priority"):
-        litellm.Router(model_list=_model_list(), dynamic_queue={"enabled": True})
+        litellm.Router(model_list=_model_list(), dynamic_queue={"enabled": True, "max_waiting": 8})
 
 
 @pytest.mark.parametrize("call", ["acompletion", "atext_completion"])
 async def test_a_router_whose_queue_has_no_redis_serves_a_request_as_it_would_without_the_queue(call: str) -> None:
     router: Final = litellm.Router(
-        model_list=_model_list(), default_priority=0, num_retries=2, dynamic_queue={"enabled": True}
+        model_list=_model_list(), default_priority=0, num_retries=2, dynamic_queue={"enabled": True, "max_waiting": 8}
     )
     request: Final = {"messages": [{"role": "user", "content": "hi"}]} if call == "acompletion" else {"prompt": "hi"}
 
@@ -492,9 +525,8 @@ async def test_a_router_whose_queue_has_no_redis_serves_a_request_as_it_would_wi
 @pytest.mark.parametrize("call", ["acompletion", "atext_completion"])
 async def test_a_router_with_a_queue_serves_a_healthy_request_straight_through(call: str) -> None:
     timer: Final = ManualTimer()
-    router: Final = _on_the_clock(
-        litellm.Router(model_list=_model_list(), default_priority=0, dynamic_queue={"enabled": True}), timer
-    )
+    host: Final = _QueueHost(timer)
+    router: Final = _on_the_clock(host, model_list=_model_list(), default_priority=0, dynamic_queue=_SIZED)
     request: Final = {"messages": [{"role": "user", "content": "hi"}]} if call == "acompletion" else {"prompt": "hi"}
 
     response: Final = await getattr(router, call)(model="group", **request)
@@ -509,26 +541,25 @@ def _ordered_pair() -> list[dict[str, object]]:
     ]
 
 
-def _on_the_clock(router: litellm.Router, timer: ManualTimer, backends: Backends | None = None) -> litellm.Router:
-    """The router's own queue, built as its endpoints build it, on the test's clock and an in-process backend in
-    place of its Redis."""
-    endpoints: Final = router._core._endpoints  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # the router's own endpoints
-    settings: Final = endpoints._core.resolved.dynamic_queue  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType]  # its resolved queue settings
-    assert isinstance(settings, DynamicQueueSettings)
-    endpoints._queue_router = DynamicQueueRouter(settings, backends or _in_memory(timer), timer=timer)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the queue it builds lazily
-    return router
+async def _congest_directly(host: "_QueueHost", capacity: str) -> None:
+    await host.backend.report(capacity, "in-flight", PassThrough(0), MatchingFailure(retry_after_ms=60_000))
+
+
+def _on_the_clock(host: "_QueueHost", **arguments: object) -> litellm.Router:
+    """A router built on ``host``, which puts its queue on the test's clock in place of its Redis."""
+    return litellm.Router.from_config(build_router_config(router_arguments(**arguments)), host)  # pyright: ignore[reportArgumentType]  # each test's router arguments
 
 
 def _queueing_router(timer: ManualTimer, disable_cooldowns: bool = False) -> litellm.Router:
-    router: Final = litellm.Router(
+    return _on_the_clock(
+        _QueueHost(timer),
         model_list=_ordered_pair(),
         default_priority=0,
         num_retries=0,
         cooldown_time=60,
         disable_cooldowns=disable_cooldowns,
-        dynamic_queue={"enabled": True, "queue_timeout": 0.5},
+        dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 0.5},
     )
-    return _on_the_clock(router, timer)
 
 
 MESSAGES: Final = [{"role": "user", "content": "hi"}]
@@ -612,23 +643,36 @@ async def _no_wait() -> None:
     return None
 
 
-def _retrying_router(
-    host: PythonHost, timer: ManualTimer, *, queued: bool = True, backends: Backends | None = None
-) -> litellm.Router:
+class _QueueHost(_RecordsBackoffs):
+    """Also builds the router's queue on the test's clock, on ``backends`` or else on ``backend``, one in-process
+    queue the test can congest directly, in place of its Redis."""
+
+    def __init__(self, timer: ManualTimer, backends: Backends | None = None) -> None:
+        super().__init__()
+        self._timer = timer
+        self.backend = LocalQueueBackend(QueueSettings(max_waiting=8), clock=timer.now)
+        self._backends: Backends = backends or (lambda settings: self.backend)
+
+    def dynamic_queue(
+        self, settings: DynamicQueueSettings, redis: Callable[[], object]
+    ) -> DynamicQueueRouter:
+        return DynamicQueueRouter(settings, self._backends, timer=self._timer)
+
+
+def _retrying_router(host: _RecordsBackoffs, *, queued: bool = True) -> litellm.Router:
     arguments: Final = router_arguments(
         model_list=[{"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "only"}}],
         default_priority=0,
         num_retries=1,
-        dynamic_queue={"enabled": queued, "queue_timeout": 0.5},
+        dynamic_queue={"enabled": queued, "max_waiting": 8, "queue_timeout": 0.5},
     )
-    router: Final = litellm.Router.from_config(build_router_config(arguments), host)
-    return _on_the_clock(router, timer, backends) if queued else router
+    return litellm.Router.from_config(build_router_config(arguments), host)
 
 
 async def test_a_retry_after_a_congesting_failure_waits_in_the_queue_instead_of_the_retry_backoff() -> None:
-    host: Final = _RecordsBackoffs()
     timer: Final = ManualTimer()
-    router: Final = _retrying_router(host, timer)
+    host: Final = _QueueHost(timer)
+    router: Final = _retrying_router(host)
 
     waited: Final = await _waited(
         timer, router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429)), 0.25
@@ -640,11 +684,11 @@ async def test_a_retry_after_a_congesting_failure_waits_in_the_queue_instead_of_
 
 
 async def test_a_retry_after_a_failure_the_queue_does_not_handle_keeps_its_retry_backoff() -> None:
-    queued: Final = _RecordsBackoffs()
+    queued: Final = _QueueHost(ManualTimer())
     unqueued: Final = _RecordsBackoffs()
     for host, enabled in ((queued, True), (unqueued, False)):
         with pytest.raises(litellm.ServiceUnavailableError):
-            _ = await _retrying_router(host, ManualTimer(), queued=enabled).acompletion(
+            _ = await _retrying_router(host, queued=enabled).acompletion(
                 model="group", messages=MESSAGES, mock_response=_provider_error(503)
             )
 
@@ -664,12 +708,9 @@ async def test_a_congesting_failure_without_the_queues_redis_keeps_the_providers
     backends: Callable[[ManualTimer], Backends],
 ) -> None:
     timer: Final = ManualTimer()
-    queued: Final = _RecordsBackoffs()
+    queued: Final = _QueueHost(timer, backends(timer))
     unqueued: Final = _RecordsBackoffs()
-    for host, router in (
-        (queued, _retrying_router(queued, timer, backends=backends(timer))),
-        (unqueued, _retrying_router(unqueued, timer, queued=False)),
-    ):
+    for host, router in ((queued, _retrying_router(queued)), (unqueued, _retrying_router(unqueued, queued=False))):
         with pytest.raises(litellm.RateLimitError) as raised:
             _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
         assert raised.value.status_code == 429
@@ -710,15 +751,12 @@ async def test_a_cooling_deployment_kept_for_the_queue_is_never_called_once_the_
         return backends[-1]
 
     router: Final = _on_the_clock(
-        litellm.Router(
-            model_list=_ordered_pair(),
-            default_priority=0,
-            num_retries=0,
-            cooldown_time=3_600,
-            dynamic_queue={"enabled": True, "queue_timeout": 30},
-        ),
-        timer,
-        backend,
+        _QueueHost(timer, backend),
+        model_list=_ordered_pair(),
+        default_priority=0,
+        num_retries=0,
+        cooldown_time=3_600,
+        dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 30},
     )
     with pytest.raises(litellm.RateLimitError):
         _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
@@ -745,20 +783,18 @@ async def test_a_fallback_target_sending_its_own_credentials_skips_the_queue_and
     override: Mapping[str, object], served: bool
 ) -> None:
     timer: Final = ManualTimer()
+    host: Final = _QueueHost(timer)
     router: Final = _on_the_clock(
-        litellm.Router(
-            model_list=[
-                {"model_name": name, "litellm_params": {"model": f"openai/{name}"}, "model_info": {"id": f"{name}-1"}}
-                for name in ("primary", "backup")
-            ],
-            default_priority=0,
-            num_retries=0,
-            dynamic_queue={"enabled": True, "queue_timeout": 0.5},
-        ),
-        timer,
+        host,
+        model_list=[
+            {"model_name": name, "litellm_params": {"model": f"openai/{name}"}, "model_info": {"id": f"{name}-1"}}
+            for name in ("primary", "backup")
+        ],
+        default_priority=0,
+        num_retries=0,
+        dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 0.5},
     )
-    queue: Final = router._core._endpoints._dynamic_queue()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # the queue the router waits in
-    await _congest(queue, "deployment:backup-1", retry_after_ms=60_000)  # pyright: ignore[reportUnknownArgumentType]  # see above
+    await _congest_directly(host, "deployment:backup-1")
 
     fallback: Final = {"model": "backup", "mock_response": "served", **override}
     outcome: Final = await _waited(
@@ -780,15 +816,12 @@ async def test_a_group_left_only_cooling_with_the_queues_redis_unreachable_fails
 ):
     timer: Final = ManualTimer()
     router: Final = _on_the_clock(
-        litellm.Router(
-            model_list=_ordered_pair(),
-            default_priority=0,
-            num_retries=0,
-            cooldown_time=60,
-            dynamic_queue={"enabled": True, "queue_timeout": 0.5},
-        ),
-        timer,
-        on_redis(lambda: UnreachableRedis()),
+        _QueueHost(timer, on_redis(lambda: UnreachableRedis())),
+        model_list=_ordered_pair(),
+        default_priority=0,
+        num_retries=0,
+        cooldown_time=60,
+        dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 0.5},
     )
     with pytest.raises(litellm.RateLimitError):
         _ = await router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429))
@@ -818,8 +851,9 @@ async def test_a_cooldown_lookup_that_never_answers_lets_the_attempt_go_on_witho
     probe: Final = asyncio.create_task(request_queue.admit("cap", "m", _never_answers(looking)))
     try:
         await asyncio.wait_for(looking.wait(), 10)
-        await timer.parked(count=1)
-        timer.advance(router.queue_settings.operation_timeout_ms / 1000)
+        for _ in range(2):
+            await timer.parked(count=1)
+            timer.advance(router.queue_settings.operation_timeout_ms / 1000)
         unqueued: Final = await _finished(probe)
     finally:
         await _reap(probe)
@@ -827,8 +861,56 @@ async def test_a_cooldown_lookup_that_never_answers_lets_the_attempt_go_on_witho
     assert isinstance(handed_on, Admission)
     await handed_on.finish(None)
 
-    assert unqueued is None
+    assert unqueued == WithoutQueue(still_cooling=False)
     assert request_queue.coordinated is False
+
+
+@pytest.mark.parametrize(
+    ("cooling", "still_cooling"), [(60.0, True), (0.0, False)], ids=["still_cooling", "cooldown_over"]
+)
+async def test_a_request_without_the_queue_learns_whether_its_deployment_is_still_cooling(
+    cooling: float, still_cooling: bool
+) -> None:
+    timer: Final = ManualTimer()
+    request_queue: Final = DynamicQueueRouter(ENABLED, on_redis(lambda: None), timer=timer).request(0, "r")
+
+    unqueued: Final = await request_queue.admit("deployment:d1", "m", _cooling_until(timer, cooling))
+
+    assert unqueued == WithoutQueue(still_cooling=still_cooling)
+
+
+async def test_a_stalled_cooldown_lookup_without_the_queue_is_given_up_after_the_operation_limit() -> None:
+    timer: Final = ManualTimer()
+    router: Final = DynamicQueueRouter(ENABLED, on_redis(lambda: None), timer=timer)
+    looking: Final = asyncio.Event()
+    unqueued: Final = asyncio.create_task(router.request(0, "r").admit("deployment:d1", "m", _never_answers(looking)))
+    try:
+        await asyncio.wait_for(looking.wait(), 10)
+        await timer.parked(count=1)
+        timer.advance(router.queue_settings.operation_timeout_ms / 1000)
+        result: Final = await _finished(unqueued)
+    finally:
+        await _reap(unqueued)
+
+    assert result == WithoutQueue(still_cooling=False)
+    assert timer.pending() == 0
+
+
+async def test_cancelling_a_request_during_its_cooldown_lookup_without_the_queue_cancels_it() -> None:
+    timer: Final = ManualTimer()
+    router: Final = DynamicQueueRouter(ENABLED, on_redis(lambda: None), timer=timer)
+    looking: Final = asyncio.Event()
+    unqueued: Final = asyncio.create_task(router.request(0, "r").admit("deployment:d1", "m", _never_answers(looking)))
+    try:
+        await asyncio.wait_for(looking.wait(), 10)
+        await timer.parked(count=1)
+        _ = unqueued.cancel()
+        outcome: Final = await asyncio.wait_for(asyncio.gather(unqueued, return_exceptions=True), 10)
+    finally:
+        await _reap(unqueued)
+
+    assert isinstance(outcome[0], asyncio.CancelledError)
+    assert timer.pending() == 0
 
 
 def _slow_cooldown_lookup(timer: ManualTimer, seconds: float) -> "Callable[[], Coroutine[object, object, float]]":
@@ -841,7 +923,7 @@ def _slow_cooldown_lookup(timer: ManualTimer, seconds: float) -> "Callable[[], C
 
 async def test_a_cooldown_lookup_slower_than_the_queue_time_left_times_out_and_dispatches_nothing() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=0.5))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=0.5))
     await _congest(router, "cap", retry_after_ms=0)
     timer.advance(1.0)
     probe: Final = asyncio.create_task(router.request(0, "r").admit("cap", "m", _slow_cooldown_lookup(timer, 0.75)))
@@ -876,7 +958,7 @@ async def test_a_request_naming_one_deployment_on_forwarded_credentials_keeps_th
             }
         ],
         default_priority=0,
-        dynamic_queue={"enabled": True},
+        dynamic_queue={"enabled": True, "max_waiting": 8},
     )
     forwarded: Final = {"custom_llm_provider": "anthropic", "extra_headers": {"Authorization": "Bearer caller-own"}}
 
@@ -896,7 +978,7 @@ async def test_a_request_naming_one_deployment_on_forwarded_credentials_keeps_th
 async def test_a_request_on_its_callers_own_credentials_keeps_the_priority_scheduler(
     credentials: Mapping[str, object], scheduled: bool
 ) -> None:
-    router: Final = litellm.Router(model_list=_model_list(), default_priority=0, dynamic_queue={"enabled": True})
+    router: Final = litellm.Router(model_list=_model_list(), default_priority=0, dynamic_queue=_SIZED)
 
     response: Final = await router.acompletion(
         model="group", messages=[{"role": "user", "content": "hi"}], priority=1, **credentials
@@ -908,7 +990,7 @@ async def test_a_request_on_its_callers_own_credentials_keeps_the_priority_sched
 
 async def test_a_total_timeout_released_for_a_stream_never_bounds_its_queue_wait() -> None:
     timer: Final = ManualTimer()
-    router: Final = _router(timer, DynamicQueueSettings(enabled=True, queue_timeout=3.0))
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=3.0))
     await _congest(router, "cap", retry_after_ms=10_000_000)
 
     async with total_deadline(1.0, from_body=False, clock=timer.now) as deadline:
@@ -922,19 +1004,17 @@ async def test_a_total_timeout_released_for_a_stream_never_bounds_its_queue_wait
 
 async def test_an_empty_api_key_field_still_waits_in_its_configured_deployments_queue() -> None:
     timer: Final = ManualTimer()
+    host: Final = _QueueHost(timer)
     router: Final = _on_the_clock(
-        litellm.Router(
-            model_list=[
-                {"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "vertex"}}
-            ],
-            default_priority=0,
-            num_retries=0,
-            dynamic_queue={"enabled": True, "queue_timeout": 0.5},
-        ),
-        timer,
+        host,
+        model_list=[
+            {"model_name": "group", "litellm_params": {"model": "openai/gpt-x"}, "model_info": {"id": "vertex"}}
+        ],
+        default_priority=0,
+        num_retries=0,
+        dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 0.5},
     )
-    queue: Final = router._core._endpoints._dynamic_queue()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # the queue the router waits in
-    await _congest(queue, "deployment:vertex", retry_after_ms=60_000)  # pyright: ignore[reportUnknownArgumentType]  # see above
+    await _congest_directly(host, "deployment:vertex")
 
     waited: Final = await _waited(
         timer, router.acompletion(model="group", messages=MESSAGES, api_key=None, mock_response="never reached"), 0.25

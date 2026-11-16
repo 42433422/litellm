@@ -248,6 +248,7 @@ from litellm.router_utils.dynamic_queue_router import (
     Admission,
     DynamicQueueSettings,
     QueueRejectedError,
+    WithoutQueue,
     capacity_of,
     congested_ids,
     current_request_queue,
@@ -5369,12 +5370,14 @@ class _Driver:
         if capacity is None or not self._core.queues_on(self._attempt_request(step))(deployment):
             return None
         own_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
-        admission: Final = await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
-        if admission is None and await self._cooldown_left_s(own_id) > 0:
+        admitted: Final = await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
+        if not isinstance(admitted, WithoutQueue):
+            return admitted
+        if admitted.still_cooling:
             raise self._core._failure_error(  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
                 {"error_kind": "no_healthy_deployments"}, call.model_name, None, request=self._request
             )
-        return admission
+        return None
 
     def _attempt_request(self, step: Mapping[str, object]) -> Mapping[str, object]:
         """The request as the attempt sends it: with the params a fallback's dict target sets (``kwargs.update``)."""

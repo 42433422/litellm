@@ -91,15 +91,16 @@ def _real_router() -> litellm.Router:
     return litellm.Router.from_config(build_router_config(arguments), _RecordsBackoffs())
 
 
-def _local_queue(timer: ManualTimer, **settings: int | float) -> DynamicQueueRouter:
-    return DynamicQueueRouter(DynamicQueueSettings(enabled=True, **settings), _in_memory(timer), timer=timer)
+def _local_queue(timer: ManualTimer, max_waiting: int = 8, **settings: float) -> DynamicQueueRouter:
+    queue: Final = DynamicQueueSettings(enabled=True, max_waiting=max_waiting, **settings)
+    return DynamicQueueRouter(queue, _in_memory(timer), timer=timer)
 
 
 async def _congest_capacity(queue: DynamicQueueRouter, capacity: str) -> None:
     admission: Final = await queue.request(priority=0, request_id=f"congests-{capacity}").admit(
         capacity, "m", _no_cooldown
     )
-    assert admission is not None
+    assert isinstance(admission, Admission)
     assert await admission.finish(MatchingFailure(retry_after_ms=60_000)) is True
 
 
@@ -147,13 +148,15 @@ def _stream_attempt(
 
 async def _probe(timer: ManualTimer) -> tuple[DynamicQueueRouter, Admission]:
     """A local queue whose capacity a provider failure congested, and the probe its first waiter was granted."""
-    router: Final = DynamicQueueRouter(DynamicQueueSettings(enabled=True), _in_memory(timer, successes=1), timer=timer)
+    router: Final = DynamicQueueRouter(
+        DynamicQueueSettings(enabled=True, max_waiting=8), _in_memory(timer, successes=1), timer=timer
+    )
     healthy: Final = await router.request(priority=0, request_id="congests").admit(CAPACITY, "m", _no_cooldown)
-    assert healthy is not None
+    assert isinstance(healthy, Admission)
     _ = await healthy.finish(MatchingFailure())
     timer.advance(1.0)
     probe: Final = await router.request(priority=0, request_id="probe").admit(CAPACITY, "m", _no_cooldown)
-    assert probe is not None
+    assert isinstance(probe, Admission)
     return router, probe
 
 
@@ -672,7 +675,7 @@ async def test_a_stream_retry_after_a_failure_the_queue_took_waits_there_instead
     timer: Final = ManualTimer()
     request_queue: Final = _local_queue(timer, queue_timeout=0.5).request(priority=0, request_id="stream")
     admission: Final = await request_queue.admit(CAPACITY, "group", _no_cooldown)
-    assert admission is not None
+    assert isinstance(admission, Admission)
     attempt: Final = StreamAttempt(
         core=router._core,  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the router's own Rust core
         op="acompletion",

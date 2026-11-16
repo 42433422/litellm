@@ -89,7 +89,7 @@ class RouterFactory:
             default_priority=0,
             num_retries=0,
             cooldown_time=1,
-            dynamic_queue={"enabled": True, **queue},
+            dynamic_queue={"enabled": True, "max_waiting": 8, **queue},
         )
         cache: Final = router.health().store.redis_cache
         assert cache is not None

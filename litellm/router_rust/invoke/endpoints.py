@@ -52,7 +52,7 @@ from litellm.router_strategy.complexity_router.context_compaction import (
     initialize_compaction_state,
     surface_for_call,
 )
-from litellm.router_utils.dynamic_queue_router import DynamicQueueRouter, bound_request_queue, on_redis
+from litellm.router_utils.dynamic_queue_router import DynamicQueueRouter, bound_request_queue
 from litellm.router_utils.endpoint_eligibility import endpoint_for_call, endpoint_selection
 from litellm.vector_stores.search_query import store_search_params
 
@@ -2074,7 +2074,7 @@ class RustEndpoints:
         if settings is None:
             return None
         if self._queue_router is None or self._queue_router.settings is not settings:
-            self._queue_router = DynamicQueueRouter(settings, on_redis(lambda: self._core.routing_cache.redis_cache))
+            self._queue_router = self._core.host.dynamic_queue(settings, lambda: self._core.routing_cache.redis_cache)
         return self._queue_router
 
     async def _prioritized(

@@ -2,7 +2,7 @@
 
 Inbound authentication uses a verifier, identity resolver, and authorizer injected into `Auth`. `Auth::from_config` composes the current master-key implementation. `Auth::new` accepts alternate implementations and an injected clock
 
-`CredentialExtractor` selects a token or transport credential from HTTP request parts. The default `Bearer` extractor is strict. A host can supply another extractor with `Auth::with_extractor` for a separate route profile. A transport credential is only a selection marker, never proof of identity
+`CredentialExtractor` selects a token or transport credential from HTTP request parts. The default `Bearer` extractor is strict. A host can supply another extractor with `Auth::with_extractor` for a separate route profile. `PythonBearer` is the one the gateway uses in front of Python. It reads `Authorization: Bearer` the way `get_api_key` in `user_api_key_auth.py` does and yields no key where Python would read a different one (`x-litellm-api-key`, another scheme, a provider key header), so that request goes to Python. A transport credential is only a selection marker, never proof of identity
 
 `Authenticator` receives that selected credential and HTTP request parts. Transport verifiers must obtain proof from trusted server extensions, not client-supplied identity headers. It returns `VerifiedIdentity` only after verification. Request parts provide headers and trusted transport extensions for integrations. The verifier must validate any client-controlled claims before treating them as identity. There is no fallback chain after verification failure
 

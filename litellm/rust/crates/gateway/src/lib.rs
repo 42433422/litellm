@@ -1,7 +1,9 @@
 mod auth;
+mod dispatch;
 mod error;
 mod redis;
 mod secrets;
+pub use dispatch::dispatching_router;
 pub use error::Error;
 pub use redis::RedisClients;
 
@@ -74,6 +76,15 @@ pub fn install_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
+}
+
+/// Master-key authentication in front of Python, reading the key only where Python's
+/// `get_api_key` would, so any other credential is left to Python.
+pub fn forward_auth(
+    config: &Config,
+    secrets: Arc<dyn litellm_secrets::source::SecretSource>,
+) -> Auth {
+    Auth::from_config(config, secrets).with_extractor(Arc::new(litellm_gateway_auth::PythonBearer))
 }
 
 pub async fn build_redis(

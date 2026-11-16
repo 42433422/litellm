@@ -29,6 +29,7 @@ from litellm.router_utils.dynamic_queue import (
     QueueSettings,
     QueueTimeout,
     Succeeded,
+    Waiting,
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_router import (
@@ -1099,21 +1100,33 @@ def _losing_redis(timer: ManualTimer) -> tuple[Backends, "list[_LosesRedis]"]:
 
 
 RETRY_AFTER_S: Final = 20
+# router-core honours a provider Retry-After plus a random jitter below this (call.rs, JITTER)
+JITTER_S: Final = 0.75
+LOST_AT_S: Final = 2.25
+
+
+def _a_retry_after_backoff(seconds: float, waited_s: float = 0.0) -> bool:
+    return RETRY_AFTER_S - waited_s <= seconds < RETRY_AFTER_S + JITTER_S - waited_s
 
 
 async def _queued_retry_losing_redis_at(
-    host: _QueueHost, timer: ManualTimer, built: "list[_LosesRedis]", at: float
+    host: _QueueHost, timer: ManualTimer, built: "list[_LosesRedis]", at: float, probe_held_ahead: bool = False
 ) -> object:
-    """A 429 whose retry waits in the queue until the queue's Redis is lost under it at ``at``, then the outcome."""
+    """A 429 whose retry waits in the queue until the queue's Redis is lost under it at ``at``, then the outcome.
+    ``probe_held_ahead`` puts a higher-priority waiter that never claims its probe ahead, so the retry keeps waiting
+    past its own Retry-After."""
     router: Final = _retrying_router(host, queue_timeout=30)
     waiting: Final = asyncio.create_task(
         router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S))
     )
     try:
-        while timer.at < at - 0.25:
-            await timer.parked(waiting)
-            timer.advance(0.25)
         await timer.parked(waiting)
+        if probe_held_ahead:
+            ahead: Final = WaitRequest("deployment:only", "ahead", -1)
+            assert await built[0].admit(ahead, 3_600_000) == Waiting()
+        while timer.at < at - 0.25:
+            timer.advance(0.25)
+            await timer.parked(waiting)
         built[0].reachable = False
         timer.advance(0.25)
         return (await asyncio.wait_for(asyncio.gather(waiting, return_exceptions=True), 10))[0]
@@ -1121,39 +1134,38 @@ async def _queued_retry_losing_redis_at(
         await _reap(waiting)
 
 
-async def _ordinary_backoffs() -> list[float]:
-    """The backoffs the same request takes on the same router without the queue."""
-    unqueued: Final = _RecordsBackoffs()
-    with pytest.raises(litellm.RateLimitError):
-        _ = await _retrying_router(unqueued, queued=False).acompletion(
-            model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S)
-        )
-    return unqueued.backoffs
-
-
-@pytest.mark.parametrize("lost_after_the_backoff", [False, True], ids=["part_left", "all_served_in_the_queue"])
-async def test_a_queued_retry_whose_queue_is_lost_waits_only_what_is_left_of_its_ordinary_backoff(
-    lost_after_the_backoff: bool,
-) -> None:
-    ordinary: Final = await _ordinary_backoffs()
-    assert ordinary[0] > 2.25 and ordinary[0] % 0.25 == 0, ordinary
-    lost_at: Final = ordinary[0] if lost_after_the_backoff else 2.25
+async def test_a_queued_retry_whose_queue_is_lost_waits_only_what_is_left_of_its_ordinary_backoff() -> None:
     timer: Final = ManualTimer()
     backends, built = _losing_redis(timer)
     host: Final = _QueueHost(timer, backends)
 
-    outcome: Final = await _queued_retry_losing_redis_at(host, timer, built, lost_at)
+    outcome: Final = await _queued_retry_losing_redis_at(host, timer, built, LOST_AT_S)
 
-    owed: Final = () if lost_after_the_backoff else (pytest.approx(ordinary[0] - lost_at),)
     assert isinstance(outcome, litellm.RateLimitError)
-    assert host.backoffs == [*owed, *ordinary[1:]]
+    assert len(host.backoffs) == 2, host.backoffs
+    assert _a_retry_after_backoff(host.backoffs[0], waited_s=LOST_AT_S), host.backoffs
+    assert _a_retry_after_backoff(host.backoffs[1]), host.backoffs
+
+
+async def test_a_queued_retry_that_waited_out_its_whole_backoff_owes_nothing_when_its_queue_is_lost() -> None:
+    timer: Final = ManualTimer()
+    backends, built = _losing_redis(timer)
+    host: Final = _QueueHost(timer, backends)
+    past_the_backoff: Final = RETRY_AFTER_S + 1.0
+
+    outcome: Final = await _queued_retry_losing_redis_at(host, timer, built, past_the_backoff, probe_held_ahead=True)
+
+    assert isinstance(outcome, litellm.RateLimitError)
+    assert timer.at == past_the_backoff
+    assert len(host.backoffs) == 1, host.backoffs
+    assert _a_retry_after_backoff(host.backoffs[0]), host.backoffs
 
 
 async def test_cancelling_a_queued_retry_during_what_is_left_of_its_backoff_cancels_the_request() -> None:
     timer: Final = ManualTimer()
     backends, built = _losing_redis(timer)
     host: Final = _BacksOffForever(timer, backends)
-    cancelling: Final = asyncio.create_task(_queued_retry_losing_redis_at(host, timer, built, 2.25))
+    cancelling: Final = asyncio.create_task(_queued_retry_losing_redis_at(host, timer, built, LOST_AT_S))
     try:
         await asyncio.wait_for(host.backing_off.wait(), 10)
         _ = cancelling.cancel()
@@ -1163,6 +1175,7 @@ async def test_cancelling_a_queued_retry_during_what_is_left_of_its_backoff_canc
 
     assert isinstance(outcome[0], asyncio.CancelledError)
     assert len(host.backoffs) == 1
+    assert _a_retry_after_backoff(host.backoffs[0], waited_s=LOST_AT_S), host.backoffs
 
 
 async def test_a_queued_retry_whose_backoff_outlasts_the_total_timeout_ends_at_once_with_the_providers_error() -> None:

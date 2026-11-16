@@ -896,6 +896,59 @@ async def test_a_stalled_cooldown_lookup_without_the_queue_is_given_up_after_the
     assert timer.pending() == 0
 
 
+def _answers_once_then(
+    timer: ManualTimer, ends_at: float, fails: bool
+) -> "Callable[[], Coroutine[object, object, float]]":
+    """Answers the cooldown left until ``ends_at`` once, then never answers again, or fails when ``fails``."""
+    answered: Final = asyncio.Event()
+
+    async def left() -> float:
+        if answered.is_set() and fails:
+            raise ConnectionError("the cooldown store went away")
+        if answered.is_set():
+            await asyncio.Event().wait()
+        answered.set()
+        return max(ends_at - timer.now(), 0.0)
+
+    return left
+
+
+async def _settled_on(timer: ManualTimer, task: "asyncio.Task[_T]", step: float) -> _T | BaseException:
+    """Moves time ``step`` at a time whenever anything is parked on the timer, until ``task`` settles."""
+    for _ in range(10_000):
+        sleeping: Final = asyncio.create_task(timer.parked(count=1))
+        _ = await asyncio.wait({task, sleeping}, return_when=asyncio.FIRST_COMPLETED)
+        await _reap(sleeping)
+        if task.done():
+            return task.exception() or task.result()
+        timer.advance(step)
+    raise AssertionError("deadlock safeguard: the task never settled")
+
+
+@pytest.mark.parametrize(
+    ("fails", "cooling_until", "still_cooling"),
+    [(False, 60.0, True), (False, 0.5, False), (True, 60.0, True)],
+    ids=["stalled_reread_active", "stalled_reread_ended", "failed_reread_active"],
+)
+async def test_a_cooldown_seen_before_the_queue_was_lost_holds_until_it_ends_when_the_reread_does_not_answer(
+    fails: bool, cooling_until: float, still_cooling: bool
+) -> None:
+    timer: Final = ManualTimer()
+    router: Final = _router(timer, DynamicQueueSettings(enabled=True, max_waiting=8, queue_timeout=30.0))
+    await _congest(router, "cap", retry_after_ms=0)
+    request_queue: Final = router.request(0, "r")
+    lookup: Final = _answers_once_then(timer, cooling_until, fails)
+    admitting: Final = asyncio.create_task(request_queue.admit("cap", "m", lookup))
+    try:
+        unqueued: Final = await _settled_on(timer, admitting, 0.25)
+    finally:
+        await _reap(admitting)
+
+    assert unqueued == WithoutQueue(still_cooling=still_cooling)
+    assert request_queue.coordinated is False
+    assert timer.at < 60.0
+
+
 async def test_cancelling_a_request_during_its_cooldown_lookup_without_the_queue_cancels_it() -> None:
     timer: Final = ManualTimer()
     router: Final = DynamicQueueRouter(ENABLED, on_redis(lambda: None), timer=timer)

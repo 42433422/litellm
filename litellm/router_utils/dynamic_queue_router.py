@@ -205,31 +205,53 @@ class RequestQueue:
         """The attempt's turn, or WithoutQueue when coordination failed. Raises the public error of a full queue or
         spent queue time. ``cooldown_left_s`` keeps the wait queued, in priority order, until the deployment's own
         cooldown ends."""
+        cooldown: Final = _ObservedCooldown(self.router.timer, cooldown_left_s)
         if not self.coordinated:
-            return await self._without_queue(cooldown_left_s)
+            return await self._without_queue(cooldown)
         queue: Final = self.router.queue()
         if isinstance(queue, CoordinationUnavailable):
             self.lose_coordination()
-            return await self._without_queue(cooldown_left_s)
+            return await self._without_queue(cooldown)
         self._waits += 1
         request: Final = WaitRequest(capacity, f"{self._request_id}:{self._waits}", self._priority)
         started: Final = self.router.timer.now()
-        admitted: Final = await queue.admit(request, self._budget_s(), cooldown_left_s)
+        admitted: Final = await queue.admit(request, self._budget_s(), cooldown.left_s)
         self._remaining_s = max(self._remaining_s - (self.router.timer.now() - started), 0.0)
         if isinstance(admitted, CoordinationUnavailable):
             self.lose_coordination()
-            return await self._without_queue(cooldown_left_s)
+            return await self._without_queue(cooldown)
         if not isinstance(admitted, Admitted):
             raise rejection_error(admitted, model)
         held: Final = contextlib.AsyncExitStack()
         attempt: Final = await held.enter_async_context(queue.attempt(request, admitted))
         return Admission(attempt, held, self)
 
-    async def _without_queue(self, cooldown_left_s: Callable[[], Awaitable[float]]) -> WithoutQueue:
-        """A lookup that does not answer within the queue's operation limit confirms no cooldown."""
+    async def _without_queue(self, cooldown: "_ObservedCooldown") -> WithoutQueue:
+        """A lookup that fails or does not answer within the queue's operation limit keeps the cooldown this admission
+        last saw, until it ends; one it never saw is none."""
         bound_s: Final = self.router.queue_settings.operation_timeout_ms / 1000
-        left: Final = await _within(self.router.timer, bound_s, cooldown_left_s())
-        return WithoutQueue(still_cooling=left is not None and left > 0)
+        try:
+            left: Final = await _within(self.router.timer, bound_s, cooldown.left_s())
+        except Exception:  # noqa: BLE001  # an unreadable cooldown falls back to the one this admission saw
+            return WithoutQueue(still_cooling=cooldown.active())
+        return WithoutQueue(still_cooling=cooldown.active() if left is None else left > 0)
+
+
+class _ObservedCooldown:
+    """One admission's cooldown lookup, keeping the end of the last cooldown it answered on the queue's timer."""
+
+    def __init__(self, timer: Timer, lookup: Callable[[], Awaitable[float]]) -> None:
+        self._timer = timer
+        self._lookup = lookup
+        self._ends_at: float | None = None
+
+    async def left_s(self) -> float:
+        left: Final = await self._lookup()
+        self._ends_at = self._timer.now() + left
+        return left
+
+    def active(self) -> bool:
+        return self._ends_at is not None and self._timer.now() < self._ends_at
 
 
 _CURRENT: Final[ContextVar[RequestQueue | None]] = ContextVar("dynamic_queue_request", default=None)

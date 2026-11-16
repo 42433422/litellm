@@ -653,9 +653,7 @@ class _QueueHost(_RecordsBackoffs):
         self.backend = LocalQueueBackend(QueueSettings(max_waiting=8), clock=timer.now)
         self._backends: Backends = backends or (lambda settings: self.backend)
 
-    def dynamic_queue(
-        self, settings: DynamicQueueSettings, redis: Callable[[], object]
-    ) -> DynamicQueueRouter:
+    def dynamic_queue(self, settings: DynamicQueueSettings, redis: Callable[[], object]) -> DynamicQueueRouter:
         return DynamicQueueRouter(settings, self._backends, timer=self._timer)
 
 

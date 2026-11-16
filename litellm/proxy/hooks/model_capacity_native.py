@@ -147,6 +147,14 @@ async def _finish(suspended: _Suspended) -> object:
             return out
 
 
+def _loop_running() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def _members(members: object) -> list[list[object]]:
     found: Final = as_str_mapping(members)
     if found is None:
@@ -321,7 +329,11 @@ class CapacityDelegate:
         self.post_call: Final = post_call
         self.window_size: Final = window_size
         self.media_model_resolver: Final = media_model_resolver
+        self.usage_cache: Final = internal_usage_cache
         self.active_teams: Final = ActiveTeamRegistry(internal_usage_cache)
+        self.deferred_touches: Final[
+            dict[int, tuple[str, str, object, int]]
+        ] = {}  # mutable-ok: touches Rust resumes on the event loop
         self.llm_router: Router | None = None
 
     def _router(self) -> Router:
@@ -446,23 +458,26 @@ class CapacityDelegate:
 
     @_seam_now
     def touch(self, args: Mapping[str, object]) -> object:
+        touch_args: Final = (str(args["model"]), str(args["member"]), args["priority_class"], int(str(args["window"])))
+        token: Final = next(_TOKENS)
+        if self.usage_cache.redis_cache is not None and not _loop_running():
+            self.deferred_touches[token] = touch_args
+            return {"pending": token}
         context: Final = copy_context()
-        coroutine: Final = self.active_teams.touch(
-            str(args["model"]),
-            str(args["member"]),
-            args["priority_class"],  # pyright: ignore[reportArgumentType]  # the class as the handler passes it, a reserved priority of any type
-            int(str(args["window"])),
-        )
+        coroutine: Final = self.active_teams.touch(*touch_args)  # pyright: ignore[reportArgumentType]  # the class as the handler passes it, a reserved priority of any type
         finished, out = _step(coroutine, context, None, None)
         if finished:
             return {"members": _members(out)}
-        token: Final = next(_TOKENS)
         _live().suspended[token] = _Suspended(coroutine, out, context)
         return {"pending": token}
 
     @_seam
     async def touched(self, args: Mapping[str, object]) -> object:
-        return _members(await _finish(_live().suspended.pop(int(str(args["pending"])))))
+        token: Final = int(str(args["pending"]))
+        deferred: Final = self.deferred_touches.pop(token, None)
+        if deferred is not None:
+            return _members(await self.active_teams.touch(*deferred))  # pyright: ignore[reportArgumentType]  # the class as the handler passes it, a reserved priority of any type
+        return _members(await _finish(_live().suspended.pop(token)))
 
     @_seam
     async def metrics_enabled(self, _args: Mapping[str, object]) -> object:

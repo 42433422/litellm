@@ -5343,15 +5343,18 @@ class _Driver:
         request_queue: Final = current_request_queue()
         self._owed_until = None if request_queue is None else request_queue.router.timer.now() + seconds
 
-    async def _serve_owed_backoff(self) -> None:
-        """What is left of the backoff the queue took over, for an attempt that goes out without the queue."""
+    async def _serve_owed_backoff(self) -> bool:
+        """What is left of the backoff the queue took over, for an attempt that goes out without the queue. Whether
+        the attempt waited."""
         request_queue: Final = current_request_queue()
         if self._owed_until is None or request_queue is None:
-            return
+            return False
         left_s: Final = self._owed_until - request_queue.router.timer.now()
         self._owed_until = None
-        if left_s > 0:
-            await self._core._host.sleep(left_s)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        if left_s <= 0:
+            return False
+        await self._core._host.sleep(left_s)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        return True
 
     async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
         self._queued_retry = False
@@ -5392,17 +5395,19 @@ class _Driver:
             or capacity is None
             or not self._core.queues_on(self._attempt_request(step))(deployment)
         ):
-            await self._serve_owed_backoff()
+            _ = await self._serve_owed_backoff()
             return None
         own_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
-        admitted: Final = await request_queue.admit(capacity, call.model_name, partial(self._cooldown_left_s, own_id))
+        cooldown_left_s: Final = partial(self._cooldown_left_s, own_id)
+        admitted: Final = await request_queue.admit(capacity, call.model_name, cooldown_left_s)
         if not isinstance(admitted, WithoutQueue):
             return admitted
-        if admitted.still_cooling:
+        waited: Final = await self._serve_owed_backoff()
+        without_queue: Final = await request_queue.recheck_cooldown(admitted, cooldown_left_s) if waited else admitted
+        if without_queue.still_cooling:
             raise self._core._failure_error(  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
                 {"error_kind": "no_healthy_deployments"}, call.model_name, None, request=self._request
             )
-        await self._serve_owed_backoff()
         return None
 
     def _attempt_request(self, step: Mapping[str, object]) -> Mapping[str, object]:

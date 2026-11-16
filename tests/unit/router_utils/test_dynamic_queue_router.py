@@ -40,6 +40,7 @@ from litellm.router_utils.dynamic_queue_router import (
     DynamicQueueRouter,
     DynamicQueueSettings,
     DynamicQueueTimeoutError,
+    RequestQueue,
     WithoutQueue,
     bound_request_queue,
     capacity_of,
@@ -49,7 +50,7 @@ from litellm.router_utils.dynamic_queue_router import (
     prefer_uncongested,
     rejection_error,
 )
-from litellm.types.router import RouterRateLimitError
+from litellm.types.router import RetryPolicy, RouterRateLimitError
 from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _finished, _reap
 from tests.unit.router_utils.test_dynamic_queue_redis import UnreachableRedis
 
@@ -388,7 +389,8 @@ async def test_congestion_the_queue_cannot_read_leaves_every_candidate_and_the_r
 
     assert preferred == ("d1", "d2")
     assert busy == frozenset()
-    assert admitted == WithoutQueue(still_cooling=False)
+    assert isinstance(admitted, WithoutQueue)
+    assert admitted.still_cooling is False
 
 
 async def test_a_request_with_no_queue_backend_goes_on_without_the_queue_and_a_later_one_queues_again() -> None:
@@ -402,8 +404,10 @@ async def test_a_request_with_no_queue_backend_goes_on_without_the_queue_and_a_l
     still_without: Final = await first.admit("deployment:d1", "m", _no_cooldown)
     queued: Final = await router.request(priority=0, request_id="later").admit("deployment:d1", "m", _no_cooldown)
 
-    assert without_queue == WithoutQueue(still_cooling=False)
-    assert still_without == WithoutQueue(still_cooling=False)
+    assert isinstance(without_queue, WithoutQueue)
+    assert without_queue.still_cooling is False
+    assert isinstance(still_without, WithoutQueue)
+    assert still_without.still_cooling is False
     assert isinstance(queued, Admission)
     assert await queued.finish(Succeeded()) is True
 
@@ -431,7 +435,8 @@ async def test_a_report_the_queue_cannot_take_takes_the_rest_of_the_request_off_
 
     assert learned is False
     assert request_queue.coordinated is False
-    assert retried == WithoutQueue(still_cooling=False)
+    assert isinstance(retried, WithoutQueue)
+    assert retried.still_cooling is False
 
 
 def test_a_full_queue_answers_503_queue_full_and_running_out_of_time_is_the_usual_timeout() -> None:
@@ -861,7 +866,8 @@ async def test_a_cooldown_lookup_that_never_answers_lets_the_attempt_go_on_witho
     assert isinstance(handed_on, Admission)
     await handed_on.finish(None)
 
-    assert unqueued == WithoutQueue(still_cooling=False)
+    assert isinstance(unqueued, WithoutQueue)
+    assert unqueued.still_cooling is False
     assert request_queue.coordinated is False
 
 
@@ -876,7 +882,8 @@ async def test_a_request_without_the_queue_learns_whether_its_deployment_is_stil
 
     unqueued: Final = await request_queue.admit("deployment:d1", "m", _cooling_until(timer, cooling))
 
-    assert unqueued == WithoutQueue(still_cooling=still_cooling)
+    assert isinstance(unqueued, WithoutQueue)
+    assert unqueued.still_cooling is still_cooling
 
 
 async def test_a_stalled_cooldown_lookup_without_the_queue_is_given_up_after_the_operation_limit() -> None:
@@ -892,7 +899,8 @@ async def test_a_stalled_cooldown_lookup_without_the_queue_is_given_up_after_the
     finally:
         await _reap(unqueued)
 
-    assert result == WithoutQueue(still_cooling=False)
+    assert isinstance(result, WithoutQueue)
+    assert result.still_cooling is False
     assert timer.pending() == 0
 
 
@@ -944,7 +952,8 @@ async def test_a_cooldown_seen_before_the_queue_was_lost_holds_until_it_ends_whe
     finally:
         await _reap(admitting)
 
-    assert unqueued == WithoutQueue(still_cooling=still_cooling)
+    assert isinstance(unqueued, WithoutQueue)
+    assert unqueued.still_cooling is still_cooling
     assert request_queue.coordinated is False
     assert timer.at < 60.0
 
@@ -961,6 +970,65 @@ async def test_cancelling_a_request_during_its_cooldown_lookup_without_the_queue
         outcome: Final = await asyncio.wait_for(asyncio.gather(unqueued, return_exceptions=True), 10)
     finally:
         await _reap(unqueued)
+
+    assert isinstance(outcome[0], asyncio.CancelledError)
+    assert timer.pending() == 0
+
+
+async def _cooldown_store_gone() -> float:
+    raise ConnectionError("the cooldown store went away")
+
+
+async def _cooling_for_a_minute_without_the_queue(timer: ManualTimer) -> tuple[RequestQueue, WithoutQueue]:
+    request_queue: Final = DynamicQueueRouter(ENABLED, on_redis(lambda: None), timer=timer).request(0, "r")
+    unqueued: Final = await request_queue.admit("deployment:d1", "m", _cooling_until(timer, 60.0))
+    assert isinstance(unqueued, WithoutQueue)
+    assert unqueued.still_cooling is True
+    return request_queue, unqueued
+
+
+@pytest.mark.parametrize(
+    ("waited_s", "reread", "still_cooling"),
+    [
+        (30.0, lambda timer: _never_answers(asyncio.Event()), True),
+        (30.0, lambda timer: _cooldown_store_gone, True),
+        (60.0, lambda timer: _never_answers(asyncio.Event()), False),
+        (30.0, lambda timer: _cooling_until(timer, 0.0), False),
+    ],
+    ids=["stalled_before_it_ends", "failed_before_it_ends", "stalled_after_it_ended", "answered_over"],
+)
+async def test_a_cooldown_reread_after_a_backoff_keeps_the_cooldown_seen_before_it_until_that_cooldown_ends(
+    waited_s: float,
+    reread: "Callable[[ManualTimer], Callable[[], Coroutine[object, object, float]]]",
+    still_cooling: bool,
+) -> None:
+    timer: Final = ManualTimer()
+    request_queue, unqueued = await _cooling_for_a_minute_without_the_queue(timer)
+    timer.advance(waited_s)
+
+    rechecking: Final = asyncio.create_task(request_queue.recheck_cooldown(unqueued, reread(timer)))
+    try:
+        rechecked: Final = await _settled_on(timer, rechecking, 0.25)
+    finally:
+        await _reap(rechecking)
+
+    assert isinstance(rechecked, WithoutQueue)
+    assert rechecked.still_cooling is still_cooling
+    assert timer.pending() == 0
+
+
+async def test_cancelling_a_request_during_its_cooldown_reread_after_a_backoff_cancels_it() -> None:
+    timer: Final = ManualTimer()
+    request_queue, unqueued = await _cooling_for_a_minute_without_the_queue(timer)
+    looking: Final = asyncio.Event()
+    rechecking: Final = asyncio.create_task(request_queue.recheck_cooldown(unqueued, _never_answers(looking)))
+    try:
+        await asyncio.wait_for(looking.wait(), 10)
+        await timer.parked(count=1)
+        _ = rechecking.cancel()
+        outcome: Final = await asyncio.wait_for(asyncio.gather(rechecking, return_exceptions=True), 10)
+    finally:
+        await _reap(rechecking)
 
     assert isinstance(outcome[0], asyncio.CancelledError)
     assert timer.pending() == 0
@@ -1110,14 +1178,19 @@ def _a_retry_after_backoff(seconds: float, waited_s: float = 0.0) -> bool:
 
 
 async def _queued_retry_losing_redis_at(
-    host: _QueueHost, timer: ManualTimer, built: "list[_LosesRedis]", at: float, probe_held_ahead: bool = False
+    host: _QueueHost,
+    timer: ManualTimer,
+    built: "list[_LosesRedis]",
+    at: float,
+    probe_held_ahead: bool = False,
+    router: litellm.Router | None = None,
 ) -> object:
     """A 429 whose retry waits in the queue until the queue's Redis is lost under it at ``at``, then the outcome.
     ``probe_held_ahead`` puts a higher-priority waiter that never claims its probe ahead, so the retry keeps waiting
     past its own Retry-After."""
-    router: Final = _retrying_router(host, queue_timeout=30)
+    retrying: Final = router or _retrying_router(host, queue_timeout=30)
     waiting: Final = asyncio.create_task(
-        router.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S))
+        retrying.acompletion(model="group", messages=MESSAGES, mock_response=_provider_error(429, RETRY_AFTER_S))
     )
     try:
         await timer.parked(waiting)
@@ -1175,6 +1248,29 @@ async def test_cancelling_a_queued_retry_during_what_is_left_of_its_backoff_canc
 
     assert isinstance(outcome[0], asyncio.CancelledError)
     assert len(host.backoffs) == 1
+    assert _a_retry_after_backoff(host.backoffs[0], waited_s=LOST_AT_S), host.backoffs
+
+
+async def test_a_queued_retry_on_an_all_cooling_group_whose_queue_is_lost_waits_its_backoff_before_failing() -> (
+    None
+):
+    timer: Final = ManualTimer()
+    backends, built = _losing_redis(timer)
+    host: Final = _QueueHost(timer, backends)
+    router: Final = _on_the_clock(
+        host,
+        model_list=_ordered_pair(),
+        default_priority=0,
+        num_retries=1,
+        cooldown_time=3_600,
+        retry_policy=RetryPolicy(RateLimitErrorRetries=2),
+        dynamic_queue={"enabled": True, "max_waiting": 8, "queue_timeout": 30},
+    )
+
+    outcome: Final = await _queued_retry_losing_redis_at(host, timer, built, LOST_AT_S, router=router)
+
+    assert isinstance(outcome, RouterRateLimitError)
+    assert host.backoffs, host.backoffs
     assert _a_retry_after_backoff(host.backoffs[0], waited_s=LOST_AT_S), host.backoffs
 
 

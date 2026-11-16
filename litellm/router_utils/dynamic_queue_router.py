@@ -162,9 +162,11 @@ class Admission:
 @dataclass(frozen=True, slots=True)
 class WithoutQueue:
     """The attempt goes on without the queue because its coordination failed. ``still_cooling`` when the deployment's
-    own cooldown is confirmed active, so the attempt must not go out on it."""
+    own cooldown is confirmed active, so the attempt must not go out on it, until ``cooling_until`` on the queue's
+    timer."""
 
     still_cooling: bool
+    cooling_until: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +228,12 @@ class RequestQueue:
         attempt: Final = await held.enter_async_context(queue.attempt(request, admitted))
         return Admission(attempt, held, self)
 
+    async def recheck_cooldown(
+        self, previous: WithoutQueue, cooldown_left_s: Callable[[], Awaitable[float]]
+    ) -> WithoutQueue:
+        """``previous`` reread after the attempt waited, keeping its cooldown until it ends if the reread fails."""
+        return await self._without_queue(_ObservedCooldown(self.router.timer, cooldown_left_s, previous.cooling_until))
+
     async def _without_queue(self, cooldown: "_ObservedCooldown") -> WithoutQueue:
         """A lookup that fails or does not answer within the queue's operation limit keeps the cooldown this admission
         last saw, until it ends; one it never saw is none."""
@@ -233,17 +241,17 @@ class RequestQueue:
         try:
             left: Final = await _within(self.router.timer, bound_s, cooldown.left_s())
         except Exception:  # noqa: BLE001  # an unreadable cooldown falls back to the one this admission saw
-            return WithoutQueue(still_cooling=cooldown.active())
-        return WithoutQueue(still_cooling=cooldown.active() if left is None else left > 0)
+            return cooldown.without_queue()
+        return cooldown.without_queue() if left is None else cooldown.without_queue(still_cooling=left > 0)
 
 
 class _ObservedCooldown:
     """One admission's cooldown lookup, keeping the end of the last cooldown it answered on the queue's timer."""
 
-    def __init__(self, timer: Timer, lookup: Callable[[], Awaitable[float]]) -> None:
+    def __init__(self, timer: Timer, lookup: Callable[[], Awaitable[float]], ends_at: float | None = None) -> None:
         self._timer = timer
         self._lookup = lookup
-        self._ends_at: float | None = None
+        self._ends_at = ends_at
 
     async def left_s(self) -> float:
         left: Final = await self._lookup()
@@ -252,6 +260,10 @@ class _ObservedCooldown:
 
     def active(self) -> bool:
         return self._ends_at is not None and self._timer.now() < self._ends_at
+
+    def without_queue(self, *, still_cooling: bool | None = None) -> WithoutQueue:
+        cooling: Final = self.active() if still_cooling is None else still_cooling
+        return WithoutQueue(still_cooling=cooling, cooling_until=self._ends_at if cooling else None)
 
 
 _CURRENT: Final[ContextVar[RequestQueue | None]] = ContextVar("dynamic_queue_request", default=None)

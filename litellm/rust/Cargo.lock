@@ -3988,6 +3988,7 @@ dependencies = [
  "litellm-gateway-ui",
  "litellm-http",
  "litellm-inference",
+ "litellm-inference-messages",
  "litellm-llms",
  "litellm-model-catalog",
  "litellm-redis-client",
@@ -3995,6 +3996,7 @@ dependencies = [
  "litellm-redis-resolve",
  "litellm-redis-testing",
  "litellm-redis-types",
+ "litellm-router-core",
  "litellm-secret-value",
  "litellm-secrets",
  "litellm-tracing",
@@ -4071,6 +4073,7 @@ dependencies = [
  "litellm-auth",
  "litellm-cache-memory",
  "litellm-cache-response",
+ "litellm-config",
  "litellm-core-utils",
  "litellm-error",
  "litellm-gateway-auth",
@@ -4085,7 +4088,8 @@ dependencies = [
  "litellm-inference-transcription",
  "litellm-llms",
  "litellm-llms-types",
- "litellm-router",
+ "litellm-router-core",
+ "litellm-router-types",
  "litellm-secret-value",
  "litellm-secrets",
  "rstest",
@@ -4095,6 +4099,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tower",
+ "tracing",
  "wiremock",
 ]
 
@@ -4558,7 +4563,6 @@ dependencies = [
 name = "litellm-python-bridge"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "aws-credential-types",
  "aws-sdk-secretsmanager",
  "azure_core",
@@ -4759,26 +4763,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "litellm-router"
-version = "0.1.0"
-dependencies = [
- "litellm-config",
- "litellm-core-utils",
- "litellm-inference",
- "litellm-inference-messages",
- "litellm-llms",
- "litellm-model-catalog",
- "litellm-router-types",
- "rstest",
- "serde_json",
-]
-
-[[package]]
 name = "litellm-router-core"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "async-trait",
  "jiff",
  "litellm-cache",
  "litellm-router-types",

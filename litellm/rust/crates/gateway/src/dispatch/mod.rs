@@ -13,6 +13,7 @@ use litellm_config::Config;
 use litellm_gateway_auth::Auth;
 use litellm_gateway_forward::Forward;
 use litellm_gateway_inference::Gateway;
+use litellm_router_core::ConfigError;
 
 #[derive(Clone)]
 struct Gate {
@@ -52,10 +53,9 @@ async fn gate(State(gate): State<Gate>, request: Request, next: Next) -> Respons
 /// configuration, the route and the request are all ones it is known to handle the way Python
 /// does, and Python serves the rest through `forward`.
 pub fn dispatching_router(
-    inference: Arc<Gateway>,
+    inference: Result<Arc<Gateway>, ConfigError>,
     config: &Config,
     env: &dyn Fn(&str) -> Option<String>,
-    auth: Auth,
     forward: Forward,
 ) -> Router {
     if let Err(unsupported) = config::supported(config, env) {
@@ -65,8 +65,18 @@ pub fn dispatching_router(
         );
         return Router::new().fallback_service(forward);
     }
+    let inference = match inference {
+        Ok(inference) => inference,
+        Err(refused) => {
+            tracing::info!(
+                reason = %litellm_error::Report::new(&refused),
+                "router-core can't route this configuration without python, so python serves every request"
+            );
+            return Router::new().fallback_service(forward);
+        }
+    };
     let gate_state = Gate {
-        auth,
+        auth: crate::forward_auth(config, inference.secrets.clone()),
         forward: forward.clone(),
     };
     let wrong_method = forward.clone();

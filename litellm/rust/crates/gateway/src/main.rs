@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let level = settings.log_level();
     Logger::new(StderrSink { level }).install_global()?;
     let config = Config::load(settings.litellm_config)?;
-    let inference = litellm_gateway::build_inference(&config)?;
+    let inference = litellm_gateway::build_inference(&config).await?;
     let _redis =
         litellm_gateway::build_redis(&config, &inference.resources.pool, &inference.http).await?;
     let ui = match std::env::var_os("LITELLM_UI_PATH") {
@@ -141,12 +141,14 @@ async fn in_front_of_python(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn Error>> {
     let config = Config::load(config)?;
-    let inference = litellm_gateway::build_inference(&config)?;
+    let inference = match litellm_gateway::build_inference(&config).await {
+        Err(litellm_gateway::Error::RouterConfig(refused)) => Err(refused),
+        built => Ok(built?),
+    };
     let env = |name: &str| std::env::var(name).ok();
-    let auth = litellm_gateway::forward_auth(&config, inference.secrets.clone());
     litellm_gateway_forward::run_app(
         forward,
-        |to_python| litellm_gateway::dispatching_router(inference, &config, &env, auth, to_python),
+        |to_python| litellm_gateway::dispatching_router(inference, &config, &env, to_python),
         shutdown,
     )
     .await?;

@@ -851,10 +851,7 @@ async def test_a_cooldown_lookup_that_never_answers_lets_the_attempt_go_on_witho
     probe: Final = asyncio.create_task(request_queue.admit("cap", "m", _never_answers(looking)))
     try:
         await asyncio.wait_for(looking.wait(), 10)
-        for _ in range(2):
-            await timer.parked(count=1)
-            timer.advance(router.queue_settings.operation_timeout_ms / 1000)
-        unqueued: Final = await _finished(probe)
+        unqueued: Final = await _settled_on(timer, probe, 0.25)
     finally:
         await _reap(probe)
     handed_on: Final = await _waited(timer, router.request(0, "next").admit("cap", "m", _no_cooldown), 0.25)

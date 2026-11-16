@@ -97,8 +97,11 @@ import { EmailEventSettingsResponse, EmailEventSettingsUpdateRequest } from "./e
 import type {
   ListPluginsResponse,
   SkillRegisterRequest,
+  SkillHubRegisterRequest,
   SkillMutationResponse,
   SkillImport,
+  SkillUpdate,
+  SkillUploadMetadata,
 } from "./claude_code_plugins/types";
 import type { ModelBudgetUsage, ModelMaxBudget } from "./key_team_helpers/ModelMaxBudgetEditor";
 import type { StoredModelMaxBudget } from "./key_team_helpers/modelMaxBudgetPayload";
@@ -6907,24 +6910,22 @@ export const getSkillHubSkill = (accessToken: string, name: string) =>
     accessToken,
   });
 
-export const importSkillHubSkill = (accessToken: string, body: SkillImport) =>
+export const importSkillHubSkill = (accessToken: string, body: SkillImport | SkillHubRegisterRequest) =>
   apiClient.post<SkillMutationResponse>("/skill-hub/skills/import", { accessToken, body });
 
-export const updateSkillHubSkill = (
-  accessToken: string,
-  name: string,
-  body: components["schemas"]["SkillHubMetadata"],
-) => apiClient.put<SkillMutationResponse>(`/skill-hub/skills/${encodeURIComponent(name)}`, { accessToken, body });
+export const updateSkillHubSkill = (accessToken: string, name: string, body: SkillUpdate) =>
+  apiClient.put<SkillMutationResponse>(`/skill-hub/skills/${encodeURIComponent(name)}`, { accessToken, body });
 
 export const uploadSkillHubSkill = (
   accessToken: string,
   file: File,
   version: string,
-  skill?: components["schemas"]["SkillHubSkill"],
+  { skill, metadata }: { skill?: components["schemas"]["SkillHubSkill"]; metadata?: SkillUploadMetadata } = {},
 ): Promise<SkillMutationResponse> => {
   const body = new FormData();
   body.append("file", file);
   if (version.trim()) body.append("version", version.trim());
+  if (!skill && metadata) body.append("metadata", JSON.stringify(metadata));
   if (skill?.updated_at) body.append("expected_updated_at", skill.updated_at);
   return skill
     ? apiClient.put(`/skill-hub/skills/${encodeURIComponent(skill.name)}/upload`, { accessToken, rawBody: body })

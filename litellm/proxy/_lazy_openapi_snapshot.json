@@ -59731,7 +59731,7 @@
             },
             "file": {
               "contentMediaType": "application/octet-stream",
-              "description": "Replacement Agent Skills ZIP with the same declared skill name",
+              "description": "Replacement ZIP retaining the registered and declared skill names",
               "title": "File",
               "type": "string"
             },
@@ -59770,7 +59770,7 @@
             },
             "file": {
               "contentMediaType": "application/octet-stream",
-              "description": "Replacement Agent Skills ZIP with the same declared skill name",
+              "description": "Replacement ZIP retaining the registered and declared skill names",
               "title": "File",
               "type": "string"
             },
@@ -59799,6 +59799,22 @@
               "description": "Agent Skills ZIP with SKILL.md and optional supporting files",
               "title": "File",
               "type": "string"
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "contentMediaType": "application/json",
+                  "contentSchema": {
+                    "$ref": "#/components/schemas/SkillHubUpload"
+                  },
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional JSON registry metadata",
+              "title": "Metadata"
             },
             "version": {
               "anyOf": [
@@ -59833,6 +59849,17 @@
         },
         "ImportSkillRequest": {
           "properties": {
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SkillHubUpload"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional registry name and metadata overrides"
+            },
             "path": {
               "anyOf": [
                 {
@@ -59885,6 +59912,33 @@
             "url"
           ],
           "title": "ImportSkillRequest",
+          "type": "object"
+        },
+        "PluginAuthor": {
+          "description": "Plugin author information.",
+          "properties": {
+            "email": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Author email",
+              "title": "Email"
+            },
+            "name": {
+              "description": "Author name",
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "PluginAuthor",
           "type": "object"
         },
         "PluginDownloadEvent": {
@@ -60102,86 +60156,6 @@
           "title": "SkillHubList",
           "type": "object"
         },
-        "SkillHubMetadata": {
-          "additionalProperties": false,
-          "properties": {
-            "description": {
-              "anyOf": [
-                {
-                  "maxLength": 1024,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Description"
-            },
-            "domain": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Domain"
-            },
-            "expected_updated_at": {
-              "anyOf": [
-                {
-                  "format": "date-time",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Published updated_at read by the editor. A stale value returns 409",
-              "title": "Expected Updated At"
-            },
-            "keywords": {
-              "anyOf": [
-                {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Keywords"
-            },
-            "namespace": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Namespace"
-            },
-            "version": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Explicit higher SemVer, or omit/null for an automatic patch bump",
-              "title": "Version"
-            }
-          },
-          "title": "SkillHubMetadata",
-          "type": "object"
-        },
         "SkillHubPendingSkill": {
           "properties": {
             "action": {
@@ -60223,6 +60197,27 @@
                 }
               ]
             },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/PluginAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "category": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            },
             "description": {
               "anyOf": [
                 {
@@ -60244,6 +60239,17 @@
                 }
               ],
               "title": "Domain"
+            },
+            "homepage": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Homepage"
             },
             "keywords": {
               "anyOf": [
@@ -60306,6 +60312,122 @@
           "additionalProperties": false,
           "properties": {},
           "title": "SkillHubPublication",
+          "type": "object"
+        },
+        "SkillHubRegistration": {
+          "properties": {
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/PluginAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "category": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            },
+            "description": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Description"
+            },
+            "domain": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Domain"
+            },
+            "homepage": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Homepage"
+            },
+            "keywords": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Keywords"
+            },
+            "name": {
+              "description": "Registry skill name",
+              "pattern": "^[a-z0-9-]+$",
+              "title": "Name",
+              "type": "string"
+            },
+            "namespace": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            },
+            "source": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Repository or HTTPS archive source reference",
+              "title": "Source",
+              "type": "object"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": "1.0.0",
+              "description": "Semantic version, defaults to 1.0.0 on creation",
+              "title": "Version"
+            }
+          },
+          "required": [
+            "name",
+            "source"
+          ],
+          "title": "SkillHubRegistration",
           "type": "object"
         },
         "SkillHubRejection": {
@@ -60431,6 +60553,27 @@
               ],
               "title": "Approved By"
             },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/PluginAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "category": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            },
             "content_url": {
               "anyOf": [
                 {
@@ -60509,6 +60652,17 @@
                 }
               ],
               "title": "Download Url"
+            },
+            "homepage": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Homepage"
             },
             "id": {
               "title": "Id",
@@ -60766,10 +60920,32 @@
         "SkillHubSubmissionEdit": {
           "additionalProperties": false,
           "properties": {
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/PluginAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to preserve, null to clear"
+            },
+            "category": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to preserve, null to clear",
+              "title": "Category"
+            },
             "description": {
               "anyOf": [
                 {
-                  "maxLength": 1024,
                   "type": "string"
                 },
                 {
@@ -60807,6 +60983,18 @@
               ],
               "description": "Published updated_at read by the editor. A stale value returns 409",
               "title": "Expected Updated At"
+            },
+            "homepage": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to preserve, null to clear",
+              "title": "Homepage"
             },
             "keywords": {
               "anyOf": [
@@ -60892,6 +61080,242 @@
             "expected_revision"
           ],
           "title": "SkillHubSubmissionRevision",
+          "type": "object"
+        },
+        "SkillHubUpdate": {
+          "additionalProperties": false,
+          "properties": {
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/PluginAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to preserve, null to clear"
+            },
+            "category": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to preserve, null to clear",
+              "title": "Category"
+            },
+            "description": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Description"
+            },
+            "domain": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Domain"
+            },
+            "expected_updated_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Published updated_at read by the editor. A stale value returns 409",
+              "title": "Expected Updated At"
+            },
+            "homepage": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to preserve, null to clear",
+              "title": "Homepage"
+            },
+            "keywords": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Keywords"
+            },
+            "namespace": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Explicit replacement source reference. Omit/null to preserve the stored source and archive",
+              "title": "Source"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Explicit higher SemVer, or omit/null for an automatic patch bump",
+              "title": "Version"
+            }
+          },
+          "title": "SkillHubUpdate",
+          "type": "object"
+        },
+        "SkillHubUpload": {
+          "properties": {
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/PluginAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "category": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            },
+            "description": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Description"
+            },
+            "domain": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Domain"
+            },
+            "homepage": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Homepage"
+            },
+            "keywords": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Keywords"
+            },
+            "name": {
+              "description": "Registry skill name",
+              "pattern": "^[a-z0-9-]+$",
+              "title": "Name",
+              "type": "string"
+            },
+            "namespace": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": "1.0.0",
+              "description": "Semantic version, defaults to 1.0.0 on creation",
+              "title": "Version"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "SkillHubUpload",
           "type": "object"
         },
         "SkillHubVersion": {
@@ -61393,6 +61817,16 @@
                 "title": "Sort Order",
                 "type": "string"
               }
+            },
+            {
+              "in": "query",
+              "name": "enabled_only",
+              "required": false,
+              "schema": {
+                "default": false,
+                "title": "Enabled Only",
+                "type": "boolean"
+              }
             }
           ],
           "responses": {
@@ -61430,13 +61864,21 @@
       },
       "/skill-hub/skills/import": {
         "post": {
-          "description": "Import a public skills.sh or GitHub skill as a portable snapshot.",
+          "description": "Register a source reference, or import a public skills.sh/GitHub URL as a portable snapshot.",
           "operationId": "import_skill_skill_hub_skills_import_post",
           "requestBody": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ImportSkillRequest"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SkillHubRegistration"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ImportSkillRequest"
+                    }
+                  ],
+                  "title": "Body"
                 }
               }
             },
@@ -61625,7 +62067,7 @@
           ]
         },
         "put": {
-          "description": "Replace registry metadata, preserving files. Members submit an immutable proposal for admin review.",
+          "description": "Replace registry metadata or an explicit source. Members submit a proposal for admin review.",
           "operationId": "replace_skill_metadata_skill_hub_skills__name__put",
           "parameters": [
             {
@@ -61642,7 +62084,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SkillHubMetadata"
+                  "$ref": "#/components/schemas/SkillHubUpdate"
                 }
               }
             },
@@ -62114,7 +62556,7 @@
       },
       "/skill-hub/skills/{name}/versions/{version_id}/archive": {
         "get": {
-          "description": "Download a retained publication as a portable ZIP with SKILL.md at its root.",
+          "description": "Download a retained skill ZIP, preserving legacy packages without portable frontmatter.",
           "operationId": "download_skill_version_skill_hub_skills__name__versions__version_id__archive_get",
           "parameters": [
             {
@@ -62573,7 +63015,7 @@
       },
       "/skill-hub/submissions/{submission_id}/archive": {
         "get": {
-          "description": "Download an owned proposal as a private portable ZIP. Legacy nonportable archives return 404.",
+          "description": "Download an owned proposal as a private ZIP, preserving legacy packages without portable frontmatter.",
           "operationId": "download_submission_skill_hub_submissions__submission_id__archive_get",
           "parameters": [
             {

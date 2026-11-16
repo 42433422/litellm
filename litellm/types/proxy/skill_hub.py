@@ -1,11 +1,12 @@
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Literal, TypeAlias
+from typing import Final, Literal, TypeAlias
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, TypeAdapter, model_validator
 
 from litellm.models.skill_submission import SubmissionOperation, SubmissionStatus
 from litellm.types.llms.base import LiteLLMBaseModel
+from litellm.types.proxy.claude_code_endpoints import PluginAuthor
 
 SkillSortField: TypeAlias = Literal[
     "name",
@@ -17,6 +18,7 @@ SkillSortField: TypeAlias = Literal[
     "approved_by",
     "security_scan_passed",
 ]
+_IMPORT_FIELDS: Final = TypeAdapter(Mapping[str, object])
 
 
 class SkillHubSkill(LiteLLMBaseModel):
@@ -39,6 +41,9 @@ class SkillHubSkill(LiteLLMBaseModel):
     domain: str | None = None
     namespace: str | None = None
     keywords: tuple[str, ...] | None = None
+    author: PluginAuthor | None = None
+    category: str | None = None
+    homepage: str | None = None
     download_count: int | None = Field(None, description="Gateway ZIP downloads, including repeat downloads")
 
 
@@ -51,6 +56,34 @@ class SkillHubList(LiteLLMBaseModel):
     next_offset: int | None
 
 
+class SkillHubUpload(LiteLLMBaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(..., pattern=r"^[a-z0-9-]+$", description="Registry skill name")
+    version: str | None = Field("1.0.0", description="Semantic version, defaults to 1.0.0 on creation")
+    description: str | None = None
+    author: PluginAuthor | None = None
+    homepage: str | None = None
+    keywords: tuple[str, ...] | None = None
+    category: str | None = None
+    domain: str | None = None
+    namespace: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_installation_preference(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        fields: Final = _IMPORT_FIELDS.validate_python(data)
+        if "installation_preference" in fields or "installationPreference" in fields:
+            raise ValueError("Installation preferences are not supported by Skills Hub")
+        return fields
+
+
+class SkillHubRegistration(SkillHubUpload):
+    source: Mapping[str, str] = Field(description="Repository or HTTPS archive source reference")
+
+
 class ImportSkillRequest(LiteLLMBaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -59,12 +92,25 @@ class ImportSkillRequest(LiteLLMBaseModel):
     ref: str = Field("HEAD", description="Git commit, tag or branch to import")
     path: str | None = Field(None, description="Repository-relative skill directory")
     version: str | None = Field(None, description="Semantic version, or omit/null to start at 1.0.0")
+    metadata: SkillHubUpload | None = Field(None, description="Optional registry name and metadata overrides")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_reference_payload(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        fields: Final = _IMPORT_FIELDS.validate_python(data)
+        if "source" in fields:
+            raise ValueError("Use name and source for reference registration, or url for a portable import")
+        if "installation_preference" in fields or "installationPreference" in fields:
+            raise ValueError("Installation preferences are not supported by Skills Hub")
+        return fields
 
 
 class SkillHubMetadata(LiteLLMBaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    description: str | None = Field(None, max_length=1024)
+    description: str | None = None
     version: str | None = Field(None, description="Explicit higher SemVer, or omit/null for an automatic patch bump")
     expected_updated_at: datetime | None = Field(
         None, description="Published updated_at read by the editor. A stale value returns 409", exclude=True
@@ -72,6 +118,16 @@ class SkillHubMetadata(LiteLLMBaseModel):
     domain: str | None = None
     namespace: str | None = None
     keywords: tuple[str, ...] | None = None
+    author: PluginAuthor | None = Field(None, description="Omit to preserve, null to clear")
+    category: str | None = Field(None, description="Omit to preserve, null to clear")
+    homepage: str | None = Field(None, description="Omit to preserve, null to clear")
+
+
+class SkillHubUpdate(SkillHubMetadata):
+    source: Mapping[str, str] | None = Field(
+        None,
+        description="Explicit replacement source reference. Omit/null to preserve the stored source and archive",
+    )
 
 
 class SkillHubPublication(LiteLLMBaseModel):
@@ -124,6 +180,9 @@ class SkillHubProposal(LiteLLMBaseModel):
     domain: str | None = None
     namespace: str | None = None
     keywords: tuple[str, ...] | None = None
+    author: PluginAuthor | None = None
+    category: str | None = None
+    homepage: str | None = None
     source: Mapping[str, str]
     agent_skill: SkillHubAgentSkill | None = None
 
